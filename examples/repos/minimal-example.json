@@ -1,0 +1,12 @@
+{
+  "name": "minimal-example",
+  "github": "example/minimal",
+  "baseBranch": "main",
+  "knowledge": [],
+  "checks": [
+    {"name": "unit", "cmd": ["python3", "-m", "unittest", "discover", "-s", "tests"], "requires": []}
+  ],
+  "e2e": [],
+  "release": {"notes": "CHANGELOG.md"},
+  "announce": {"medium": true, "discord": false, "slack": false}
+}

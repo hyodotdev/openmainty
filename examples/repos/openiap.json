@@ -1,0 +1,19 @@
+{
+  "name": "openiap",
+  "github": "hyodotdev/openiap",
+  "baseBranch": "main",
+  "knowledge": [
+    "knowledge/internal/04-platform-packages.md",
+    "knowledge/internal/06-git-deployment.md",
+    "knowledge/internal/09-community-touchpoints.md"
+  ],
+  "checks": [
+    {"name": "parity", "cmd": ["bun", "audit:parity"], "requires": []},
+    {"name": "docs", "cmd": ["bun", "audit:docs"], "requires": []}
+  ],
+  "e2e": [
+    {"name": "ios-device", "cmd": ["bun", "e2e:ios"], "requires": ["ios_device"]}
+  ],
+  "release": {"notes": "CHANGELOG.md per package"},
+  "announce": {"medium": true, "discord": true, "slack": true}
+}

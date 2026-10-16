@@ -1,0 +1,11 @@
+[project]
+name = "openmainty"
+version = "0.1.0"
+description = "Your AI maintainer for open source."
+requires-python = ">=3.9"
+
+[project.scripts]
+openmainty = "openmainty.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
