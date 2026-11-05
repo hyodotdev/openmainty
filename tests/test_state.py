@@ -14,6 +14,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from openmainty import pcconfig, repos, runner, store  # noqa: E402
+from openmainty.util import Cancelled  # noqa: E402
+try:
+    from tests._home import use_temp_home  # noqa: E402
+except ImportError:  # discover top-level mode: tests/ is on sys.path
+    from _home import use_temp_home  # noqa: E402
 
 PROFILE = {
     "name": "fakerepo",
@@ -31,7 +36,7 @@ class HomeMixin(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        os.environ["OPENMAINTY_HOME"] = str(Path(self.tmp.name) / "home")
+        use_temp_home(self, str(Path(self.tmp.name) / "home"))
         self.checkout = Path(self.tmp.name) / "checkout"
         self.checkout.mkdir()
         (self.checkout / "README.md").write_text("# fake\n")
@@ -41,7 +46,6 @@ class HomeMixin(unittest.TestCase):
         pcconfig.save(pc)
 
     def tearDown(self):
-        os.environ.pop("OPENMAINTY_HOME", None)
         os.environ.pop("OPENMAINTY_FAKE_QUOTA", None)
 
     def make_run(self):
@@ -83,13 +87,16 @@ class StateTransitionTests(HomeMixin):
         self.assertIn("fix", ex2.calls, "failed fix must be retried")
 
     def test_stale_verification_invalidated_after_code_change(self):
+        # Stronger contract (HEAD-only is not enough): verification binds to
+        # the actual content fingerprint, so editing real bytes in the run
+        # worktree invalidates prior checks even though no commit field was
+        # touched. Bumping workSeq/workCommit by hand would test only the
+        # old, weaker signal.
         state = self.make_run()
         self.assertTrue(runner.execute(state, repos.load("fakerepo"), runner.FakeExecutor(), self.checkout))
-        state = store.load(state["id"])
-        # simulate: fix produced new code after verification passed
-        state["workSeq"] = state.get("workSeq", 0) + 1
-        state["workCommit"] = "copyseq-changed"
-        store.save(state)
+        work = store.run_dir(state["id"]) / "work"
+        (work / "README.md").write_text("# changed after verification\n",
+                                        encoding="utf-8")
         ex = runner.FakeExecutor()
         runner.execute(state, repos.load("fakerepo"), ex, self.checkout)
         state = store.load(state["id"])
@@ -134,6 +141,21 @@ class StateTransitionTests(HomeMixin):
         ok = runner.execute(state, repos.load("fakerepo"), runner.FakeExecutor(), self.checkout)
         self.assertTrue(ok)
 
+    def test_cancel_leaves_resumable_state(self):
+        import threading
+        state = self.make_run()
+        ev = threading.Event()
+        ev.set()
+        with self.assertRaises(Cancelled):
+            runner.execute(state, repos.load("fakerepo"),
+                           runner.FakeExecutor(cancel_event=ev), self.checkout)
+        state = store.load(state["id"])
+        self.assertEqual(state["steps"]["triage"]["status"], "pending")
+        self.assertTrue(any(i["kind"] == "cancelled" for i in state["interventions"]))
+        ok = runner.execute(state, repos.load("fakerepo"),
+                            runner.FakeExecutor(), self.checkout)
+        self.assertTrue(ok)
+
     def test_review_without_valid_findings_skips_apply(self):
         state = self.make_run()
         ex = runner.FakeExecutor(script={"review": [(0, "VALID: none. All good.")]})
@@ -163,6 +185,43 @@ class StateTransitionTests(HomeMixin):
         state = store.load(state["id"])
         self.assertEqual(state["steps"]["e2e"]["status"], "failed")
         self.assertEqual(state["steps"]["e2e"]["exit_code"], 2)
+
+
+class RecordAnswerTests(HomeMixin):
+    def make_question_run(self):
+        state = store.create("fakerepo", "1", "t", "base0", {})
+        store.mark(state, "triage", "blocked", note="asked: q?")
+        state["waitReason"] = "question: stop or pause?"
+        state["question_step"] = "triage"
+        store.save(state)
+        return state
+
+    def test_record_answer_clears_wait(self):
+        state = self.make_question_run()
+        store.record_answer(state["id"], "stop")
+        reloaded = store.load(state["id"])
+        self.assertIsNone(reloaded["waitReason"])
+        self.assertEqual(reloaded["answers"], [{"q": "stop or pause?", "a": "stop"}])
+        self.assertEqual(reloaded["steps"]["triage"]["status"], "pending")
+        self.assertNotIn("question_step", reloaded)
+
+    def test_record_answer_rejects(self):
+        state = store.create("fakerepo", "2", "t", "base0", {})
+        with self.assertRaises(SystemExit):
+            store.record_answer(state["id"], "x")
+        with self.assertRaises(SystemExit):
+            store.record_answer("run-missing", "x")
+        q = self.make_question_run()
+        with self.assertRaises(SystemExit):
+            store.record_answer(q["id"], "  ")
+
+    def test_cmd_answer_roundtrip(self):
+        import argparse
+        from openmainty import cli
+        state = self.make_question_run()
+        ns = argparse.Namespace(run=state["id"], answer="stop", answer_file=None)
+        self.assertEqual(cli.cmd_answer(ns), 0)
+        self.assertIsNone(store.load(state["id"])["waitReason"])
 
 
 if __name__ == "__main__":

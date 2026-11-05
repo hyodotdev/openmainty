@@ -7,17 +7,78 @@ explicit approval policy (see external.py).
 """
 from __future__ import annotations
 
+import re as _re
+
+_ISSUE_NUMBER_RE = _re.compile(r"[1-9][0-9]*")
+
+
+def is_github_issue_number(value) -> bool:
+    """True only for an actual positive ASCII-numeric GitHub issue identity.
+
+    Synthetic maintenance keys (`dep-...`), missing/empty values, zero,
+    negatives, non-ASCII digits, and zero-padded/malformed forms are all
+    False: those must never take GitHub closing keywords (`Fixes #N`) or
+    issue URLs, and drafts must describe them with the meaningful
+    task/title/local run context instead.
+    """
+    if not isinstance(value, str):
+        return False
+    if not value.isascii():
+        return False
+    return _ISSUE_NUMBER_RE.fullmatch(value) is not None
+
+
+def _local_task_title(state: dict) -> str:
+    """Meaningful human title for a run without a real GitHub issue."""
+    title = (state.get("title") or "").strip()
+    if title:
+        return title
+    dep, target = state.get("dep"), state.get("target")
+    if dep or target:
+        return f"chore(deps): {dep or '?'} -> {target or '?'}"
+    return f"local run {state.get('id', '?')}"
+
+
+def _verified_steps_text(state: dict) -> str:
+    """Honest verify-step list: a dependency-maintenance reproduce skip is
+    labeled skipped/not-applicable, never a `reproduce@?` verified test.
+    Actual review/e2e evidence keeps its recorded commit binding."""
+    from . import store as _store
+
+    steps = state["steps"]
+    try:
+        proof = _store.verification_status(state)
+    except Exception:  # noqa: BLE001 - drafts must render even offline
+        proof = {}
+    parts = []
+    for name in ("reproduce", "review", "e2e"):
+        if steps[name]["status"] != "done":
+            continue
+        if proof.get(name) == "skipped":
+            parts.append(
+                f"{name}: skipped (not applicable — dependency "
+                f"maintenance, no upstream bug to reproduce)"
+            )
+            continue
+        parts.append(f"{name}@{state['verifiedCommits'].get(name, '?')[:8]}")
+    return ", ".join(parts)
+
 
 def pr_description(state: dict, profile: dict, summary: str) -> str:
-    steps = state["steps"]
-    verified = ", ".join(
-        f"{s}@{state['verifiedCommits'].get(s, '?')[:8]}"
-        for s in ("reproduce", "review", "e2e")
-        if steps[s]["status"] == "done"
-    )
-    return f"""# {state['title'] or ('Fixes #' + state['issue'])}
+    issue = state.get("issue") or ""
+    if is_github_issue_number(issue):
+        heading = state["title"] or f"Fixes #{issue}"
+        issue_line = f"Fixes {profile['github']}#{issue}."
+    else:
+        heading = _local_task_title(state)
+        issue_line = (
+            f"Local maintenance run {state['id']}: {heading} "
+            f"(no upstream issue — no closing keyword)."
+        )
+    verified = _verified_steps_text(state)
+    return f"""# {heading}
 
-Fixes {profile['github']}#{state['issue']}.
+{issue_line}
 
 ## Summary
 {summary or '(see run evidence)'}
@@ -41,7 +102,11 @@ def suggest_labels(profile: dict) -> str:
 
 
 def release_notes(state: dict, profile: dict, summary: str) -> str:
-    return f"""# Release notes draft ({profile['name']}#{state['issue']})
+    issue = state.get("issue") or ""
+    heading = (f"{profile['name']}#{issue}"
+               if is_github_issue_number(issue)
+               else _local_task_title(state))
+    return f"""# Release notes draft ({heading})
 
 {summary or '(pending fix summary)'}
 
@@ -52,10 +117,17 @@ def release_notes(state: dict, profile: dict, summary: str) -> str:
 
 
 def medium_draft(state: dict, summary: str) -> str:
-    return f"""# Medium draft: fixing {state['repo']}#{state['issue']}
+    issue = state.get("issue") or ""
+    if is_github_issue_number(issue):
+        heading = f"fixing {state['repo']}#{issue}"
+        first_item = f"The report: {state['title']}"
+    else:
+        heading = _local_task_title(state)
+        first_item = f"The task: {_local_task_title(state)}"
+    return f"""# Medium draft: {heading}
 
 ## Outline
-1. The report: {state['title']}
+1. {first_item}
 2. Root cause (one paragraph).
 3. The fix and regression test.
 4. Verification evidence.
@@ -68,16 +140,30 @@ def medium_draft(state: dict, summary: str) -> str:
 
 
 def discord_draft(state: dict) -> str:
+    issue = state.get("issue") or ""
+    if is_github_issue_number(issue):
+        return (
+            f"Fix for {state['repo']}#{issue} "
+            f"({state['title'] or 'see issue'}) is in review — "
+            f"run {state['id']}. Feedback welcome on the PR."
+        )
     return (
-        f"Fix for {state['repo']}#{state['issue']} "
-        f"({state['title'] or 'see issue'}) is in review — "
-        f"run {state['id']}. Feedback welcome on the PR."
+        f"Maintenance {_local_task_title(state)} "
+        f"({state['repo']}) is in review — "
+        f"run {state['id']}. Feedback welcome on the draft."
     )
 
 
 def slack_draft(state: dict) -> str:
+    issue = state.get("issue") or ""
+    if is_github_issue_number(issue):
+        return (
+            f"[openmainty] {state['repo']}#{issue} "
+            f"{state['title'] or ''} — run {state['id']}, "
+            f"work commit {(state['workCommit'] or '?')[:12]}. Drafts ready for review."
+        )
     return (
-        f"[openmainty] {state['repo']}#{state['issue']} "
-        f"{state['title'] or ''} — run {state['id']}, "
+        f"[openmainty] {_local_task_title(state)} "
+        f"({state['repo']}) — run {state['id']}, "
         f"work commit {(state['workCommit'] or '?')[:12]}. Drafts ready for review."
     )

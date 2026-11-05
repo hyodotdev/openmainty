@@ -1,14 +1,39 @@
 # OpenMainty — Your AI maintainer for open source.
 
-OpenMainty keeps your repositories healthy on its own: it watches
-dependency drift and open issues, then works each item through
-triage → reproduce → analyze → fix → review → verify → release and
-announcement drafts. You review drafts and merge; it never posts, merges,
-deploys, or sends channel messages by itself.
+OpenMainty is a local maintainer tool: it watches dependency drift and
+open issues/PRs/Discussions, verifies updates in a sandbox on your Mac,
+and prepares reviewable batches and PR drafts (triage → reproduce →
+analyze → fix → review → verify). You review and merge; it never posts,
+merges, deploys, or sends channel messages by itself.
+
+Verified state (2026-11-05): promoted app `75ab15721af543f8` after 32
+independently gated promotions; 127 test modules / 3,672 tests pass on
+Python 3.14 and 3.9 (one sandbox-fenced module excluded by design); the
+web dashboard was checked in a real browser at 1280px and 390px, light
+and dark. Not yet shown: one real maintenance case run end to end, and
+proof of the subscription worker binding. See
+[docs/SUBMISSION.md](docs/SUBMISSION.md) for the evidence.
 
 Primary worker: your Muse Code subscription login via `muse exec`
 (`--provider meta --model muse-spark-1.3 --contributor-mode on`).
 No direct model APIs, no pay-per-use keys.
+Subscriber-only: `chat` and worker runs require `muse login`;
+API-key billing (`META_API_KEY`) is refused.
+
+## Hackathon
+
+OpenMainty is entered in the Meta Global AI Developer Hackathon
+(Oct 27 – Nov 5 KST). Start here: [docs/HACKATHON.md](docs/HACKATHON.md) —
+what it does, the safety model, honest limits, and how to regenerate
+every number. Daily operation stays in
+[docs/OWNER_RUNBOOK.md](docs/OWNER_RUNBOOK.md); the 3-command
+quickstart:
+
+```sh
+openmainty metrics --lang en          # regenerate every number (read-only)
+./openmainty release                   # full tests → promote → restart → verify
+~/.openmainty/app/current/openmainty gc --dry-run   # disk report, deletes nothing
+```
 
 ## Install (reproducible, stdlib only, Python ≥ 3.9)
 
@@ -57,12 +82,19 @@ openmainty status --run <run-id> [--json]
 openmainty resume --run <run-id>
 openmainty external --run <run-id> --dry-run     # previews only; never sends
 openmainty deps --repo mylib [--check]           # registry drift
+openmainty chat start --repo mylib [--issue 12] [--message "..."]  # REPL when --message absent
+openmainty chat send --session <id> --message "..."               # continue a saved session
+openmainty chat list | show --session <id> | export --session <id> [--out f.md]
+openmainty chat delete --session <id>                               # remove a saved session
 openmainty serve --port 8901                     # read-only local dashboard
 openmainty app install                           # login-persistent dashboard (macOS)
 ```
 
-Open `http://127.0.0.1:8901/` in a browser to watch repos, runs, drift,
-and the daily log. The dashboard never mutates state or spends quota.
+Open `http://127.0.0.1:8901/` in a browser: the dashboard is a
+maintenance console — continue chat sessions, check drift/issues, and
+start maintain/resume jobs. It binds loopback only; quota-spending
+actions enforce the subscriber gate. Jobs still produce drafts only:
+nothing posts, merges, deploys, or sends by itself.
 
 ## Run it on another computer
 
@@ -95,9 +127,10 @@ these defaults on top:
 ## Layout
 
 - `src/openmainty/` — core: worker (`muse.py`), ordering/state (`runner.py`,
-  `store.py`), portable profiles (`repos.py`), PC config (`pcconfig.py`),
-  drift (`deps.py`), dashboard (`serve.py`), `doctor.py`, `planner.py`,
-  `artifacts.py`, `external.py`, `cli.py`
+  `store.py`), conversations (`chat.py`), portable profiles (`repos.py`),
+  PC config (`pcconfig.py`), drift (`deps.py`), dashboard (`serve.py`,
+  `dashboard.html`), `doctor.py`, `planner.py`, `artifacts.py`, `external.py`,
+  `cli.py`
 - `examples/repos/` — portable profile examples
 - `tests/` — state/resume/dedup, cost-policy, drift, model-select, watch
 - `docs/` — `USAGE.md`, `MULTI_PC.md`, `COORDINATOR_NEXT.md`, `HACKATHON.md`

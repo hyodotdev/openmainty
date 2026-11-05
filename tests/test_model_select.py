@@ -10,6 +10,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from openmainty import cli, muse, runner  # noqa: E402
+try:
+    from tests._home import offline_muse_version  # noqa: E402
+except ImportError:  # discover top-level mode: tests/ is on sys.path
+    from _home import offline_muse_version  # noqa: E402
 
 
 class ModelSelectTests(unittest.TestCase):
@@ -32,6 +36,9 @@ class ModelSelectTests(unittest.TestCase):
         self.assertIn("off", off_cmd)
 
     def test_agent_info_model(self):
+        # Model choice is the assertion; version string is fixture input.
+        # Real agent_info model/provider/billing logic stays intact.
+        offline_muse_version(self, "fixture-muse-0.0.0")
         self.assertEqual(muse.agent_info()["model"], muse.DEFAULT_MODEL)
         self.assertEqual(muse.agent_info(model="muse-spark")["model"], "muse-spark")
 

@@ -12,9 +12,16 @@ from pathlib import Path
 
 def home() -> Path:
     override = os.environ.get("OPENMAINTY_HOME")
-    if override:
-        return Path(override).expanduser()
-    return Path.home() / ".openmainty"
+    resolved = (Path(override).expanduser() if override
+                else Path.home() / ".openmainty")
+    # M2.15b test-isolation guard: with OPENMAINTY_TEST_GUARD=1
+    # (set for the whole suite by tests/__init__.py, never in
+    # production) resolving the real home is a loud error, never a
+    # silent read or write into the owner's data.
+    if os.environ.get("OPENMAINTY_TEST_GUARD") == "1" \
+            and resolved == Path.home() / ".openmainty":
+        raise RuntimeError("test touched the real OpenMainty home")
+    return resolved
 
 
 def repos_dir() -> Path:
@@ -27,3 +34,7 @@ def runs_dir() -> Path:
 
 def pc_file() -> Path:
     return home() / "pc.json"
+
+
+def sessions_dir() -> Path:
+    return home() / "sessions"

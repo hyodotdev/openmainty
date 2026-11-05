@@ -44,3 +44,27 @@ def save(data: dict) -> Path:
 
 def checkout_for(repo_name: str):
     return load().get("checkouts", {}).get(repo_name)
+
+
+def workspace_root() -> Path:
+    """Where checkouts live by default. Visible dir; state stays in ~/.openmainty."""
+    root = load().get("workspace_root") or str(Path.home() / "openmainty")
+    return Path(root).expanduser()
+
+
+def set_workspace_root(path: str) -> Path:
+    """Validate + persist. Never moves existing checkouts (non-destructive)."""
+    import os
+    candidate = Path(path or "").expanduser()
+    if not candidate.is_absolute():
+        raise SystemExit(f"error: workspace root must be absolute: {path!r}")
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise SystemExit(f"error: cannot create workspace root: {exc}") from exc
+    if not os.access(candidate, os.W_OK):
+        raise SystemExit(f"error: workspace root not writable: {candidate}")
+    data = load()
+    data["workspace_root"] = str(candidate)
+    save(data)
+    return candidate

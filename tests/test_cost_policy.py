@@ -97,14 +97,50 @@ class CostPolicyTests(unittest.TestCase):
         self.assertIsNone(usage["tokens"])
 
     def test_model_traffic_only_via_muse_cli(self):
+        import ast as _ast
         import sys as _sys
         _sys.path.insert(0, str(SRC.parent))
         from openmainty import muse as m  # noqa: E402
         import inspect
         src = inspect.getsource(m)
         self.assertIn('"muse", "exec"', src)
-        for net in ("urllib", "requests", "http.client", "socket.create_connection"):
+        for net in ("urllib", "http.client", "socket.create_connection"):
             self.assertNotIn(net, src, f"network client in muse worker: {net}")
+        # "requests" also occurs as ordinary prose ("Server requests
+        # are never answered ..."), so a substring scan false-positives.
+        # What the policy forbids is importing the network client:
+        # check real import statements instead.
+        tree = _ast.parse(src)
+        imported = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Import):
+                imported.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, _ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+        self.assertNotIn("requests", imported,
+                         "network client in muse worker: requests")
+        # A dynamic import smuggles the same client past the
+        # statement scan: importlib.import_module("requests") and
+        # __import__("requests") are forbidden too.
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ast.Call):
+                continue
+            func = node.func
+            dynamic = False
+            if (isinstance(func, _ast.Attribute)
+                    and func.attr == "import_module"
+                    and isinstance(func.value, _ast.Name)
+                    and func.value.id == "importlib"):
+                dynamic = True
+            elif (isinstance(func, _ast.Name)
+                    and func.id == "__import__"):
+                dynamic = True
+            if dynamic and node.args and isinstance(node.args[0],
+                                                    _ast.Constant):
+                first = str(node.args[0].value).split(".")[0]
+                self.assertNotEqual(first, "requests",
+                                    "dynamic network client in muse "
+                                    "worker: requests")
 
 
 if __name__ == "__main__":
