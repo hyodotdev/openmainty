@@ -109,6 +109,15 @@ SUBSCRIPTION_WORKER_EXTRA_META_LITERALS = (
     "/Library/Application Support",
 )
 
+# D2 (owner decision, gate 2 E28/root425): the ONLY file the
+# contained subscription worker may write. The host takes an
+# advisory lock on exactly this file during settings/read, so
+# the policy allows file-write-data + file-write-create on
+# this literal only: no unlink/rename, nothing else in
+# ~/.config/muse writable.
+SUBSCRIPTION_WORKER_SETTINGS_LOCK = (
+    "~/.config/muse/.settings.json.lock")
+
 
 class ContainmentError(Exception):
     pass
@@ -401,11 +410,14 @@ def subscription_worker_exceptions(home=None) -> list:
 
 def _prove_subscription_plus(text: str, base: str,
                              read_clauses: list,
-                             meta_entries: list) -> None:
+                             meta_entries: list,
+                             extra_lines=()) -> None:
     """Prove text is the base policy plus exactly the given
-    read clauses and metadata entries — removal style. Read
-    removal operates on the read-deny line only, metadata
-    removal on the metadata line only; every other line
+    read clauses, metadata entries, and whole extra lines —
+    removal style. Read removal operates on the read-deny
+    line only, metadata removal on the metadata line only,
+    and each extra line (the D2 write rule) must appear
+    exactly once outside those lines; every other line
     (network deny, write confinement, exec pin, securityd
     deny) must be identical.
     """
@@ -451,6 +463,11 @@ def _prove_subscription_plus(text: str, base: str,
               if ln != tread and ln != tmeta]
     rest_b = [ln for ln in blines
               if ln != oread and ln != ometa]
+    for extra in extra_lines:
+        if rest_t.count(extra) != 1:
+            raise ContainmentError(
+                "subscription proof: extra not unique")
+        rest_t.remove(extra)
     if rest_t != rest_b:
         raise ContainmentError(
             "subscription proof: extra diff")
@@ -461,15 +478,20 @@ def build_subscription_worker_policy_text(root: str,
                                           home=None) -> str:
     """Contained subscription-worker profile: product A text
     plus exactly the F2 named read exception (gate (2),
-    root301).
+    root301) and the one D2 settings-lock write rule (gate
+    (2), root425).
 
     Reads: the SUBSCRIPTION_WORKER_READ_EXCEPTIONS clauses.
     Metadata: the ancestor literals of each read path plus
     SUBSCRIPTION_WORKER_EXTRA_META_LITERALS, restricted to
-    entries not already present in the base text. Network
-    deny, owned-only writes, the exec pin, and the securityd
-    deny stay exactly as in the base policy. The result is
-    proven base-plus by removal; anything else raises
+    entries not already present in the base text. Write: one
+    appended allow line, file-write-data + file-write-create
+    on the SUBSCRIPTION_WORKER_SETTINGS_LOCK literal only
+    (advisory lock for settings/read; no unlink/rename,
+    nothing else writable). Network deny, the write-deny
+    line itself, the exec pin, and the securityd deny stay
+    byte-identical to the base policy. The result is proven
+    base-plus by removal; anything else raises
     ContainmentError. Nothing here authorizes a model worker.
     """
     if not root or not os.path.isabs(root):
@@ -533,8 +555,26 @@ def build_subscription_worker_policy_text(root: str,
     text = text.replace(metaline,
                         metaline[:-1] + "".join(meta_entries)
                         + ")", 1)
+    account_home = _resolve_worker_home(home)
+    lock_path = os.path.normpath(os.path.join(
+        account_home, SUBSCRIPTION_WORKER_SETTINGS_LOCK[2:]))
+    real_lock = os.path.realpath(lock_path)
+    if real_lock == real_root or real_lock.startswith(
+            real_root + os.sep):
+        raise ContainmentError(
+            "worker exception must not resolve under the "
+            "owned root: %s" % lock_path)
+    write_rule = ("(allow file-write-data file-write-create "
+                  "(literal %s))" % _sb_literal(lock_path))
+    if write_rule in text:
+        raise ContainmentError(
+            "subscription proof: write rule present")
+    if not text.endswith("\n"):
+        raise ContainmentError(
+            "subscription proof: base text shape")
+    text = text + write_rule + "\n"
     _prove_subscription_plus(text, base, read_clauses,
-                             meta_entries)
+                             meta_entries, [write_rule])
     return text
 
 

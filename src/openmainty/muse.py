@@ -1658,6 +1658,82 @@ def parse_msp_usage(result: dict) -> dict:
     }
 
 
+# settings/read returns the OWNER's composed values. Only these
+# keys' values may be observed; everything else is dropped by
+# the parser, never retained, returned, or logged.
+_MSP_SETTINGS_KEYS = (
+    "provider",
+    "model",
+    "reasoning_effort",
+    "contributor_mode_enabled",
+    "contributor_mode_disclosure_acknowledged",
+)
+
+_MSP_SETTING_SAFE_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "abcdefghijklmnopqrstuvwxyz"
+    "0123456789._:/-")
+
+
+def _msp_render_setting(value):
+    """Render one allowlisted setting value for records.
+
+    Booleans, numbers, and null pass through verbatim. Strings
+    pass through only when short, interpolation-free, and drawn
+    from the safe ident charset; anything else keeps only its
+    JSON type name, never its text. Returns (rendered,
+    verbatim_bool).
+    """
+    if value is None or isinstance(value, bool):
+        return value, True
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and (
+                value != value or value in (float("inf"),
+                                            float("-inf"))):
+            return "number", False
+        return value, True
+    if isinstance(value, str):
+        if (1 <= len(value) <= 64 and "${" not in value
+                and all(ch in _MSP_SETTING_SAFE_CHARS
+                        for ch in value)):
+            return value, True
+        return "str", False
+    if isinstance(value, list):
+        return "list", False
+    if isinstance(value, dict):
+        return "dict", False
+    return "unknown", False
+
+
+def parse_msp_settings_read(result: dict) -> dict:
+    """Validate a settings/read result; keep allowlisted keys only.
+
+    Requires a values object (missing/non-object values refuse
+    malformed: an unreadable file must surface as a host error,
+    never as silent absence). Each allowlisted key reports
+    {"served", "value", ["verbatim"]}; absent keys report
+    served False with value "absent". Every other key is
+    dropped entirely.
+    """
+    if not isinstance(result, dict):
+        raise MspError("settings result must be an object",
+                       code="malformed")
+    values = result.get("values")
+    if not isinstance(values, dict):
+        raise MspError("settings values must be an object",
+                       code="malformed")
+    allow = {}
+    for key in _MSP_SETTINGS_KEYS:
+        if key not in values:
+            allow[key] = {"served": False, "value": "absent"}
+            continue
+        rendered, verbatim = _msp_render_setting(values[key])
+        allow[key] = {"served": True, "value": rendered,
+                      "verbatim": verbatim}
+    return {"schemaVersion": result.get("schemaVersion"),
+            "allow": allow}
+
+
 def msp_usage_fresh_after(usage: dict, ack_ms: int) -> bool:
     """Stage-B freshness predicate for a parsed usage record.
 
@@ -2614,7 +2690,7 @@ _MSP_WORKERS: dict = {}
 
 _MSP_WORKER_METHODS = ("initialize", "account/read", "session/start",
                        "session/read", "hook/list", "model/list",
-                       "usage/read")
+                       "usage/read", "settings/read")
 
 _MSP_WORKER_LIFECYCLE_METHODS = ("session/started",
                                  "session/statusChanged",
@@ -3614,6 +3690,7 @@ def msp_worker_session_start(handle: str, *, workspace_root: str,
                 rec, bound, params["workspaceRoot"])
             rec["worker_session"] = bound
             rec["worker_session_closed"] = False
+            rec["worker_session_pid"] = rec["child_pid"]
     except MspError:
         # Any start attempt/failure after the pre-wire checks is
         # non-rebindable on this handle: the host may hold a
@@ -3782,6 +3859,104 @@ def msp_worker_usage(handle: str, *,
     return parsed
 
 
+def _worker_evaluate_config(rec: dict, parsed: dict) -> None:
+    """Establish (or refuse) the observer-backed config identity.
+
+    The ONLY place that may set rec["config_established"]: the
+    flag goes True only when the parsed settings/read ran on
+    the same alive child pid as the bound session, after
+    bootstrap, and served provider "meta" verbatim,
+    contributor_mode_enabled True verbatim, and model equal to
+    the session-bound model id. Then rec["config_identity"] =
+    {pid, sha256 of the canonical allowlisted JSON, provider,
+    model, contributor}. Any other case deletes both and
+    records a precise rec["config_unset_reason"] instead — a
+    mismatch also revokes a prior establishment, since the
+    served config drifted. Pure state transition; no I/O.
+    """
+    bound = rec.get("worker_session")
+    if not isinstance(bound, dict) or not bound.get("id"):
+        reason = "no-session: no bound session on this handle"
+    elif rec.get("child_pid") != rec.get("worker_session_pid"):
+        reason = ("pid-changed: settings served by pid %r, "
+                  "session bound on pid %r"
+                  % (rec.get("child_pid"),
+                     rec.get("worker_session_pid")))
+    else:
+        allow = parsed["allow"]
+        provider = allow["provider"]
+        contributor = allow["contributor_mode_enabled"]
+        model = allow["model"]
+        if not provider["served"] or not provider["verbatim"] \
+                or provider["value"] != "meta":
+            reason = "provider-mismatch: served %r" % (
+                provider["value"],)
+        elif not contributor["served"] \
+                or contributor["value"] is not True:
+            reason = "contributor-not-enabled: served %r" % (
+                contributor["value"],)
+        elif not model["served"] or not model["verbatim"] \
+                or model["value"] != bound.get("model_id"):
+            reason = "model-mismatch: served %r, bound %r" % (
+                model["value"], bound.get("model_id"))
+        else:
+            reason = None
+    if reason is not None:
+        rec.pop("config_established", None)
+        rec.pop("config_identity", None)
+        rec["config_unset_reason"] = reason
+        return
+    canon = json.dumps(parsed["allow"], sort_keys=True,
+                       separators=(",", ":"))
+    rec["config_established"] = True
+    rec["config_identity"] = {
+        "pid": rec["child_pid"],
+        "sha256": hashlib.sha256(
+            canon.encode("utf-8")).hexdigest(),
+        "provider": "meta",
+        "model": bound.get("model_id"),
+        "contributor": True}
+    rec.pop("config_unset_reason", None)
+
+
+def msp_worker_settings_read(handle: str, *,
+                             timeout: float = 30.0) -> dict:
+    """Query settings/read: the host's served config, read-only.
+
+    Host-level (no session needed): sends exactly
+    "settings/read" with {} params. Anything starting with
+    "settings/write" is not a transport method and refuses
+    with bad-method before any wire write. The parser keeps
+    ONLY the allowlisted keys; every other served value is
+    dropped, never returned or recorded. Afterwards the
+    observer-backed config identity is evaluated (see
+    _worker_evaluate_config): a refused or errored query
+    records a precise unset reason and sets nothing. Takes no
+    caller argument for establishment — the served values
+    alone decide.
+    """
+    rec = _worker_record(handle)
+    if rec.get("closed"):
+        raise MspError("MSP worker handle is closed",
+                       code="unknown-handle")
+    if not rec.get("worker_bootstrapped"):
+        raise MspError("worker host is not bootstrapped",
+                       code="not-bootstrapped")
+    timeout = _msp_validate_timeout(timeout, "worker settings")
+    try:
+        result = _worker_send_request(handle, "settings/read",
+                                      {}, timeout)
+        parsed = parse_msp_settings_read(result)
+    except MspError as exc:
+        rec.pop("config_established", None)
+        rec.pop("config_identity", None)
+        rec["config_unset_reason"] = "settings-error:%s" % (
+            exc.code,)
+        raise
+    _worker_evaluate_config(rec, parsed)
+    return parsed
+
+
 def canary_admission(handle: str) -> dict:
     """Stage-A verdict: admit ONE bounded canary turn, never authority.
 
@@ -3789,14 +3964,14 @@ def canary_admission(handle: str) -> dict:
     credential lane, recorded hook count, recorded usage, config
     flag, and the single-use consumption flag. worker_hook_count
     and worker_usage are populated only by real hook/list and
-    usage/read runs, so those legs clear honestly; production
-    NEVER sets config_established in this slice, so production
-    always refuses on config-unestablished. OPEN: the criterion
-    that would establish config (an observer-backed config
-    identity bound to the same alive host) is not designed yet;
-    nothing here may set the flag by hand. On the single
-    admitting combination the consumption flag is set: a second
-    call refuses with canary-already-consumed. Full admission is
+    usage/read runs, so those legs clear honestly; config_ok
+    reads rec["config_established"], which ONLY
+    msp_worker_settings_read may set (same alive child pid as
+    the bound session, provider "meta", contributor enabled,
+    model matching — see _worker_evaluate_config). Nothing
+    here may set the flag by hand. On the single admitting
+    combination the consumption flag is set: a second call
+    refuses with canary-already-consumed. Full admission is
     never granted here (see msp_worker_capability, still hard
     False).
     """
@@ -3851,8 +4026,11 @@ def msp_worker_capability(handle: str) -> dict:
     a Meta-ready native profile (no offline deny-all policy is
     model-network admission), and contributor/config proof
     (requested flags are not observed enforcement). Session
-    binding is reported, never authority. No caller-supplied
-    verified bool or auth dict can change this verdict.
+    binding is reported, never authority. The contributor_config
+    member reports the observed config identity when
+    msp_worker_settings_read established one on this handle
+    (observed False otherwise). No caller-supplied verified
+    bool or auth dict can change this verdict.
     """
     rec = _worker_record(handle)
     if rec.get("closed"):
@@ -3871,8 +4049,20 @@ def msp_worker_capability(handle: str) -> dict:
     missing.append("metaready-native-profile: unproved (the "
                    "offline deny-all wrapper is session-lifecycle "
                    "capability only, not model-network admission)")
-    missing.append("contributor-config: unproved (requested CLI "
-                   "flags only; effective config unobserved)")
+    ident = rec.get("config_identity")
+    if rec.get("config_established") is True and isinstance(
+            ident, dict):
+        contributor_config = {
+            "observed": True,
+            "provider": ident.get("provider"),
+            "model": ident.get("model"),
+            "pid": ident.get("pid"),
+            "sha256": ident.get("sha256")}
+    else:
+        missing.append("contributor-config: unproved (requested "
+                       "CLI flags only; effective config "
+                       "unobserved)")
+        contributor_config = {"observed": False}
     bound = rec.get("worker_session")
     session_bound = isinstance(bound, dict) and bool(bound.get("id"))
     return {"admitted": False,
@@ -3880,6 +4070,7 @@ def msp_worker_capability(handle: str) -> dict:
             "credential_note": note,
             "session_bound": session_bound,
             "session_status": (bound or {}).get("status"),
+            "contributor_config": contributor_config,
             "missing": missing}
 
 
