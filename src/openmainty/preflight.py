@@ -798,13 +798,73 @@ def _validate_binary_shape(binary: dict, name: str) -> None:
                 status=502, code="corrupt")
 
 
+def _validate_worker_binding(worker: dict, name: str) -> None:
+    """Closed same-alive worker binding (slice 297).
+
+    Names the exact live worker an established config was
+    proved on: registry handle, child pid, and the slice-293
+    served-settings sha. Unknown keys are corrupt; a missing
+    key is corrupt. Legacy records omit "worker" entirely.
+    """
+    if not isinstance(worker, dict):
+        raise PreflightError(f"preflight {name} must be an object",
+                             status=502, code="corrupt")
+    for key in ("handle", "pid", "sha256", "provider", "model",
+                "contributor"):
+        if key not in worker:
+            raise PreflightError(
+                f"preflight {name} is missing key: {key!r}",
+                status=502, code="corrupt")
+    for key in worker:
+        if key not in ("handle", "pid", "sha256", "provider",
+                       "model", "contributor"):
+            raise PreflightError(
+                f"preflight {name} has unknown key: {key!r}",
+                status=502, code="corrupt")
+    handle = worker["handle"]
+    if not isinstance(handle, str) or not handle \
+            or len(handle) > 128:
+        raise PreflightError(
+            f"preflight {name}.handle must be a non-empty string",
+            status=502, code="corrupt")
+    pid = worker["pid"]
+    if not isinstance(pid, int) or isinstance(pid, bool) \
+            or pid <= 0:
+        raise PreflightError(
+            f"preflight {name}.pid must be a positive "
+            f"integer", status=502, code="corrupt")
+    sha = worker["sha256"]
+    if not isinstance(sha, str) or len(sha) != 64 or any(
+            c not in "0123456789abcdefABCDEF" for c in sha):
+        raise PreflightError(
+            f"preflight {name}.sha256 must be 64 hex chars",
+            status=502, code="corrupt")
+    provider = worker["provider"]
+    if not isinstance(provider, str) or not provider \
+            or len(provider) > 64:
+        raise PreflightError(
+            f"preflight {name}.provider must be a non-empty "
+            f"string", status=502, code="corrupt")
+    model = worker["model"]
+    if not isinstance(model, str) or not model \
+            or len(model) > 128:
+        raise PreflightError(
+            f"preflight {name}.model must be a non-empty string",
+            status=502, code="corrupt")
+    if worker["contributor"] is not True \
+            and worker["contributor"] is not False:
+        raise PreflightError(
+            f"preflight {name}.contributor must be a boolean",
+            status=502, code="corrupt")
+
+
 def _validate_config_shape(config: dict, name: str) -> None:
     """Closed config-surface identity (explicit unestablished)."""
     if not isinstance(config, dict):
         raise PreflightError(f"preflight {name} must be an object",
                              status=502, code="corrupt")
     for key in config:
-        if key not in ("status", "files", "note"):
+        if key not in ("status", "files", "note", "worker"):
             raise PreflightError(
                 f"preflight {name} has unknown key: {key!r}",
                 status=502, code="corrupt")
@@ -846,6 +906,9 @@ def _validate_config_shape(config: dict, name: str) -> None:
         raise PreflightError(
             f"preflight {name}.note must be bounded text",
             status=502, code="corrupt")
+    if "worker" in config:
+        _validate_worker_binding(config["worker"],
+                                 f"{name}.worker")
 
 
 def _validate_auth_shape(auth: dict, name: str) -> None:
@@ -1223,7 +1286,237 @@ def _child_env_shape():
             "values": values}
 
 
-def current_identity():
+# Slice 297 (S1+S2): observer-backed identity from a live worker.
+# The slice-293 worker record is the config source of truth; the
+# worker's own account observation plus its owned trace
+# (credential.status) is the credential source of truth. A handle
+# names a live registry entry in THIS process only: nothing on
+# disk can stand in for it, and a closed or replaced worker no
+# longer counts. No model turn is sent on this path.
+_WORKER_IDENTITY_PROFILE = "subscription-broker"
+_CRED_SOURCE_LOGIN = "subscription-login"
+_CRED_TRACE_FIELDS = ("event", "provider", "source",
+                        "masks_login")
+_CRED_TRACE_FILES_MAX = 8
+_CRED_TRACE_BYTES_MAX = 1 << 20
+_CRED_VALUE_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789_.:/-")
+_HEX_CHARS = frozenset("0123456789abcdef")
+
+
+def _cred_scalar_ok(value):
+    if not isinstance(value, str):
+        return False
+    if not 1 <= len(value) <= 64:
+        return False
+    for char in value:
+        if char not in _CRED_VALUE_CHARS:
+            return False
+    return True
+
+
+def _read_worker_credential_trace(root):
+    """Latest meta credential.status from the worker's OWNED trace.
+
+    Returns ({"source", "masks_login"}, None) or (None, reason).
+    Only the two enum scalars are ever kept; raw lines are
+    never retained. Only provider=meta lines count: another
+    provider's line must never decide this worker's result.
+    The newest matching line wins: it names the current
+    credential state, not history, so each file is read from
+    the tail (last _CRED_TRACE_BYTES_MAX bytes, dropping a
+    possibly partial first line). More than
+    _CRED_TRACE_FILES_MAX files refuses with a named reason
+    instead of silently dropping some.
+    """
+    if not isinstance(root, str) or not root:
+        return None, "trace-root-missing"
+    found = []
+    try:
+        for dirpath, _dirnames, filenames in os.walk(
+                os.path.join(root, "data")):
+            for leaf in sorted(filenames):
+                if leaf.endswith(".log"):
+                    found.append(os.path.join(dirpath, leaf))
+                    if len(found) > _CRED_TRACE_FILES_MAX:
+                        return None, "trace-too-many-files"
+    except OSError:
+        return None, "trace-unreadable"
+    latest = None
+    try:
+        for path in sorted(found):
+            with open(path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                if size > _CRED_TRACE_BYTES_MAX:
+                    fh.seek(size - _CRED_TRACE_BYTES_MAX)
+                    fh.readline()  # drop a partial first line
+                else:
+                    fh.seek(0)
+                blob = fh.read()
+            text = blob.decode("utf-8", errors="replace")
+            for line in text.splitlines():
+                if "credential.status" not in line:
+                    continue
+                fields = {}
+                for token in line.split():
+                    key, sep, value = token.partition("=")
+                    if not sep \
+                            or key not in _CRED_TRACE_FIELDS:
+                        continue
+                    if len(value) >= 2 and value[:1] == '"' \
+                            and value[-1:] == '"':
+                        value = value[1:-1]
+                    if _cred_scalar_ok(value):
+                        fields[key] = value
+                if fields.get("event") == "credential.status" \
+                        and fields.get("provider") == "meta" \
+                        and "source" in fields \
+                        and "masks_login" in fields:
+                    latest = {"source": fields["source"],
+                              "masks_login":
+                                  fields["masks_login"]}
+    except OSError:
+        return None, "trace-unreadable"
+    if latest is None:
+        return None, "credential-status-missing"
+    return latest, None
+
+
+def _observe_worker_identity(handle):
+    """(config, auth) proved by one live worker, or unestablished.
+
+    Every runtime failure degrades to status "unestablished"
+    (config) and source "unknown" (auth) with the worker's
+    recorded reason. Only a non-string handle raises, as a
+    caller bug: it can never name a live worker.
+    """
+    from . import muse as _muse
+    if not isinstance(handle, str) or not handle:
+        raise ValueError(
+            "worker handle must be a non-empty str")
+    key_present = "META_API_KEY" in os.environ
+    contrib_present = "MUSE_CONTRIBUTOR_MODE" in os.environ
+
+    def _unknown_config(reason):
+        return {"status": "unestablished", "files": [],
+                "note": str(reason)[:500]}
+
+    def _unknown_auth(how):
+        return {"meta_api_key_present": key_present,
+                "contributor_env_present": contrib_present,
+                "credential_source": "unknown",
+                "billing_evidence": None,
+                "observed_how": str(how)[:200]}
+
+    rec = _muse._MSP_WORKERS.get(handle)
+    if rec is None or rec.get("closed"):
+        return (_unknown_config(
+                    "worker gone: no live handle %s" % handle),
+                _unknown_auth("worker gone: no live handle"))
+    broken = rec.get("broken")
+    if broken:
+        return (_unknown_config(
+                    "worker broken: %s" % (broken,)),
+                _unknown_auth("worker broken"))
+    proc = rec.get("proc")
+    if proc is not None and proc.poll() is not None:
+        return (_unknown_config("worker child exited"),
+                _unknown_auth("worker child exited"))
+    try:
+        _muse._worker_check_owner(rec)
+    except _muse.MspError as exc:
+        return (_unknown_config(
+                    "worker owner check failed: %s"
+                    % (exc.code or "owner-mismatch",)),
+                _unknown_auth("worker owner mismatch"))
+    profile = rec.get("profile")
+    if profile != _WORKER_IDENTITY_PROFILE:
+        return (_unknown_config(
+                    "worker profile %s: need %s"
+                    % (profile, _WORKER_IDENTITY_PROFILE)),
+                _unknown_auth("worker profile %s" % (profile,)))
+    # Re-observe the worker itself, never just the record: a
+    # config that changed after the last read must not read
+    # as established. A local read only; no model turn.
+    try:
+        _muse.msp_worker_settings_read(handle, timeout=10.0)
+    except _muse.MspError as exc:
+        return (_unknown_config(
+                    "worker settings-read failed: %s"
+                    % (exc.code or "error",)),
+                _unknown_auth("worker settings-read failed"))
+    if rec.get("config_established") is not True:
+        reason = rec.get("config_unset_reason") \
+            or "config not established"
+        return (_unknown_config(reason),
+                _unknown_auth("config not established"))
+    identity = rec.get("config_identity") or {}
+    live_pid = rec.get("child_pid")
+    if identity.get("pid") != live_pid:
+        return (_unknown_config(
+                    "worker pid changed: identity pid %r, "
+                    "live pid %r"
+                    % (identity.get("pid"), live_pid)),
+                _unknown_auth("worker pid changed"))
+    sha = identity.get("sha256")
+    provider = identity.get("provider")
+    model = identity.get("model")
+    contributor = identity.get("contributor")
+    sha_ok = isinstance(sha, str) and len(sha) == 64 \
+        and all(char in _HEX_CHARS for char in sha)
+    if not (sha_ok and isinstance(provider, str)
+            and isinstance(model, str)
+            and contributor is True):
+        return (_unknown_config("worker identity incomplete"),
+                _unknown_auth("worker identity incomplete"))
+    config = {
+        "status": "established", "files": [],
+        "note": ("worker-proved %s config: handle %s pid %s "
+                 "sha %s" % (profile, handle, live_pid,
+                             sha))[:500],
+        "worker": {"handle": handle, "pid": live_pid,
+                   "sha256": sha, "provider": provider,
+                   "model": model, "contributor": True},
+    }
+    account = rec.get("worker_account")
+    if not isinstance(account, dict):
+        return config, _unknown_auth("account unobserved")
+    lane, _note = _muse.msp_credential_lane(account)
+    if key_present or lane in ("apiKey", "envKey"):
+        return config, _unknown_auth(
+            "caller key takes precedence: env key=%s "
+            "lane=%s" % (key_present, lane))
+    if lane != "accountLogin-candidate":
+        return config, _unknown_auth(
+            "account lane %s: login unobserved" % (lane,))
+    cred, cred_reason = _read_worker_credential_trace(
+        rec.get("root"))
+    if cred is None:
+        return config, _unknown_auth(
+            "trace credential.status %s" % (cred_reason,))
+    if cred["source"] != "login":
+        return config, _unknown_auth(
+            "trace credential source %s" % (cred["source"],))
+    if cred["masks_login"] != "false":
+        return config, _unknown_auth(
+            "trace credential masks_login true")
+    auth = {
+        "meta_api_key_present": key_present,
+        "contributor_env_present": contrib_present,
+        "credential_source": _CRED_SOURCE_LOGIN,
+        "billing_evidence": None,
+        "observed_how": (
+            "worker %s pid %s: accountLogin/"
+            "accountLogin-candidate; trace credential.status "
+            "source=login masks_login=false; billing not "
+            "observed" % (handle, live_pid))[:200],
+    }
+    return config, auth
+
+
+def current_identity(worker_handle=None):
     """Snapshot the live world the dedicated profile would run in.
 
     Returns {"binary", "policy", "config", "source", "env", "auth"}.
@@ -1240,6 +1533,14 @@ def current_identity():
     source: absence is necessary but not sufficient, and values are
     never logged. Offline tests mock this whole function;
     production has no fixture path.
+
+    With worker_handle None (the only production path today),
+    config/auth stay hardcoded unestablished/unknown, exactly as
+    before. With a live worker handle, both legs are observed
+    from that same worker; anything unproved stays unestablished
+    with the worker's recorded reason. No production caller
+    passes a handle yet: the spawn-and-bind lifecycle is a
+    later slice.
     """
     from . import muse as _muse
     try:
@@ -1249,21 +1550,26 @@ def current_identity():
     except OSError as exc:
         binary = {"status": "unavailable", "error": str(exc)[:300],
                   "path": "", "real_path": "", "sha256": ""}
+    if worker_handle is None:
+        config = {"status": "unestablished", "files": [],
+                  "note": "config surface not yet pinned; target-A "
+                          "refused until a later gate establishes it"}
+        auth = {"meta_api_key_present": "META_API_KEY" in os.environ,
+                "contributor_env_present":
+                    "MUSE_CONTRIBUTOR_MODE" in os.environ,
+                "credential_source": "unknown",
+                "billing_evidence": None,
+                "observed_how": "app env presence check only; no "
+                                "session proof observed"}
+    else:
+        config, auth = _observe_worker_identity(worker_handle)
     return {
         "binary": binary,
         "policy": dict(_muse.SOURCE_REPAIR_PROFILE),
-        "config": {"status": "unestablished", "files": [],
-                   "note": "config surface not yet pinned; target-A "
-                           "refused until a later gate establishes it"},
+        "config": config,
         "source": _collect_source_identity(),
         "env": _child_env_shape(),
-        "auth": {"meta_api_key_present": "META_API_KEY" in os.environ,
-                 "contributor_env_present":
-                     "MUSE_CONTRIBUTOR_MODE" in os.environ,
-                 "credential_source": "unknown",
-                 "billing_evidence": None,
-                 "observed_how": "app env presence check only; no "
-                                 "session proof observed"},
+        "auth": auth,
     }
 
 
@@ -1429,6 +1735,21 @@ def _same_world(recorded: dict, live: dict) -> bool:
     if list(rec_cfg.get("files") or []) != list(
             live_cfg.get("files") or []):
         return False
+    # Same-alive worker binding (slice 297): like the legacy
+    # contributor key above, absent != present. A replaced
+    # worker (handle, pid, or served-settings sha differs)
+    # is a new world, never relabeled proof.
+    rec_worker = rec_cfg.get("worker")
+    live_worker = live_cfg.get("worker")
+    if (rec_worker is None) != (live_worker is None):
+        return False
+    if rec_worker is not None:
+        if not isinstance(rec_worker, dict) \
+                or not isinstance(live_worker, dict):
+            return False
+        for key in ("handle", "pid", "sha256"):
+            if rec_worker.get(key) != live_worker.get(key):
+                return False
     rec_src = recorded.get("source") or {}
     live_src = live.get("source") or {}
     if str(rec_src.get("app_version") or "") != str(
@@ -1624,6 +1945,26 @@ def _create_preflight_locked(home_path: str, dedupe_key: str) -> dict:
             "dir": [dev, ino],
             "home": [hdev, hino],
         }
+        # Same-alive binding (slice 297): the record names the
+        # exact worker the config was proved on. A present
+        # "worker" key is always projected and validated
+        # below, so a malformed binding refuses the create
+        # instead of silently falling back to legacy.
+        if "worker" in config:
+            worker = config["worker"]
+            if isinstance(worker, dict):
+                inputs["config"]["worker"] = {
+                    "handle": str(worker.get("handle") or ""),
+                    "pid": worker.get("pid"),
+                    "sha256": str(worker.get("sha256") or ""),
+                    "provider": str(
+                        worker.get("provider") or ""),
+                    "model": str(worker.get("model") or ""),
+                    "contributor": bool(
+                        worker.get("contributor")),
+                }
+            else:
+                inputs["config"]["worker"] = worker
         _validate_input_doc(inputs)
         _write_owned_json(dfd, f"{pfid}.input.json", inputs,
                           immutable=True,
@@ -2700,6 +3041,35 @@ def check_target_authority(home=None, current=None,
             "config identity unestablished or drifted since the "
             "preflight; target-A refused. 다음: 설정 표면이 확정될 "
             "때까지 대기하세요.", "config-unestablished")
+    # Same-alive worker binding (slice 297): when the binding
+    # exists, an established config only counts on the exact
+    # worker it was proved on. A gone, replaced, or drifted
+    # worker refuses here; a new check on the live worker
+    # re-proves. Absent on both sides keeps the legacy
+    # file-based established path; present on only one side
+    # is drift. (In production, established arises only via
+    # worker observation, which always sets the key.)
+    rec_worker = rec_cfg.get("worker")
+    live_worker = live_cfg.get("worker")
+    if (rec_worker is None) != (live_worker is None):
+        raise _refuse(
+            "worker binding changed since the preflight; "
+            "target-A refused. 다음: 격리 점검을 다시 실행하세요.",
+            "config-unestablished")
+    if rec_worker is not None:
+        if not isinstance(rec_worker, dict) \
+                or not isinstance(live_worker, dict):
+            raise _refuse(
+                "worker binding unreadable; target-A refused. "
+                "다음: 격리 점검을 다시 실행하세요.",
+                "config-unestablished")
+        for key in ("handle", "pid", "sha256"):
+            if rec_worker.get(key) != live_worker.get(key):
+                raise _refuse(
+                    "worker binding drifted since the preflight "
+                    "(%s changed); target-A refused. 다음: 격리 "
+                    "점검을 다시 실행하세요." % key,
+                    "config-unestablished")
     live_src = live.get("source") or {}
     rec_src = inputs.get("source") or {}
     if not isinstance(live_src, dict) or live_src.get("status") != "ok" \
