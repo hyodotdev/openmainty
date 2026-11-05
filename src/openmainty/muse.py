@@ -2049,7 +2049,7 @@ def _msp_resolve_snapshot(binary):
 
 def _msp_build_wrapper(root: str, snap: dict, *,
                      profile: str = "product",
-                     home=None) -> dict:
+                     home=None, broker_port=None) -> dict:
     """Build the single native wrapper argv (IO boundary for tests).
 
     The production path creates the ncontain offline policy inside
@@ -2066,13 +2066,17 @@ def _msp_build_wrapper(root: str, snap: dict, *,
     subscription-worker policy (product A plus exactly the F2
     named read exception) for the given account home instead;
     profile "subscription-canary" builds the canary policy
-    (subscription plus exactly the two E31 network lines).
-    anything else refuses. The default keeps existing callers
-    on the product policy.
+    (subscription plus exactly the two E31 network lines);
+    profile "subscription-broker" builds the broker policy
+    (subscription plus exactly the one loopback egress line
+    for broker_port, which is required). anything else
+    refuses. The default keeps existing callers on the
+    product policy.
     """
     from . import ncontain as _ncontain
     if profile not in ("product", "subscription",
-                       "subscription-canary"):
+                       "subscription-canary",
+                       "subscription-broker"):
         raise MspError(f"unknown worker profile: {profile!r}",
                        code="bad-input")
     try:
@@ -2087,7 +2091,13 @@ def _msp_build_wrapper(root: str, snap: dict, *,
                "mode": oct(stat.S_IMODE(st.st_mode)),
                "offline_only": True, "admits_worker": False}
     try:
-        if profile == "subscription-canary":
+        if profile == "subscription-broker":
+            if broker_port is None:
+                raise MspError("broker profile needs a port",
+                               code="bad-input")
+            policy = _ncontain.create_subscription_broker_policy(
+                root, exe_pin, home, broker_port)
+        elif profile == "subscription-canary":
             policy = _ncontain.create_subscription_canary_policy(
                 root, exe_pin, home)
         elif profile == "subscription":
@@ -2878,7 +2888,7 @@ def _worker_send_request(handle: str, method: str, params: dict,
     _MSP_WORKER_METHODS with fixed params may be sent. The shared
     transport contract lives in _msp_exchange. turn/start is
     structurally single-use: it refuses before any wire write
-    unless the handle's profile is "subscription-canary", the
+    unless the handle's profile is a canary profile, the
     canary-turn flag is already set (only msp_worker_canary_turn
     sets it, before its own wire write), and the one-shot wire
     flag is still unused; the wire flag is set here, at the
@@ -2889,9 +2899,10 @@ def _worker_send_request(handle: str, method: str, params: dict,
         raise MspError("MSP worker handle is closed",
                        code="unknown-handle")
     if method == "turn/start":
-        if rec.get("profile") != "subscription-canary":
-            raise MspError("turn/start needs the "
-                           "subscription-canary profile",
+        if rec.get("profile") not in _MSP_TURN_PROFILES:
+            raise MspError("turn/start needs a canary "
+                           "profile (subscription-canary or "
+                           "subscription-broker)",
                            code="canary-profile")
         if rec.get("worker_canary_turn_sent") is not True:
             raise MspError("turn/start needs the canary "
@@ -3250,13 +3261,18 @@ def spawn_msp_worker(root: str, binary: Optional[str] = None, *,
     the child HOME and XDG_CONFIG_HOME at the real account
     home; museHome, cache, and TMPDIR stay owned. Profile
     "subscription-canary" is subscription plus exactly the two
-    E31 network lines (443 out, DNS resolver): the only
-    profile a canary turn may use. The default "product"
-    keeps existing behaviour unchanged. Unknown profiles
-    refuse.
+    E31 network lines (443 out, DNS resolver). Profile
+    "subscription-broker" starts an owned loopback CONNECT
+    broker, allows the child egress only to it, and passes
+    -c endpoint_transport.proxy for its port (E38 shape).
+    The default "product" keeps existing behaviour
+    unchanged. Unknown profiles refuse. A canary turn may
+    use subscription-canary or subscription-broker, under
+    exactly the same gates.
     """
     if profile not in ("product", "subscription",
-                       "subscription-canary"):
+                       "subscription-canary",
+                       "subscription-broker"):
         raise MspError(f"unknown worker profile: {profile!r}",
                        code="bad-input")
     timeout_s = _msp_validate_timeout(timeout_s, "worker spawn")
@@ -3274,37 +3290,85 @@ def spawn_msp_worker(root: str, binary: Optional[str] = None, *,
     env = _msp_host_env(canon)
     worker_home = None
     worker_exceptions = None
-    if profile in ("subscription", "subscription-canary"):
-        from . import ncontain as _ncontain
+    worker_broker = None
+    worker_broker_port = None
+    proxy_flag = []
+    if profile == "subscription-broker":
+        from . import mspbroker as _mspbroker_mod
+        broker_cls = _BROKER_CLASS or \
+            _mspbroker_mod.ConnectBroker
         try:
-            worker_home = pwd.getpwuid(os.getuid()).pw_dir
-        except KeyError as exc:
-            raise MspError("worker account home unresolvable: "
-                           f"{exc}", code="unreadable") from exc
-        try:
-            if profile == "subscription-canary":
-                worker_exceptions = \
-                    _ncontain.subscription_canary_exceptions(
-                        worker_home)
-            else:
-                worker_exceptions = \
-                    _ncontain.subscription_worker_exceptions(
-                        worker_home)
-        except _ncontain.ContainmentError as exc:
-            raise MspError(f"worker profile unavailable: {exc}",
+            worker_broker = broker_cls()
+            worker_broker_port = worker_broker.start()
+        except Exception as exc:
+            raise MspError(f"worker broker failed to start: "
+                           f"{exc}",
                            code="containment") from exc
-        env["HOME"] = worker_home
-        env["XDG_CONFIG_HOME"] = os.path.join(
-            worker_home, ".config")
-        wrapped = _msp_build_wrapper(
-            canon, snap, profile=profile,
-            home=worker_home)
-    else:
-        wrapped = _msp_build_wrapper(canon, snap)
-    cmd = list(wrapped["argv"]) + ["serve"] + build_host_cmd()[2:]
+        proxy_flag = [
+            "-c", 'endpoint_transport.proxy='
+                  '"http://127.0.0.1:%d"' % worker_broker_port]
+    try:
+        if profile in ("subscription", "subscription-canary",
+                       "subscription-broker"):
+            from . import ncontain as _ncontain
+            try:
+                worker_home = pwd.getpwuid(os.getuid()).pw_dir
+            except KeyError as exc:
+                raise MspError(
+                    "worker account home unresolvable: "
+                    f"{exc}", code="unreadable") from exc
+            try:
+                if profile == "subscription-canary":
+                    worker_exceptions = \
+                        _ncontain.subscription_canary_exceptions(
+                            worker_home)
+                else:
+                    worker_exceptions = \
+                        _ncontain.subscription_worker_exceptions(
+                            worker_home)
+                    if profile == "subscription-broker":
+                        worker_exceptions = list(
+                            worker_exceptions) + [{
+                                "path":
+                                    "(allow network-outbound "
+                                    "(remote tcp "
+                                    '"localhost:%d"))'
+                                    % worker_broker_port,
+                                "kind": "network",
+                                "reason":
+                                    "loopback egress to the "
+                                    "owned CONNECT broker "
+                                    "(E38)"}]
+            except _ncontain.ContainmentError as exc:
+                raise MspError(
+                    f"worker profile unavailable: {exc}",
+                    code="containment") from exc
+            env["HOME"] = worker_home
+            env["XDG_CONFIG_HOME"] = os.path.join(
+                worker_home, ".config")
+            wrapped = _msp_build_wrapper(
+                canon, snap, profile=profile,
+                home=worker_home,
+                broker_port=worker_broker_port)
+        else:
+            wrapped = _msp_build_wrapper(canon, snap)
+    except Exception:
+        if worker_broker is not None:
+            try:
+                worker_broker.stop()
+            except Exception:
+                pass
+        raise
+    cmd = list(wrapped["argv"]) + ["serve"] + proxy_flag \
+        + build_host_cmd()[2:]
     try:
         proc = _msp_spawn_process(cmd, env, canon)
     except (OSError, ValueError, TypeError) as exc:
+        if worker_broker is not None:
+            try:
+                worker_broker.stop()
+            except Exception:
+                pass
         raise MspError(f"worker host failed to spawn: {exc}",
                        code="transport") from exc
     handle = _msp_handle()
@@ -3324,6 +3388,11 @@ def spawn_msp_worker(root: str, binary: Optional[str] = None, *,
             proc.wait(timeout=10)
         except Exception:
             pass
+        if worker_broker is not None:
+            try:
+                worker_broker.stop()
+            except Exception:
+                pass
         raise MspError("worker root vanished during spawn: "
                        f"{exc}", code="unreadable") from exc
     import secrets
@@ -3357,6 +3426,8 @@ def spawn_msp_worker(root: str, binary: Optional[str] = None, *,
         "profile": profile,
         "worker_home": worker_home,
         "worker_profile_exceptions": worker_exceptions,
+        "worker_broker": worker_broker,
+        "worker_broker_port": worker_broker_port,
     }
     _MSP_WORKERS[handle] = rec
     out_t = threading.Thread(target=_msp_stdout_reader, args=(rec,),
@@ -3494,9 +3565,22 @@ _MSP_CANARY_WATCH_MAX_FOREGROUND = 16
 _MSP_CANARY_WATCH_SLEEP_S = 0.2
 
 
+_MSP_TURN_PROFILES = ("subscription-canary",
+                      "subscription-broker")
+"""Profiles a canary turn may use: the narrow-network
+canary and the brokered profile (slice 296), which joins
+exactly the same gates (admission, one-shot wire flag,
+pinned prompt, watch arming)."""
+
+_BROKER_CLASS = None
+"""ConnectBroker class for broker spawns; tests patch this
+seam to observe broker lifecycle. Resolved lazily so the
+broker module loads only for broker spawns."""
+
+
 def _canary_watch_armed(rec: dict) -> bool:
     """True only on a canary handle past the turn flag."""
-    return (rec.get("profile") == "subscription-canary"
+    return (rec.get("profile") in _MSP_TURN_PROFILES
             and rec.get("worker_canary_turn_sent") is True)
 
 
@@ -4708,7 +4792,7 @@ def msp_worker_canary_turn(handle: str, *,
     """Send the single canary turn and watch it to completion.
 
     Gates (MspError, no wire write): the handle's profile must
-    be "subscription-canary" (canary-profile); a canary
+    be a canary profile (canary-profile); a canary
     admission must already have been consumed on THIS handle
     by canary_admission (canary-not-admitted); no canary turn
     may have been sent yet (canary-already-sent; the flag is
@@ -4754,6 +4838,9 @@ def msp_worker_canary_turn(handle: str, *,
     Retry entries carry error_kind/http_status/system;
     completion carries request_denied/quota/duration_ms/
     ttft_ms/usage_input/usage_output when served.
+    On a closing stop the return additionally carries
+    {"broker_log", "broker_stop"} from the close, but only
+    on a broker handle (non-broker handles omit both).
     msp_worker_turn keeps refusing and capability stays
     admitted False regardless of this function's outcome.
     """
@@ -4761,9 +4848,10 @@ def msp_worker_canary_turn(handle: str, *,
     if rec.get("closed"):
         raise MspError("MSP worker handle is closed",
                        code="unknown-handle")
-    if rec.get("profile") != "subscription-canary":
-        raise MspError("canary turn needs the "
-                       "subscription-canary profile",
+    if rec.get("profile") not in _MSP_TURN_PROFILES:
+        raise MspError("canary turn needs a canary "
+                       "profile (subscription-canary or "
+                       "subscription-broker)",
                        code="canary-profile")
     if rec.get("worker_canary_consumed") is not True:
         raise MspError("canary turn needs a prior canary "
@@ -4788,11 +4876,21 @@ def msp_worker_canary_turn(handle: str, *,
         out["ledger_counts"] = dict(
             rec.get("turn_notification_counts") or {})
         try:
-            msp_worker_close(handle, reason="canary-" + stop)
+            closed = msp_worker_close(
+                handle, reason="canary-" + stop)
         except MspError as close_exc:
             if out["error"] is None:
                 out["error"] = {"code": close_exc.code,
                                 "message": str(close_exc)}
+        else:
+            # A failed brokered turn is the case we most need
+            # to read: keep the final broker evidence. Only
+            # broker handles carry these keys, so every other
+            # profile keeps today's return shape.
+            if "broker_log" in closed:
+                out["broker_log"] = closed["broker_log"]
+            if "broker_stop" in closed:
+                out["broker_stop"] = closed["broker_stop"]
         return out
 
     command_id = _msp_new_command_id()
@@ -4866,9 +4964,22 @@ def msp_worker_close(handle: str, reason: str = "done") -> dict:
     check gates cleanup itself. When even the original binding
     cannot be proved (foreign process, corrupt ref), cleanup
     refuses with the owner-check code after a signal-free
-    release, never entering kill/reap.
+    release, never entering kill/reap. On a broker handle the
+    broker is stopped first (no tunnel outlives the handle)
+    and the return value additionally carries "broker_log"
+    (the final metadata log, read after stop() joined) and
+    "broker_stop" (its stop result); non-broker handles keep
+    today's return shape.
     """
     rec = _worker_record(handle)
+    broker = rec.get("worker_broker")
+    broker_stop = None
+    if broker is not None:
+        try:
+            broker_stop = broker.stop()
+        except Exception:
+            broker_stop = {"joined": 0,
+                           "alive": ["stop-raised"]}
     try:
         try:
             _worker_check_owner(rec)
@@ -4898,10 +5009,40 @@ def msp_worker_close(handle: str, reason: str = "done") -> dict:
                                f"cleanup: {exc.code}",
                                code=exc.code) from exc
             rec["proc"] = ref
-        return _msp_close_rec(rec, reason)
+        closed = _msp_close_rec(rec, reason)
+        if broker is not None:
+            try:
+                closed["broker_log"] = broker.log()
+            except Exception:
+                closed["broker_log"] = []
+            closed["broker_stop"] = broker_stop
+        return closed
     finally:
         rec["closed"] = True
         _MSP_WORKERS.pop(handle, None)
+
+
+def msp_worker_broker_log(handle: str) -> list:
+    """Return a copy of the owned broker's metadata log.
+
+    Read-only: the returned list is a deep copy, so callers
+    (experiments) cannot alter broker state. Only broker
+    handles carry a broker; anything else refuses with
+    bad-input. Call it before msp_worker_close: closing
+    stops the broker and invalidates the handle. Entries
+    carry method/target/decision/byte counts/times/header
+    names only — never header values or tunnel bytes.
+    """
+    rec = _worker_record(handle)
+    if rec.get("closed"):
+        raise MspError("MSP worker handle is closed",
+                       code="unknown-handle")
+    broker = rec.get("worker_broker")
+    if broker is None:
+        raise MspError("broker log needs a "
+                       "subscription-broker handle",
+                       code="bad-input")
+    return broker.log()
 
 
 def _worker_close_no_signal(rec: dict) -> None:

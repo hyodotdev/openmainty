@@ -457,15 +457,15 @@ class CanaryTurnCase(Worker273Mixin, unittest.TestCase):
                     2, {"state": "accountLogin",
                         "credentialRequired": True})]}
 
-    def _admitted_canary(self):
-        """Bootstrap+session+settings+hooks+canary on canary."""
+    def _admitted_canary(self, profile="subscription-canary"):
+        """Bootstrap+session+settings+hooks+canary on a profile."""
         self._stop_worker_patches()
         root = self._spawn_root()
         child = _MspScriptedChild(script={})
         self.addCleanup(child.force_close)
         self._spawn_with(child)
         handle = muse_mod.spawn_msp_worker(
-            root, profile="subscription-canary")
+            root, profile=profile)
         self.addCleanup(self._close_quiet, handle)
         child._script.update(self._boot_script(root))
         muse_mod.msp_worker_bootstrap(handle, timeout=10,
@@ -827,6 +827,48 @@ class CanaryTurnCase(Worker273Mixin, unittest.TestCase):
                                  "canary-already-sent")
             finally:
                 self._close_quiet(handle2)
+        finally:
+            self._close_quiet(handle)
+
+    def test_failed_turn_keeps_broker_log_on_broker(self):
+        handle, child, _sid = self._admitted_canary(
+            profile="subscription-broker")
+        try:
+            fixed_cmd = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e60"
+            other_cmd = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e61"
+            turn_id = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e62"
+            child._script["turn/start"] = [self._turn_ack(
+                6, other_cmd, turn_id)]
+            with mock.patch.object(
+                    muse_mod, "_msp_new_command_id",
+                    return_value=fixed_cmd):
+                out = muse_mod.msp_worker_canary_turn(
+                    handle, timeout=30)
+            self.assertEqual(out["stop"], "error")
+            self.assertIn("broker_log", out)
+            self.assertIn("broker_stop", out)
+            self.assertIsInstance(out["broker_log"], list)
+            self.assertIsInstance(out["broker_stop"], dict)
+        finally:
+            self._close_quiet(handle)
+
+    def test_failed_turn_keeps_no_broker_keys_off_broker(
+            self):
+        handle, child, _sid = self._admitted_canary()
+        try:
+            fixed_cmd = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e63"
+            other_cmd = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e64"
+            turn_id = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e65"
+            child._script["turn/start"] = [self._turn_ack(
+                6, other_cmd, turn_id)]
+            with mock.patch.object(
+                    muse_mod, "_msp_new_command_id",
+                    return_value=fixed_cmd):
+                out = muse_mod.msp_worker_canary_turn(
+                    handle, timeout=30)
+            self.assertEqual(out["stop"], "error")
+            self.assertNotIn("broker_log", out)
+            self.assertNotIn("broker_stop", out)
         finally:
             self._close_quiet(handle)
 

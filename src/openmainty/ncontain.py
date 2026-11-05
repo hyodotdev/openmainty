@@ -692,6 +692,74 @@ def build_subscription_canary_policy_text(root: str,
     return text
 
 
+def _prove_broker_plus(text: str, sub: str, hole: str) -> None:
+    """Prove text is the subscription text plus exactly the
+    one broker egress line — removal style. The line must
+    be absent from the subscription text and present
+    exactly once, appended at the end; "(deny network*)"
+    must be kept; "*:443" must be absent; everything else
+    must be identical.
+    """
+    if hole in sub:
+        raise ContainmentError(
+            "broker proof: hole already present")
+    tlines = text.splitlines()
+    slines = sub.splitlines()
+    if tlines != slines + [hole]:
+        raise ContainmentError("broker proof: extra diff")
+    if tlines.count(hole) != 1:
+        raise ContainmentError(
+            "broker proof: hole not unique")
+    if "(deny network*)" not in sub:
+        raise ContainmentError(
+            "broker proof: network deny lost")
+    if "*:443" in text:
+        raise ContainmentError(
+            "broker proof: 443 line forbidden")
+
+
+def _check_broker_port(port) -> int:
+    if isinstance(port, bool) or not isinstance(port, int):
+        raise ContainmentError(
+            "broker port must be an integer 1024-65535")
+    if port < 1024 or port > 65535:
+        raise ContainmentError(
+            "broker port must be an integer 1024-65535")
+    return port
+
+
+def build_subscription_broker_policy_text(root: str,
+                                          exe_path: str,
+                                          home,
+                                          port: int) -> str:
+    """Broker profile: subscription text plus exactly one
+    loopback egress line for the given broker port (gate
+    (2), slice 296).
+
+    E38 showed the host accepts
+    -c endpoint_transport.proxy="http://127.0.0.1:PORT"
+    (trace transport=proxy) and reaches the proxy with DNS
+    denied — so this profile carries NO *:443 line and NO
+    DNS lines: the only way out is the loopback broker,
+    which enforces the host allowlist itself. Appended at
+    the END (SBPL last-match-wins) with (deny network*)
+    kept. Proven by removal; anything else raises
+    ContainmentError. The "subscription" and
+    "subscription-canary" texts are untouched by this
+    builder.
+    """
+    port = _check_broker_port(port)
+    sub = build_subscription_worker_policy_text(
+        root, exe_path, home)
+    if not sub.endswith("\n"):
+        raise ContainmentError("broker proof: base text shape")
+    hole = ('(allow network-outbound (remote tcp '
+            '"localhost:%d"))' % port)
+    text = sub + hole + "\n"
+    _prove_broker_plus(text, sub, hole)
+    return text
+
+
 def _check_owned_dir(root: str) -> os.stat_result:
     if "\x00" in root:
         raise ContainmentError("NUL byte in root")
@@ -884,6 +952,64 @@ def create_subscription_canary_policy(root: str, exe_pin: dict,
             "network": "443-outbound + DNS-resolver only "
                        "(canary, not Meta-ready)",
             "profile": "canary",
+            "offline_only": False, "admits_worker": False}
+
+
+def create_subscription_broker_policy(root: str, exe_pin: dict,
+                                      home, port: int) -> dict:
+    """Write the subscription-broker policy into the owned root.
+
+    Same write discipline as create_subscription_canary_policy
+    (re-pinned executable, validated owned root, exclusive
+    create, post-write identity recheck), but the text is
+    build_subscription_broker_policy_text: subscription text
+    plus exactly the one loopback egress line for the given
+    broker port. The returned identity says "broker" with an
+    honest network label; admits_worker stays False because
+    general worker admission is never granted here — the
+    single brokered turn is gated in muse.py exactly like
+    the canary turn (profile + prior admission + single use).
+    """
+    _require_darwin()
+    if not isinstance(exe_pin, dict):
+        raise ContainmentError("valid executable pin required")
+    if exe_pin.get("admits_worker"):
+        raise ContainmentError(
+            "a worker-admitting pin is never valid here")
+    fresh_pin = _repinned(exe_pin)
+    st = _check_owned_dir(root)
+    text = build_subscription_broker_policy_text(
+        root, fresh_pin["path"], home, port)
+    raw = text.encode("utf-8")
+    if len(raw) > _MAX_POLICY_BYTES:
+        raise ContainmentError("policy too large")
+    policy_path = os.path.join(root, POLICY_NAME)
+    if os.path.lexists(policy_path):
+        raise ContainmentError(
+            "policy already exists; refusing to overwrite")
+    fd = os.open(policy_path,
+                 os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        if os.write(fd, raw) != len(raw):
+            raise ContainmentError("short write of policy")
+    finally:
+        os.close(fd)
+    digest, pst = _read_identity(policy_path,
+                                _MAX_POLICY_BYTES)
+    if digest != hashlib.sha256(raw).hexdigest():
+        raise ContainmentError("policy changed after write")
+    return {"policy_path": policy_path,
+            "policy_sha256": digest,
+            "policy_size": pst.st_size,
+            "policy_dev": pst.st_dev,
+            "policy_ino": pst.st_ino,
+            "root": root, "root_dev": st.st_dev,
+            "root_ino": st.st_ino,
+            "executable": fresh_pin,
+            "sandbox_exec": SANDBOX_EXEC,
+            "network": "loopback broker only "
+                       "(broker, not Meta-ready)",
+            "profile": "broker",
             "offline_only": False, "admits_worker": False}
 
 
