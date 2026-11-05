@@ -118,6 +118,20 @@ SUBSCRIPTION_WORKER_EXTRA_META_LITERALS = (
 SUBSCRIPTION_WORKER_SETTINGS_LOCK = (
     "~/.config/muse/.settings.json.lock")
 
+# E31 narrow network hole (Root steer, gate 2): the ONLY
+# network the subscription-canary profile allows. Outbound
+# TCP 443 (model transport; the endpoint hostname is unknown
+# so no host allowlist can be written honestly) plus the DNS
+# resolver socket. Inbound stays denied: (deny network*) is
+# kept and these append last-match-wins. No broker: E3-0
+# measured 0 broker hits, so the binary ignores the proxy
+# env and dials direct.
+SUBSCRIPTION_CANARY_NETWORK_LINES = (
+    '(allow network-outbound (remote tcp "*:443"))',
+    '(allow network-outbound '
+    '(literal "/private/var/run/mDNSResponder"))',
+)
+
 
 class ContainmentError(Exception):
     pass
@@ -408,6 +422,28 @@ def subscription_worker_exceptions(home=None) -> list:
     return out
 
 
+def subscription_canary_exceptions(home=None) -> list:
+    """Named exceptions for the canary UI, expanded for a home.
+
+    The subscription list plus one {"path", "kind",
+    "reason"} dict per SUBSCRIPTION_CANARY_NETWORK_LINES
+    entry (kind "network", path verbatim: no home
+    expansion — the lines carry no home path).
+    """
+    out = subscription_worker_exceptions(home)
+    reasons = {
+        SUBSCRIPTION_CANARY_NETWORK_LINES[0]:
+            "model transport: outbound TCP 443 only "
+            "(no host allowlist is writable honestly)",
+        SUBSCRIPTION_CANARY_NETWORK_LINES[1]:
+            "DNS resolver socket for the 443 transport",
+    }
+    for line in SUBSCRIPTION_CANARY_NETWORK_LINES:
+        out.append({"path": line, "kind": "network",
+                    "reason": reasons[line]})
+    return out
+
+
 def _prove_subscription_plus(text: str, base: str,
                              read_clauses: list,
                              meta_entries: list,
@@ -578,6 +614,51 @@ def build_subscription_worker_policy_text(root: str,
     return text
 
 
+def _prove_canary_plus(text: str, sub: str) -> None:
+    """Prove text is the subscription text plus exactly the two
+    canary network lines — removal style. Each line must be
+    absent from the subscription text and present exactly once
+    in the canary text; everything else must be identical.
+    """
+    for line in SUBSCRIPTION_CANARY_NETWORK_LINES:
+        if line in sub:
+            raise ContainmentError(
+                "canary proof: network line already present")
+    tlines = text.splitlines()
+    slines = sub.splitlines()
+    if tlines != slines + list(SUBSCRIPTION_CANARY_NETWORK_LINES):
+        raise ContainmentError("canary proof: extra diff")
+    for line in SUBSCRIPTION_CANARY_NETWORK_LINES:
+        if tlines.count(line) != 1:
+            raise ContainmentError(
+                "canary proof: network line not unique")
+
+
+def build_subscription_canary_policy_text(root: str,
+                                          exe_path: str,
+                                          home=None) -> str:
+    """Canary profile: subscription text plus exactly the two
+    E31 network lines (gate (2), root431 steer).
+
+    Appended at the END (SBPL last-match-wins) with
+    (deny network*) kept: outbound TCP 443 plus the DNS
+    resolver socket only; inbound stays denied. File-write,
+    file-read, exec pin, and securityd deny are identical to
+    the subscription text — proven by removal; anything else
+    raises ContainmentError. Nothing here authorizes a model
+    worker: the single canary turn is gated in muse.py, and
+    the "subscription" profile stays network-denied.
+    """
+    sub = build_subscription_worker_policy_text(
+        root, exe_path, home)
+    if not sub.endswith("\n"):
+        raise ContainmentError("canary proof: base text shape")
+    text = sub + "\n".join(SUBSCRIPTION_CANARY_NETWORK_LINES) \
+        + "\n"
+    _prove_canary_plus(text, sub)
+    return text
+
+
 def _check_owned_dir(root: str) -> os.stat_result:
     if "\x00" in root:
         raise ContainmentError("NUL byte in root")
@@ -715,6 +796,62 @@ def create_subscription_worker_policy(root: str, exe_pin: dict,
                        "offline-only, not Meta-ready)",
             "profile": "subscription",
             "offline_only": True, "admits_worker": False}
+
+
+def create_subscription_canary_policy(root: str, exe_pin: dict,
+                                      home=None) -> dict:
+    """Write the subscription-canary policy into the owned root.
+
+    Same write discipline as create_subscription_worker_policy,
+    but the text is build_subscription_canary_policy_text:
+    subscription text plus exactly the two E31 network lines.
+    The returned identity says "canary" with offline_only
+    False and an honest network label; admits_worker stays
+    False because general worker admission is never granted
+    here — the single canary turn is gated in muse.py
+    (profile + prior canary admission + single use).
+    """
+    _require_darwin()
+    if not isinstance(exe_pin, dict):
+        raise ContainmentError("valid executable pin required")
+    if exe_pin.get("admits_worker"):
+        raise ContainmentError(
+            "a worker-admitting pin is never valid here")
+    fresh_pin = _repinned(exe_pin)
+    st = _check_owned_dir(root)
+    text = build_subscription_canary_policy_text(
+        root, fresh_pin["path"], home)
+    raw = text.encode("utf-8")
+    if len(raw) > _MAX_POLICY_BYTES:
+        raise ContainmentError("policy too large")
+    policy_path = os.path.join(root, POLICY_NAME)
+    if os.path.lexists(policy_path):
+        raise ContainmentError(
+            "policy already exists; refusing to overwrite")
+    fd = os.open(policy_path,
+                 os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        if os.write(fd, raw) != len(raw):
+            raise ContainmentError("short write of policy")
+    finally:
+        os.close(fd)
+    digest, pst = _read_identity(policy_path,
+                                _MAX_POLICY_BYTES)
+    if digest != hashlib.sha256(raw).hexdigest():
+        raise ContainmentError("policy changed after write")
+    return {"policy_path": policy_path,
+            "policy_sha256": digest,
+            "policy_size": pst.st_size,
+            "policy_dev": pst.st_dev,
+            "policy_ino": pst.st_ino,
+            "root": root, "root_dev": st.st_dev,
+            "root_ino": st.st_ino,
+            "executable": fresh_pin,
+            "sandbox_exec": SANDBOX_EXEC,
+            "network": "443-outbound + DNS-resolver only "
+                       "(canary, not Meta-ready)",
+            "profile": "canary",
+            "offline_only": False, "admits_worker": False}
 
 
 def wrapper_argv(policy: dict, exe_path: str) -> list:

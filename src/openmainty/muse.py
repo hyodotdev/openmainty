@@ -2065,11 +2065,14 @@ def _msp_build_wrapper(root: str, snap: dict, *,
     profile "subscription" builds the contained
     subscription-worker policy (product A plus exactly the F2
     named read exception) for the given account home instead;
+    profile "subscription-canary" builds the canary policy
+    (subscription plus exactly the two E31 network lines).
     anything else refuses. The default keeps existing callers
     on the product policy.
     """
     from . import ncontain as _ncontain
-    if profile not in ("product", "subscription"):
+    if profile not in ("product", "subscription",
+                       "subscription-canary"):
         raise MspError(f"unknown worker profile: {profile!r}",
                        code="bad-input")
     try:
@@ -2084,7 +2087,10 @@ def _msp_build_wrapper(root: str, snap: dict, *,
                "mode": oct(stat.S_IMODE(st.st_mode)),
                "offline_only": True, "admits_worker": False}
     try:
-        if profile == "subscription":
+        if profile == "subscription-canary":
+            policy = _ncontain.create_subscription_canary_policy(
+                root, exe_pin, home)
+        elif profile == "subscription":
             policy = _ncontain.create_subscription_worker_policy(
                 root, exe_pin, home)
         else:
@@ -2690,7 +2696,57 @@ _MSP_WORKERS: dict = {}
 
 _MSP_WORKER_METHODS = ("initialize", "account/read", "session/start",
                        "session/read", "hook/list", "model/list",
-                       "usage/read", "settings/read")
+                       "usage/read", "settings/read", "turn/start")
+
+# Turn-stream notifications (pinned schema "notifications"):
+# ledger-only during and after turns. Each records {method,
+# session_id} in the lifecycle ledger plus a per-method count
+# in rec["turn_notification_counts"]; payloads are NEVER
+# retained (streaming deltas would otherwise flood the
+# record). One-line schema reason each:
+# - item/delta: streaming appends to an open item, emitted
+#   throughout any live turn (the E31 breaker).
+# - item/updated: item body updates during a turn.
+# - session/tokenUsage: usage counters during a turn.
+# - session/contextUsage: context counters during a turn.
+# - turn/retryScheduled / turn/modelRetryScheduled: scheduler
+#   notices during a turn.
+# - turn/retracted / turn/unqueued: turn lifecycle outcomes.
+# - session/nameChanged: durable rename record only.
+# - session/viewHealthChanged: view-projection health; the
+#   canary polls raw snapshots, not the view stream.
+# - session/todoListChanged: model working notes only.
+# - recap/completed: recap result metadata; we never request
+#   recaps and keep no payload.
+# Deliberately NOT listed (still fail closed, tested):
+# session/permissionProfileChanged,
+# session/approvalModeChanged, session/branchChanged,
+# session/modelRouteUnserved, session/reasoningEffortChanged
+# (a route-unserved or effort change during the canary must
+# stop it, named), approval/*, admission/*, userInput/*,
+# mcpServer/*, plugin/*, monitor/*, peer/*, skill/*,
+# computerUse*, session/goalChanged, session/leaveCompleted,
+# session/driveChanged, and every other broadcast.
+_MSP_WORKER_TURN_NOTIFICATIONS = frozenset([
+    "item/delta", "item/updated", "session/tokenUsage",
+    "session/contextUsage", "turn/retryScheduled",
+    "turn/modelRetryScheduled", "turn/retracted",
+    "turn/unqueued", "session/nameChanged",
+    "session/viewHealthChanged", "session/todoListChanged",
+    "recap/completed",
+])
+
+# Host-scoped ledger-only notifications: the schema params
+# carry NO sessionId, so no sid requirement. usage/changed
+# carries SubscriptionUsage {observedAtMs, tier, weekly,
+# window} and fires right after a model turn's spend — it
+# is the evidence the canary exists to get, so requiring a
+# session id here would break the host as malformed before
+# usage/read. Ledgered as method + count with session_id
+# None; no payload kept.
+_MSP_WORKER_HOST_NOTIFICATIONS = frozenset([
+    "usage/changed",
+])
 
 _MSP_WORKER_LIFECYCLE_METHODS = ("session/started",
                                  "session/statusChanged",
@@ -2820,12 +2876,31 @@ def _worker_send_request(handle: str, method: str, params: dict,
     Private: closed handles refuse before any wire write; the live
     child/process binding is re-proved on every request; only
     _MSP_WORKER_METHODS with fixed params may be sent. The shared
-    transport contract lives in _msp_exchange.
+    transport contract lives in _msp_exchange. turn/start is
+    structurally single-use: it refuses before any wire write
+    unless the handle's profile is "subscription-canary", the
+    canary-turn flag is already set (only msp_worker_canary_turn
+    sets it, before its own wire write), and the one-shot wire
+    flag is still unused; the wire flag is set here, at the
+    write, so a second turn/start on any handle refuses.
     """
     rec = _worker_record(handle)
     if rec.get("closed"):
         raise MspError("MSP worker handle is closed",
                        code="unknown-handle")
+    if method == "turn/start":
+        if rec.get("profile") != "subscription-canary":
+            raise MspError("turn/start needs the "
+                           "subscription-canary profile",
+                           code="canary-profile")
+        if rec.get("worker_canary_turn_sent") is not True:
+            raise MspError("turn/start needs the canary "
+                           "turn flag",
+                           code="canary-not-admitted")
+        if rec.get("worker_canary_wire_used") is True:
+            raise MspError("turn/start already sent on this "
+                           "handle", code="canary-already-sent")
+        rec["worker_canary_wire_used"] = True
     _worker_check_owner(rec)
     return _msp_exchange(rec, method, params, timeout,
                         _MSP_WORKER_METHODS)
@@ -3154,7 +3229,7 @@ def parse_msp_turn_start(result: dict, command_id: str) -> dict:
 def spawn_msp_worker(root: str, binary: Optional[str] = None, *,
                      timeout_s: float = 60,
                      profile: str = "product") -> str:
-    """Spawn an owned OFFLINE worker host and return its handle.
+    """Spawn an owned worker host and return its handle.
 
     Separate registry and lifecycle from the readonly metadata
     factory: the returned handle binds exactly one live process,
@@ -3162,19 +3237,26 @@ def spawn_msp_worker(root: str, binary: Optional[str] = None, *,
     one owned root. Fresh caller-owned SSD homes only (never the
     real user home, keychain, target repos, or network); META_API
     key presence refuses exactly like the readonly path. The host
-    starts offline (deny-all network, owned-root writes only) —
-    this is Phase 1 session-lifecycle capability, NOT model
-    admission: no model turn is authorized by spawning.
+    starts offline (deny-all network, owned-root writes
+    only) on "product" and "subscription" — this is Phase 1
+    session-lifecycle capability, NOT model admission: no model
+    turn is authorized by spawning. The "subscription-canary"
+    profile is narrow-network (see above) and exists only for
+    the single canary turn.
 
     profile "subscription" wraps the child in the contained
     subscription-worker policy instead (product A plus exactly
     the F2 named read exception, gate (2) root301) and points
     the child HOME and XDG_CONFIG_HOME at the real account
-    home; museHome, cache, and TMPDIR stay owned. The default
-    "product" keeps existing behaviour unchanged. Unknown
-    profiles refuse.
+    home; museHome, cache, and TMPDIR stay owned. Profile
+    "subscription-canary" is subscription plus exactly the two
+    E31 network lines (443 out, DNS resolver): the only
+    profile a canary turn may use. The default "product"
+    keeps existing behaviour unchanged. Unknown profiles
+    refuse.
     """
-    if profile not in ("product", "subscription"):
+    if profile not in ("product", "subscription",
+                       "subscription-canary"):
         raise MspError(f"unknown worker profile: {profile!r}",
                        code="bad-input")
     timeout_s = _msp_validate_timeout(timeout_s, "worker spawn")
@@ -3192,7 +3274,7 @@ def spawn_msp_worker(root: str, binary: Optional[str] = None, *,
     env = _msp_host_env(canon)
     worker_home = None
     worker_exceptions = None
-    if profile == "subscription":
+    if profile in ("subscription", "subscription-canary"):
         from . import ncontain as _ncontain
         try:
             worker_home = pwd.getpwuid(os.getuid()).pw_dir
@@ -3200,9 +3282,14 @@ def spawn_msp_worker(root: str, binary: Optional[str] = None, *,
             raise MspError("worker account home unresolvable: "
                            f"{exc}", code="unreadable") from exc
         try:
-            worker_exceptions = \
-                _ncontain.subscription_worker_exceptions(
-                    worker_home)
+            if profile == "subscription-canary":
+                worker_exceptions = \
+                    _ncontain.subscription_canary_exceptions(
+                        worker_home)
+            else:
+                worker_exceptions = \
+                    _ncontain.subscription_worker_exceptions(
+                        worker_home)
         except _ncontain.ContainmentError as exc:
             raise MspError(f"worker profile unavailable: {exc}",
                            code="containment") from exc
@@ -3210,7 +3297,7 @@ def spawn_msp_worker(root: str, binary: Optional[str] = None, *,
         env["XDG_CONFIG_HOME"] = os.path.join(
             worker_home, ".config")
         wrapped = _msp_build_wrapper(
-            canon, snap, profile="subscription",
+            canon, snap, profile=profile,
             home=worker_home)
     else:
         wrapped = _msp_build_wrapper(canon, snap)
@@ -3334,6 +3421,71 @@ def _worker_lifecycle_shape_ok(method: str, params: dict) -> bool:
     return True
 
 
+def _ledger_turn_notification(rec: dict, method: str,
+                              params) -> None:
+    """Ledger one turn-stream notification; keep no payload.
+
+    Listed methods only (callers check membership). Requires
+    a string sessionId and, when a session is bound, an id
+    match — anything else breaks fail-closed exactly like the
+    session lifecycle path. Otherwise appends {method,
+    session_id} to the capped lifecycle ledger and bumps the
+    uncapped per-method turn_notification_counts. _msp_break
+    runs only after releasing break_lock (non-reentrant).
+    """
+    if rec.get("broken"):
+        return
+    sid = _worker_lifecycle_session_id(method, params)
+    if sid is None:
+        rec["broken_method"] = method
+        _msp_break(rec, "malformed")
+        return
+    action = None
+    with rec["break_lock"]:
+        bound = rec.get("worker_session")
+        bound_id = (bound.get("id")
+                    if isinstance(bound, dict) else None)
+        if bound_id is not None and sid != bound_id:
+            action = "session-mismatch"
+        else:
+            counts = rec.get("turn_notification_counts")
+            if not isinstance(counts, dict):
+                counts = rec["turn_notification_counts"] = {}
+            counts[method] = counts.get(method, 0) + 1
+            ledger = rec.get("lifecycle")
+            if not isinstance(ledger, list):
+                ledger = rec["lifecycle"] = []
+            ledger.append({"method": method,
+                           "session_id": sid})
+            del ledger[:-_MSP_WORKER_LIFECYCLE_MAX]
+    if action is not None:
+        rec["broken_method"] = method
+        _msp_break(rec, action)
+
+
+def _ledger_host_notification(rec: dict, method: str) -> None:
+    """Ledger one host-scoped notification; keep no payload.
+
+    Listed methods only (callers check membership). No
+    session id exists in the schema params, so none is
+    required: appends {method, session_id None} to the
+    capped lifecycle ledger and bumps the uncapped
+    per-method turn_notification_counts.
+    """
+    if rec.get("broken"):
+        return
+    with rec["break_lock"]:
+        counts = rec.get("turn_notification_counts")
+        if not isinstance(counts, dict):
+            counts = rec["turn_notification_counts"] = {}
+        counts[method] = counts.get(method, 0) + 1
+        ledger = rec.get("lifecycle")
+        if not isinstance(ledger, list):
+            ledger = rec["lifecycle"] = []
+        ledger.append({"method": method, "session_id": None})
+        del ledger[:-_MSP_WORKER_LIFECYCLE_MAX]
+
+
 def _dispatch_worker_inbox(rec: dict, raw: bytes) -> None:
     """Bounded typed lifecycle handling for worker handles.
 
@@ -3341,12 +3493,19 @@ def _dispatch_worker_inbox(rec: dict, raw: bytes) -> None:
     session/turn/item/view-gap broadcasts arrive: they are
     validated, checked against the bound session, and ledgered
     (method + session id only, cap 64, no payload retention)
-    instead of breaking the host. account/changed breaks like the
-    readonly path; a durable model change under us breaks with
-    model-changed rather than continuing on a changed model;
-    unknown methods, unknown shapes, foreign session ids, and
-    closed-session drift break fail-closed. Response-shaped
-    frames reuse the exact readonly response validation.
+    instead of breaking the host. Documented turn-stream
+    methods (_MSP_WORKER_TURN_NOTIFICATIONS) are ledger-only
+    the same way, plus an uncapped per-method count.
+    Host-scoped methods (_MSP_WORKER_HOST_NOTIFICATIONS)
+    ledger with session_id None and no sid requirement.
+    account/changed breaks like the readonly path; a durable
+    model change under us breaks with model-changed rather
+    than continuing on a changed model; unknown methods,
+    unknown shapes, foreign session ids, and closed-session
+    drift break fail-closed, and every notification break
+    records the exact method on rec["broken_method"].
+    Response-shaped frames reuse the exact readonly response
+    validation.
     """
     if rec.get("broken"):
         return
@@ -3363,7 +3522,17 @@ def _dispatch_worker_inbox(rec: dict, raw: bytes) -> None:
     if method == "account/changed":
         _msp_break(rec, "account-changed")
         return
+    if method in _MSP_WORKER_HOST_NOTIFICATIONS:
+        _ledger_host_notification(rec, method)
+        return
+    if method in _MSP_WORKER_TURN_NOTIFICATIONS:
+        _ledger_turn_notification(rec, method, obj.get("params"))
+        return
     if method not in _MSP_WORKER_LIFECYCLE_METHODS:
+        if isinstance(method, str):
+            rec["broken_method"] = method
+        else:
+            rec["broken_method"] = repr(method)
         _msp_break(rec, "server-notification")
         return
     params = obj.get("params")
@@ -4102,6 +4271,302 @@ def msp_worker_turn(handle: str, prompt: str, *,
     raise MspError("worker model turn refused: capability "
                    "unproved (%s)" % "; ".join(cap["missing"]),
                    code="capability-unproved")
+
+
+# The canary turn prompt, pinned bytes (E31 shape, pfid
+# "canary"). The single canary turn takes NO prompt argument:
+# this constant is the only prompt it can ever send.
+_MSP_CANARY_PROMPT = (
+    "Owned capability probe (no target data): reply with one "
+    "JSON line {\"probe\": \"preflight\", \"pfid\": "
+    "\"canary\"}. Do not read, write, or describe any "
+    "repository.")
+
+# History-item kinds that may appear during the canary turn.
+# Anything else (tool kinds, unknown, missing, non-string)
+# stops the turn as tool-attempted.
+_MSP_CANARY_MESSAGE_KINDS = frozenset(
+    ["userMessage", "agentMessage", "reasoning"])
+
+_MSP_CANARY_POLL_S = 2.0
+_MSP_CANARY_TEXT_MAX = 4096
+
+
+def _canary_flag_item(item):
+    """(flagged, kind, name) for one raw history item.
+
+    Allowlist: only _MSP_CANARY_MESSAGE_KINDS pass. Reads
+    ONLY the "kind" field; the name lookup is metadata for
+    the record. Truncated strings only, never payloads.
+    """
+    if not isinstance(item, dict):
+        return True, "non-dict-item", None
+    kind = item.get("kind")
+    if isinstance(kind, str) and kind in _MSP_CANARY_MESSAGE_KINDS:
+        return False, None, None
+    name = None
+    for key in ("name", "toolName", "tool", "function",
+                "command", "server"):
+        value = item.get(key)
+        if isinstance(value, str) and value:
+            name = value[:80]
+            break
+    if isinstance(kind, str):
+        shown = kind[:80]
+    elif kind is None:
+        shown = "missing-kind"
+    else:
+        shown = "non-string-kind"
+    return True, shown, name
+
+
+def _canary_item_kinds(items):
+    """Ordered kind list of raw items (kinds only, no payload)."""
+    kinds = []
+    if not isinstance(items, list):
+        return kinds
+    for item in items:
+        if not isinstance(item, dict):
+            kinds.append("non-dict-item")
+            continue
+        kind = item.get("kind")
+        if isinstance(kind, str):
+            kinds.append(kind[:80])
+        elif kind is None:
+            kinds.append("missing-kind")
+        else:
+            kinds.append("non-string-kind")
+    return kinds
+
+
+def _canary_collect_text(items):
+    """Response text from raw items, capped at 4 KiB.
+
+    Returns (text, byte_len, truncated). Only "text" /
+    "content" / "output" string members are read.
+    """
+    parts = []
+    total = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for key in ("text", "content", "output"):
+            value = item.get(key)
+            if isinstance(value, str) and value:
+                room = _MSP_CANARY_TEXT_MAX - total
+                if room <= 0:
+                    break
+                take = value[:room]
+                parts.append(take)
+                total += len(take.encode("utf-8"))
+    blob = "".join(parts)
+    size = len(blob.encode("utf-8"))
+    return blob, size, size >= _MSP_CANARY_TEXT_MAX
+
+
+def _canary_token_counts(obj, depth=0):
+    """Numeric values under token-ish keys only (depth <= 3)."""
+    found = {}
+    if depth > 3 or not isinstance(obj, dict):
+        return found
+    for key, value in obj.items():
+        if not isinstance(key, str):
+            continue
+        if "token" in key.lower() and isinstance(value, dict):
+            for sub, num in value.items():
+                if isinstance(sub, str) and isinstance(
+                        num, (int, float)) \
+                        and not isinstance(num, bool):
+                    found[key + "." + sub] = num
+        elif isinstance(value, dict):
+            for sub, num in _canary_token_counts(
+                    value, depth + 1).items():
+                found.setdefault(sub, num)
+    return found
+
+
+def _canary_model_strings(obj, depth=0):
+    """Verbatim model/provider/route strings, top levels only."""
+    found = []
+    if depth > 2 or not isinstance(obj, dict):
+        return found
+    for key, value in obj.items():
+        if not isinstance(key, str):
+            continue
+        low = key.lower()
+        if low in ("model", "modelid", "model_id",
+                   "provider", "providerid", "route",
+                   "endpoint") and isinstance(value, str):
+            found.append((key, value[:128]))
+        elif isinstance(value, dict) and depth < 2:
+            found.extend(_canary_model_strings(value,
+                                               depth + 1))
+    return found
+
+
+def msp_worker_canary_turn(handle: str, *,
+                           timeout: float = 120) -> dict:
+    """Send the single canary turn and watch it to completion.
+
+    Gates (MspError, no wire write): the handle's profile must
+    be "subscription-canary" (canary-profile); a canary
+    admission must already have been consumed on THIS handle
+    by canary_admission (canary-not-admitted); no canary turn
+    may have been sent yet (canary-already-sent; the flag is
+    set BEFORE the wire write, and the transport sets a
+    one-shot wire flag at the write). A bound session is
+    required.
+
+    Sends exactly one turn/start with required params only
+    (commandId + sessionId + one text input carrying the
+    pinned _MSP_CANARY_PROMPT — there is NO prompt argument),
+    validates the ack, then polls raw session/read snapshots
+    on a bounded interval. "completed" needs BOTH the
+    turn/completed ledger entry AND an observed agentMessage
+    in the latest poll: a completion signal without an
+    observed agent response is not canary evidence yet, so
+    the watch continues (timeout then reports honestly, with
+    completion_seen set). Every polled item passes the
+    ALLOWLIST control: only
+    userMessage/agentMessage/reasoning; the first other item
+    records kind + name only, closes the handle, and returns
+    stop "tool-attempted" without any usage call.
+
+    Returns {"stop", "ack", "ack_ms", "completion_seen",
+    "item_kinds", "text", "text_bytes", "text_truncated",
+    "token_counts", "model_strings", "ledger_counts",
+    "session_status", "polls", "tool_hit", "error"}. stop is
+    "completed", "tool-attempted", "timeout" (closes), or
+    "error" (closes; transport/ack/poll failure, no retry).
+    msp_worker_turn keeps refusing and capability stays
+    admitted False regardless of this function's outcome.
+    """
+    rec = _worker_record(handle)
+    if rec.get("closed"):
+        raise MspError("MSP worker handle is closed",
+                       code="unknown-handle")
+    if rec.get("profile") != "subscription-canary":
+        raise MspError("canary turn needs the "
+                       "subscription-canary profile",
+                       code="canary-profile")
+    if rec.get("worker_canary_consumed") is not True:
+        raise MspError("canary turn needs a prior canary "
+                       "admission on this handle",
+                       code="canary-not-admitted")
+    if rec.get("worker_canary_turn_sent") is True:
+        raise MspError("canary turn already sent on this "
+                       "handle", code="canary-already-sent")
+    bound = rec.get("worker_session")
+    if not isinstance(bound, dict) or not bound.get("id"):
+        raise MspError("canary turn needs a bound session",
+                       code="session-unbound")
+    timeout = _msp_validate_timeout(timeout, "canary turn")
+    out = {"stop": None, "ack": None, "ack_ms": None,
+           "completion_seen": False, "item_kinds": [],
+           "text": "", "text_bytes": 0,
+           "text_truncated": False, "token_counts": {},
+           "model_strings": [], "ledger_counts": {},
+           "session_status": None, "polls": 0,
+           "tool_hit": None, "error": None}
+
+    def _shut(stop, error=None):
+        out["stop"] = stop
+        out["error"] = error
+        out["ledger_counts"] = dict(
+            rec.get("turn_notification_counts") or {})
+        try:
+            msp_worker_close(handle, reason="canary-" + stop)
+        except MspError as close_exc:
+            if out["error"] is None:
+                out["error"] = {"code": close_exc.code,
+                                "message": str(close_exc)}
+        return out
+
+    command_id = _msp_new_command_id()
+    params = {"commandId": command_id,
+              "sessionId": bound["id"],
+              "input": [{"type": "text",
+                         "text": _MSP_CANARY_PROMPT}]}
+    rec["worker_canary_turn_sent"] = True
+    try:
+        ack_raw = _worker_send_request(handle, "turn/start",
+                                       params, timeout)
+    except MspError as exc:
+        return _shut("error", {"code": exc.code,
+                               "message": str(exc)})
+    try:
+        ack = parse_msp_turn_start(ack_raw, command_id)
+    except MspError as exc:
+        return _shut("error", {"code": exc.code,
+                               "message": str(exc)})
+    out["ack"] = {"turn_id": ack["turn_id"],
+                  "disposition": ack["disposition"],
+                  "status": ack["status"],
+                  "started_new_turn":
+                      ack["started_new_turn"]}
+    out["ack_ms"] = int(time.time() * 1000)
+    deadline = time.monotonic() + timeout
+    last_items = []
+    last_raw = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            out["item_kinds"] = _canary_item_kinds(last_items)
+            return _shut("timeout")
+        try:
+            raw = _worker_send_request(
+                handle, "session/read",
+                {"sessionId": bound["id"],
+                 "excludeItems": False},
+                min(10.0, remaining))
+        except MspError as exc:
+            out["item_kinds"] = _canary_item_kinds(last_items)
+            return _shut("error", {"code": exc.code,
+                                   "message": str(exc)})
+        out["polls"] += 1
+        last_raw = raw
+        items = ((raw.get("history") or {}).get("items")
+                 or [])
+        last_items = items
+        session = raw.get("session") or {}
+        if isinstance(session, dict):
+            out["session_status"] = session.get("status")
+        for index, item in enumerate(items):
+            flagged, kind, name = _canary_flag_item(item)
+            if flagged:
+                out["tool_hit"] = {"index": index,
+                                   "kind": kind, "name": name}
+                out["item_kinds"] = _canary_item_kinds(items)
+                return _shut("tool-attempted")
+        with rec["break_lock"]:
+            entries = list(rec.get("lifecycle") or [])
+        completed = any(
+            isinstance(entry, dict)
+            and entry.get("method") == "turn/completed"
+            and entry.get("session_id") == bound["id"]
+            for entry in entries)
+        if completed:
+            out["completion_seen"] = True
+        answered = any(
+            isinstance(item, dict)
+            and item.get("kind") == "agentMessage"
+            for item in items)
+        if completed and answered:
+            break
+        rest = deadline - time.monotonic()
+        if rest > 0:
+            time.sleep(min(_MSP_CANARY_POLL_S, rest))
+    out["item_kinds"] = _canary_item_kinds(last_items)
+    text, size, truncated = _canary_collect_text(last_items)
+    out["text"] = text
+    out["text_bytes"] = size
+    out["text_truncated"] = truncated
+    out["token_counts"] = _canary_token_counts(last_raw or {})
+    out["model_strings"] = _canary_model_strings(last_raw or {})
+    out["ledger_counts"] = dict(
+        rec.get("turn_notification_counts") or {})
+    out["stop"] = "completed"
+    return out
 
 
 def msp_worker_close(handle: str, reason: str = "done") -> dict:
