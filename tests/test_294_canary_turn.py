@@ -20,12 +20,18 @@ was observed). This slice:
 - muse.msp_worker_canary_turn: profile + prior canary
   admission + single use (flag before the wire write). NO
   prompt argument: the pinned bytes are a module constant
-  (pfid "canary"). One turn/start, ledger wait, bounded
-  session/read polls with the ALLOWLIST control (only
-  userMessage/agentMessage/reasoning pass; first other item
-  records kind + name, closes, returns "tool-attempted").
-  Timeout closes and returns "timeout". No retry anywhere.
-  msp_worker_turn keeps refusing; capability stays False.
+  (pfid "canary"). One turn/start, then a watch on
+  rec["canary_watch"] with NO wire traffic (the live host
+  refused session/read with -32601 in E32, so polling is
+  gone): ordered item kinds with the ALLOWLIST control
+  (only userMessage/agentMessage/reasoning pass; first
+  other item records kind + name, closes, returns
+  "tool-attempted"), agentMessage text capped at 4 KiB,
+  token counts + verbatim modelId, retry attempts, and the
+  turn/completed terminal matched to the ack turn id.
+  completed-no-message stays open; failed/timeout/error
+  close. No retry anywhere. msp_worker_turn keeps refusing;
+  capability stays False.
 
 Offline only: scripted-child fixtures. No live spawn, no
 real binary, no model turn. Isolated temp homes only; never
@@ -37,6 +43,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -46,8 +54,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from openmainty import muse as muse_mod  # noqa: E402
 from openmainty import ncontain  # noqa: E402
-from test_273_followups import (  # noqa: E402
-    Worker273Mixin, _msp_test_err)
+from test_273_followups import Worker273Mixin  # noqa: E402
 from test_276_subscription_profile import (  # noqa: E402
     GOLDEN_SUBSCRIPTION_TEXT)
 from test_preflight import (  # noqa: E402
@@ -105,18 +112,59 @@ def _settings_result(**over):
     return {"schemaVersion": 1, "values": values}
 
 
-def _read_result(items, session=None):
-    sess = {"providerId": "meta",
-            "modelId": "muse-spark-1.3",
-            "sessionId": "s", "status": "idle",
-            "turnCount": 1}
-    if session:
-        sess.update(session)
-    return {"history": {"items": items, "mode": "full",
-                        "snapshot": None},
-            "pendingRequests": [],
-            "session": sess,
-            "viewCursor": "v1"}
+def _item_frame(sid, item, completed=False, cursor="v1"):
+    """One (method, params) frame, schema-required members."""
+    params = {"item": dict(item), "sessionId": sid,
+              "viewCursor": cursor}
+    if completed:
+        params["sourceRange"] = {"start": 0, "end": 1}
+    method = ("item/completed" if completed
+              else "item/started")
+    return (method, params)
+
+
+def _usage_frame(sid, turn_id, model_id="muse-spark-1.3",
+                 usage=None, prompt=100, total=134):
+    return ("session/tokenUsage",
+            {"cumulative": {"promptTokens": prompt,
+                            "totalTokens": total},
+             "modelId": model_id,
+             "promptTokens": prompt,
+             "sessionId": sid,
+             "sourceRange": {"start": 0, "end": 1},
+             "totalTokens": total,
+             "turnId": turn_id,
+             "usage": dict(usage) if usage is not None
+             else {"inputTokens": 100,
+                   "outputTokens": 34},
+             "viewCursor": "v9"})
+
+
+def _retry_frame(sid, turn_id, model=True, attempt=1,
+                 reason=None):
+    params = {"attempt": attempt, "maxAttempts": 3,
+              "nextAttempt": 999, "retryDelayMs": 500,
+              "sessionId": sid,
+              "sourceRange": {"start": 0, "end": 1},
+              "turnId": turn_id, "viewCursor": "v8"}
+    if not model:
+        params["reason"] = reason
+    method = ("turn/modelRetryScheduled" if model
+              else "turn/retryScheduled")
+    return (method, params)
+
+
+def _completed_frame(sid, turn_id, terminal="completed",
+                     error=None, reason=None):
+    params = {"terminal": terminal, "turnId": turn_id,
+              "sessionId": sid,
+              "sourceRange": {"start": 0, "end": 1},
+              "viewCursor": "v10"}
+    if error is not None:
+        params["error"] = dict(error)
+    if reason is not None:
+        params["reason"] = reason
+    return ("turn/completed", params)
 
 
 class ReaderCase(Worker273Mixin, unittest.TestCase):
@@ -438,6 +486,38 @@ class CanaryTurnCase(Worker273Mixin, unittest.TestCase):
             "startedNewTurn": True, "status": "accepted",
             "turnId": turn_id})
 
+    def _drive(self, handle, frames, gap=0.01):
+        """Dispatch frames once the canary flag is set.
+
+        The watch only records on an armed handle, so the
+        driver waits for msp_worker_canary_turn to arm it,
+        then plays the scripted notifications like the live
+        host. Returns (thread, done_event).
+        """
+        rec = muse_mod._MSP_WORKERS[handle]
+        done = threading.Event()
+
+        def run():
+            for _ in range(400):
+                if rec.get("worker_canary_turn_sent") \
+                        is True:
+                    break
+                time.sleep(0.025)
+            for method, params in frames:
+                raw = json.dumps(
+                    {"jsonrpc": "2.0", "method": method,
+                     "params": params}).encode()
+                muse_mod._dispatch_worker_inbox(rec, raw)
+                time.sleep(gap)
+            done.set()
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        return worker, done
+
+    def _wire_methods(self, child):
+        return [o.get("method") for o in self._methods(child)]
+
     def test_no_prompt_parameter_pinned_constant(self):
         params = list(inspect.signature(
             muse_mod.msp_worker_canary_turn).parameters)
@@ -454,62 +534,60 @@ class CanaryTurnCase(Worker273Mixin, unittest.TestCase):
             turn_id = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e01"
             child._script["turn/start"] = [self._turn_ack(
                 6, fixed_cmd, turn_id)]
-            # One payload: the scripted child rewrites the
-            # whole method script on EVERY request, so a
-            # second payload id would arrive unpending and
-            # break the host with unknown-id.
-            child._script["session/read"] = [
-                _msp_test_ok(7, _read_result(
-                    [{"kind": "userMessage",
-                      "text": self.PROMPT},
-                     {"kind": "reasoning", "text": "r"},
-                     {"kind": "agentMessage",
-                      "text": "{\"probe\": \"ok\"}"}],
-                    session={"tokenUsage": {"input": 12,
-                                           "output": 34}}))]
-            rec = muse_mod._MSP_WORKERS[handle]
-            for method in ("item/delta", "item/delta",
-                           "session/tokenUsage"):
-                raw = json.dumps(
-                    {"jsonrpc": "2.0", "method": method,
-                     "params": {"sessionId": sid}}).encode()
-                muse_mod._dispatch_worker_inbox(rec, raw)
-            raw = json.dumps(
-                {"jsonrpc": "2.0", "method": "turn/completed",
-                 "params": {"sessionId": sid}}).encode()
-            muse_mod._dispatch_worker_inbox(rec, raw)
+            user = {"itemId": "i1", "kind": "userMessage",
+                    "revision": 1, "status": "completed",
+                    "text": self.PROMPT}
+            agent = {"itemId": "i2", "kind": "agentMessage",
+                     "revision": 1, "status": "completed",
+                     "text": "{\"probe\": \"ok\"}"}
+            worker, done = self._drive(handle, [
+                _item_frame(sid, user),
+                _item_frame(sid, user, completed=True),
+                _item_frame(sid, agent),
+                _item_frame(sid, agent, completed=True),
+                _usage_frame(sid, turn_id),
+                _completed_frame(sid, turn_id),
+            ])
             with mock.patch.object(
                     muse_mod, "_msp_new_command_id",
                     return_value=fixed_cmd):
-                with mock.patch.object(
-                        muse_mod.time, "sleep",
-                        return_value=None):
-                    out = muse_mod.msp_worker_canary_turn(
-                        handle, timeout=30)
+                out = muse_mod.msp_worker_canary_turn(
+                    handle, timeout=30)
+            self.assertTrue(done.wait(30))
+            worker.join(30)
             self.assertEqual(out["stop"], "completed")
+            self.assertTrue(out["completion_seen"])
             self.assertEqual(out["ack"]["turn_id"], turn_id)
             self.assertEqual(out["ack"]["disposition"],
                              "started")
             self.assertEqual(
                 out["item_kinds"],
-                ["userMessage", "reasoning", "agentMessage"])
+                ["userMessage", "userMessage",
+                 "agentMessage", "agentMessage"])
             self.assertIn("{\"probe\": \"ok\"}",
                           out["text"])
             self.assertFalse(out["text_truncated"])
             self.assertEqual(out["token_counts"],
-                             {"tokenUsage.input": 12,
-                              "tokenUsage.output": 34})
-            models = dict(out["model_strings"])
-            self.assertEqual(models.get("modelId"),
+                             {"input": 100, "output": 34,
+                              "prompt": 100, "total": 134})
+            self.assertEqual(out["model_id"],
                              "muse-spark-1.3")
+            self.assertEqual(out["completion"],
+                             {"terminal": "completed",
+                              "turn_id": turn_id,
+                              "error": None, "reason": None})
             self.assertEqual(out["ledger_counts"].get(
-                "item/delta"), 2)
+                "session/tokenUsage"), 1)
             self.assertIsNone(out["tool_hit"])
             self.assertIsNone(out["error"])
-            # The pinned prompt went on the wire exactly once.
+            # The pinned prompt went on the wire exactly once,
+            # and no session/read frame was ever written.
+            methods = self._wire_methods(child)
+            self.assertEqual(
+                methods.count("turn/start"), 1)
+            self.assertNotIn("session/read", methods)
             sent = [o for o in self._methods(child)
                     if o.get("method") == "turn/start"]
-            self.assertEqual(len(sent), 1)
             self.assertEqual(
                 sent[0]["params"]["input"],
                 [{"type": "text", "text": self.PROMPT}])
@@ -525,40 +603,43 @@ class CanaryTurnCase(Worker273Mixin, unittest.TestCase):
             child._script["turn/start"] = [self._turn_ack(
                 6, fixed_cmd, turn_id)]
             big = "x" * 5000
-            child._script["session/read"] = [_msp_test_ok(
-                7, _read_result([{"kind": "agentMessage",
-                                  "text": big}]))]
-            rec = muse_mod._MSP_WORKERS[handle]
-            raw = json.dumps(
-                {"jsonrpc": "2.0", "method": "turn/completed",
-                 "params": {"sessionId": sid}}).encode()
-            muse_mod._dispatch_worker_inbox(rec, raw)
+            agent = {"itemId": "i9", "kind": "agentMessage",
+                     "revision": 1, "status": "completed",
+                     "text": big}
+            worker, done = self._drive(handle, [
+                _item_frame(sid, agent, completed=True),
+                _completed_frame(sid, turn_id),
+            ])
             with mock.patch.object(
                     muse_mod, "_msp_new_command_id",
                     return_value=fixed_cmd):
-                with mock.patch.object(
-                        muse_mod.time, "sleep",
-                        return_value=None):
-                    out = muse_mod.msp_worker_canary_turn(
-                        handle, timeout=30)
+                out = muse_mod.msp_worker_canary_turn(
+                    handle, timeout=30)
+            self.assertTrue(done.wait(30))
+            worker.join(30)
             self.assertEqual(out["stop"], "completed")
             self.assertTrue(out["text_truncated"])
             self.assertLessEqual(out["text_bytes"], 4096)
+            self.assertNotIn("session/read",
+                             self._wire_methods(child))
         finally:
             self._close(handle)
 
     def test_each_non_message_kind_stops_tool_attempted(self):
         bad_items = [
-            ({"kind": "webSearch", "name": "w"}, "webSearch"),
-            ({"kind": "userShell"}, "userShell"),
-            ({"kind": "toolCall"}, "toolCall"),
-            ({"kind": "SomethingNew"}, "SomethingNew"),
-            ({"text": "no-kind"}, "missing-kind"),
-            ({"kind": None}, "missing-kind"),
-            ({"kind": 7}, "non-string-kind"),
+            ({"kind": "webSearch", "query": "q"},
+             "webSearch", "q"),
+            ({"kind": "userShell", "commandText": "ls"},
+             "userShell", "ls"),
+            ({"kind": "toolCall", "tool": "read"},
+             "toolCall", "read"),
+            ({"kind": "SomethingNew"}, "SomethingNew", None),
+            ({"text": "no-kind"}, "missing-kind", None),
+            ({"kind": None}, "missing-kind", None),
+            ({"kind": 7}, "non-string-kind", None),
         ]
-        for item, want_kind in bad_items:
-            handle, child, _sid = self._admitted_canary()
+        for item, want_kind, want_name in bad_items:
+            handle, child, sid = self._admitted_canary()
             try:
                 with self.subTest(item=item):
                     fixed = ("0193e0f0-7a2b-7c3d-9e4f-"
@@ -567,28 +648,38 @@ class CanaryTurnCase(Worker273Mixin, unittest.TestCase):
                                "5a6b7c8d9e%02d" % 11)
                     child._script["turn/start"] = [
                         self._turn_ack(6, fixed, turn_id)]
-                    child._script["session/read"] = [
-                        _msp_test_ok(7, _read_result(
-                            [{"kind": "userMessage",
-                              "text": "q"}, item]))]
+                    good = {"itemId": "g", "kind":
+                            "userMessage", "revision": 1,
+                            "status": "completed", "text": "q"}
+                    bad = dict(item)
+                    bad.setdefault("itemId", "b")
+                    bad.setdefault("revision", 1)
+                    bad.setdefault("status", "open")
+                    worker, done = self._drive(handle, [
+                        _item_frame(sid, good),
+                        _item_frame(sid, bad),
+                    ])
                     with mock.patch.object(
                             muse_mod, "_msp_new_command_id",
                             return_value=fixed):
-                        with mock.patch.object(
-                                muse_mod.time, "sleep",
-                                return_value=None):
-                            out = muse_mod.\
-                                msp_worker_canary_turn(
-                                    handle, timeout=30)
+                        out = muse_mod.\
+                            msp_worker_canary_turn(
+                                handle, timeout=30)
+                    self.assertTrue(done.wait(30))
+                    worker.join(30)
                     self.assertEqual(out["stop"],
                                      "tool-attempted")
                     self.assertEqual(out["tool_hit"]["kind"],
                                      want_kind)
+                    self.assertEqual(out["tool_hit"]["name"],
+                                     want_name)
+                    self.assertEqual(out["tool_hit"]["index"],
+                                     1)
                     self.assertNotIn(handle,
                                      muse_mod._MSP_WORKERS)
-                    methods = [o.get("method")
-                               for o in self._methods(child)]
+                    methods = self._wire_methods(child)
                     self.assertNotIn("usage/read", methods)
+                    self.assertNotIn("session/read", methods)
             finally:
                 self._close_quiet(handle)
 
@@ -639,22 +730,20 @@ class CanaryTurnCase(Worker273Mixin, unittest.TestCase):
             turn_id = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e06"
             child._script["turn/start"] = [self._turn_ack(
                 6, fixed_cmd, turn_id)]
-            child._script["session/read"] = [_msp_test_ok(
-                7, _read_result([{"kind": "agentMessage",
-                                  "text": "done"}]))]
-            rec = muse_mod._MSP_WORKERS[handle]
-            raw = json.dumps(
-                {"jsonrpc": "2.0", "method": "turn/completed",
-                 "params": {"sessionId": sid}}).encode()
-            muse_mod._dispatch_worker_inbox(rec, raw)
+            agent = {"itemId": "i2", "kind": "agentMessage",
+                     "revision": 1, "status": "completed",
+                     "text": "done"}
+            worker, done = self._drive(handle, [
+                _item_frame(sid, agent, completed=True),
+                _completed_frame(sid, turn_id),
+            ])
             with mock.patch.object(
                     muse_mod, "_msp_new_command_id",
                     return_value=fixed_cmd):
-                with mock.patch.object(
-                        muse_mod.time, "sleep",
-                        return_value=None):
-                    out = muse_mod.msp_worker_canary_turn(
-                        handle, timeout=30)
+                out = muse_mod.msp_worker_canary_turn(
+                    handle, timeout=30)
+            self.assertTrue(done.wait(30))
+            worker.join(30)
             self.assertEqual(out["stop"], "completed")
             with self.assertRaises(muse_mod.MspError) as cm:
                 muse_mod.msp_worker_canary_turn(
@@ -674,21 +763,23 @@ class CanaryTurnCase(Worker273Mixin, unittest.TestCase):
             turn_id = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e08"
             child._script["turn/start"] = [self._turn_ack(
                 6, fixed_cmd, turn_id)]
-            # One payload: the scripted child rewrites the
-            # whole method script on EVERY request, so extra
-            # payload ids would arrive unpending and break
-            # the host with unknown-id instead of timing out.
-            child._script["session/read"] = [
-                _msp_test_ok(7, _read_result(
-                    [{"kind": "userMessage",
-                      "text": "q"}]))]
             with mock.patch.object(
                     muse_mod, "_msp_new_command_id",
                     return_value=fixed_cmd):
                 out = muse_mod.msp_worker_canary_turn(
-                    handle, timeout=0.3)
+                    handle, timeout=0.4)
             self.assertEqual(out["stop"], "timeout")
+            self.assertFalse(out["completion_seen"])
+            self.assertEqual(out["item_kinds"], [])
+            self.assertEqual(out["text"], "")
+            self.assertEqual(out["token_counts"], {})
+            self.assertIsNone(out["model_id"])
+            self.assertEqual(out["retries"], [])
+            self.assertIsNone(out["completion"])
+            self.assertIsNone(out["tool_hit"])
             self.assertNotIn(handle, muse_mod._MSP_WORKERS)
+            self.assertNotIn("session/read",
+                             self._wire_methods(child))
         finally:
             self._close_quiet(handle)
 
@@ -728,26 +819,198 @@ class CanaryTurnCase(Worker273Mixin, unittest.TestCase):
         finally:
             self._close_quiet(handle)
 
-    def test_poll_error_is_error_stop(self):
-        handle, child, _sid = self._admitted_canary()
+    def test_host_broken_is_error_stop(self):
+        handle, child, sid = self._admitted_canary()
         try:
             fixed_cmd = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e0c"
             turn_id = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e0d"
             child._script["turn/start"] = [self._turn_ack(
                 6, fixed_cmd, turn_id)]
-            child._script["session/read"] = [
-                _msp_test_err(7)]
+            user = {"itemId": "i1", "kind": "userMessage",
+                    "revision": 1, "status": "completed",
+                    "text": "q"}
+            worker, done = self._drive(handle, [
+                _item_frame(sid, user),
+                ("approval/requested", {"sessionId": sid}),
+            ])
             with mock.patch.object(
                     muse_mod, "_msp_new_command_id",
                     return_value=fixed_cmd):
-                with mock.patch.object(
-                        muse_mod.time, "sleep",
-                        return_value=None):
-                    out = muse_mod.msp_worker_canary_turn(
-                        handle, timeout=30)
+                out = muse_mod.msp_worker_canary_turn(
+                    handle, timeout=30)
+            self.assertTrue(done.wait(30))
+            worker.join(30)
             self.assertEqual(out["stop"], "error")
             self.assertEqual(out["error"]["code"],
-                             "method-error")
+                             "server-notification")
+            self.assertEqual(out["error"]["broken_method"],
+                             "approval/requested")
+            # The watch so far is still reported.
+            self.assertEqual(out["item_kinds"],
+                             ["userMessage"])
+            self.assertNotIn(handle, muse_mod._MSP_WORKERS)
+            self.assertNotIn("session/read",
+                             self._wire_methods(child))
+        finally:
+            self._close_quiet(handle)
+
+    def test_retry_then_completed_records_attempts(self):
+        handle, child, sid = self._admitted_canary()
+        try:
+            fixed_cmd = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e0e"
+            turn_id = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e0f"
+            child._script["turn/start"] = [self._turn_ack(
+                6, fixed_cmd, turn_id)]
+            agent = {"itemId": "i2", "kind": "agentMessage",
+                     "revision": 1, "status": "completed",
+                     "text": "late"}
+            worker, done = self._drive(handle, [
+                _retry_frame(sid, turn_id, model=True,
+                             attempt=1),
+                _retry_frame(sid, turn_id, model=False,
+                             attempt=2, reason="slow host"),
+                _item_frame(sid, agent, completed=True),
+                _completed_frame(sid, turn_id),
+            ])
+            with mock.patch.object(
+                    muse_mod, "_msp_new_command_id",
+                    return_value=fixed_cmd):
+                out = muse_mod.msp_worker_canary_turn(
+                    handle, timeout=30)
+            self.assertTrue(done.wait(30))
+            worker.join(30)
+            self.assertEqual(out["stop"], "completed")
+            self.assertEqual(out["retries"], [
+                {"method": "turn/modelRetryScheduled",
+                 "attempt": 1, "max_attempts": 3,
+                 "next_attempt": 999, "retry_delay_ms": 500},
+                {"method": "turn/retryScheduled",
+                 "attempt": 2, "max_attempts": 3,
+                 "next_attempt": 999, "retry_delay_ms": 500,
+                 "reason": "slow host"},
+            ])
+            self.assertIn(handle, muse_mod._MSP_WORKERS)
+        finally:
+            self._close(handle)
+
+    def test_failed_terminal_records_error_and_closes(self):
+        handle, child, sid = self._admitted_canary()
+        try:
+            fixed_cmd = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e10"
+            turn_id = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e11"
+            child._script["turn/start"] = [self._turn_ack(
+                6, fixed_cmd, turn_id)]
+            worker, done = self._drive(handle, [
+                _completed_frame(
+                    sid, turn_id, terminal="failed",
+                    error={"kind": "quotaExceeded",
+                           "message": "no quota left",
+                           "retryable": True},
+                    reason="stopped by quota"),
+            ])
+            with mock.patch.object(
+                    muse_mod, "_msp_new_command_id",
+                    return_value=fixed_cmd):
+                out = muse_mod.msp_worker_canary_turn(
+                    handle, timeout=30)
+            self.assertTrue(done.wait(30))
+            worker.join(30)
+            self.assertEqual(out["stop"], "failed")
+            self.assertTrue(out["completion_seen"])
+            self.assertEqual(out["completion"],
+                             {"terminal": "failed",
+                              "turn_id": turn_id,
+                              "error": {"kind": "quotaExceeded",
+                                        "message":
+                                            "no quota left",
+                                        "retryable": True},
+                              "reason": "stopped by quota"})
+            self.assertNotIn(handle, muse_mod._MSP_WORKERS)
+        finally:
+            self._close_quiet(handle)
+
+    def test_completed_without_message_stays_open(self):
+        handle, child, sid = self._admitted_canary()
+        try:
+            fixed_cmd = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e12"
+            turn_id = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e13"
+            child._script["turn/start"] = [self._turn_ack(
+                6, fixed_cmd, turn_id)]
+            user = {"itemId": "i1", "kind": "userMessage",
+                    "revision": 1, "status": "completed",
+                    "text": "q"}
+            worker, done = self._drive(handle, [
+                _item_frame(sid, user, completed=True),
+                _completed_frame(sid, turn_id),
+            ])
+            with mock.patch.object(
+                    muse_mod, "_msp_new_command_id",
+                    return_value=fixed_cmd):
+                out = muse_mod.msp_worker_canary_turn(
+                    handle, timeout=30)
+            self.assertTrue(done.wait(30))
+            worker.join(30)
+            self.assertEqual(out["stop"], "completed-no-message")
+            self.assertTrue(out["completion_seen"])
+            self.assertEqual(out["text"], "")
+            self.assertIn(handle, muse_mod._MSP_WORKERS)
+        finally:
+            self._close(handle)
+
+    def test_non_canary_handle_retains_no_payload(self):
+        for profile in ("product", "subscription-canary"):
+            handle, child = self._bootstrap("accountLogin")
+            try:
+                self._start_session(handle, child, 3)
+                rec = muse_mod._MSP_WORKERS[handle]
+                rec["profile"] = profile
+                # Flag stays unset: the handle is not armed.
+                sid = rec["worker_session"]["id"]
+                agent = {"itemId": "i2",
+                         "kind": "agentMessage",
+                         "revision": 1, "status": "completed",
+                         "text": "sekrit-payload-294"}
+                for method, params in [
+                        _item_frame(sid, agent,
+                                    completed=True),
+                        _usage_frame(sid, "t-1"),
+                        _completed_frame(sid, "t-1")]:
+                    raw = json.dumps(
+                        {"jsonrpc": "2.0", "method": method,
+                         "params": params}).encode()
+                    muse_mod._dispatch_worker_inbox(rec, raw)
+                self.assertNotIn("canary_watch", rec)
+                blob = json.dumps(rec.get("lifecycle"))
+                self.assertNotIn("sekrit-payload-294", blob)
+            finally:
+                self._close(handle)
+
+    def test_turn_id_mismatch_does_not_complete(self):
+        handle, child, sid = self._admitted_canary()
+        try:
+            fixed_cmd = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e14"
+            turn_id = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e15"
+            other = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e16"
+            child._script["turn/start"] = [self._turn_ack(
+                6, fixed_cmd, turn_id)]
+            agent = {"itemId": "i2", "kind": "agentMessage",
+                     "revision": 1, "status": "completed",
+                     "text": "wrong turn"}
+            worker, done = self._drive(handle, [
+                _item_frame(sid, agent, completed=True),
+                _completed_frame(sid, other),
+            ])
+            with mock.patch.object(
+                    muse_mod, "_msp_new_command_id",
+                    return_value=fixed_cmd):
+                out = muse_mod.msp_worker_canary_turn(
+                    handle, timeout=0.6)
+            self.assertTrue(done.wait(30))
+            worker.join(30)
+            self.assertEqual(out["stop"], "timeout")
+            self.assertFalse(out["completion_seen"])
+            self.assertEqual(out["completion"]["turn_id"],
+                             other)
             self.assertNotIn(handle, muse_mod._MSP_WORKERS)
         finally:
             self._close_quiet(handle)
@@ -833,5 +1096,298 @@ class CanaryTurnCase(Worker273Mixin, unittest.TestCase):
                              "capability-unproved")
             cap = muse_mod.msp_worker_capability(handle)
             self.assertFalse(cap["admitted"])
+        finally:
+            self._close(handle)
+
+
+class CanaryWatchDiagnosticsCase(Worker273Mixin,
+                                unittest.TestCase):
+    """294d: retry/completion/finish diagnostics in the watch.
+
+    E32 ended with one turn/modelRetryScheduled and no cause.
+    The schema carries the cause; the watch must fold it.
+    Direct dispatch on an armed handle (flag hand-set, the
+    same test-only arming the transport tests use): no
+    threads, no wire traffic.
+    """
+
+    def setUp(self):
+        self._worker_fixture()
+
+    def _spawn_root(self):
+        root_tmp = tempfile.TemporaryDirectory(
+            prefix="msp294-root-")
+        self.addCleanup(root_tmp.cleanup)
+        root = os.path.realpath(root_tmp.name)
+        os.chmod(root, 0o700)
+        return root
+
+    def _armed(self):
+        """Admitted canary handle, flag hand-set, open."""
+        root = self._spawn_root()
+        child = _MspScriptedChild(script={})
+        self.addCleanup(child.force_close)
+        self._spawn_with(child)
+        handle = muse_mod.spawn_msp_worker(
+            root, profile="subscription-canary")
+        self.addCleanup(self._close_quiet, handle)
+        child._script.update(self._boot_script(root))
+        muse_mod.msp_worker_bootstrap(handle, timeout=10,
+                                      app_version="t")
+        self.root = root
+        self._start_session(handle, child, 3)
+        rec = muse_mod._MSP_WORKERS[handle]
+        sid = rec["worker_session"]["id"]
+        child._script["settings/read"] = [_msp_test_ok(
+            4, _settings_result())]
+        muse_mod.msp_worker_settings_read(handle, timeout=10)
+        child._script["hook/list"] = [_msp_test_ok(
+            5, {"hooks": []})]
+        muse_mod.msp_worker_hooks(handle, timeout=10)
+        admitted = muse_mod.canary_admission(handle)
+        self.assertTrue(admitted["admitted_once"])
+        rec["worker_canary_turn_sent"] = True
+        return handle, rec, sid
+
+    def _boot_script(self, root):
+        home = os.path.join(root, "data", "muse")
+        return {"initialize": [_msp_test_ok(
+                    1, _msp_test_init_result(home))],
+                "account/read": [_msp_test_ok(
+                    2, {"state": "accountLogin",
+                        "credentialRequired": True})]}
+
+    def _close_quiet(self, handle):
+        try:
+            muse_mod.msp_worker_close(handle)
+        except muse_mod.MspError:
+            pass
+
+    def _send(self, rec, method, params):
+        raw = json.dumps(
+            {"jsonrpc": "2.0", "method": method,
+             "params": params}).encode()
+        muse_mod._dispatch_worker_inbox(rec, raw)
+
+    def test_retry_diagnostics_folded(self):
+        _handle, rec, sid = self._armed()
+        turn_id = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e20"
+        method, params = _retry_frame(sid, turn_id,
+                                      model=True)
+        params["errorKind"] = "modelOverloaded"
+        params["httpStatus"] = 503
+        params["system"] = "meta"
+        self._send(rec, method, params)
+        watch = rec["canary_watch"]
+        self.assertEqual(watch["retries"], [
+            {"method": "turn/modelRetryScheduled",
+             "attempt": 1, "max_attempts": 3,
+             "next_attempt": 999, "retry_delay_ms": 500,
+             "error_kind": "modelOverloaded",
+             "http_status": 503, "system": "meta"},
+        ])
+
+    def test_retry_wrong_types_dropped(self):
+        _handle, rec, sid = self._armed()
+        turn_id = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e21"
+        method, params = _retry_frame(sid, turn_id,
+                                      model=True)
+        params["errorKind"] = 7
+        params["httpStatus"] = True
+        params["system"] = None
+        self._send(rec, method, params)
+        method2, params2 = _retry_frame(sid, turn_id,
+                                        model=False,
+                                        reason=5)
+        params2["httpStatus"] = "503"
+        self._send(rec, method2, params2)
+        entries = rec["canary_watch"]["retries"]
+        self.assertEqual(len(entries), 2)
+        for entry in entries:
+            self.assertNotIn("error_kind", entry)
+            self.assertNotIn("http_status", entry)
+            self.assertNotIn("system", entry)
+        self.assertNotIn("reason", entries[1])
+
+    def test_retry_caps_enforced(self):
+        _handle, rec, sid = self._armed()
+        turn_id = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e22"
+        method, params = _retry_frame(
+            sid, turn_id, model=False, reason="r" * 300)
+        params["errorKind"] = "e" * 100
+        params["system"] = "s" * 100
+        self._send(rec, method, params)
+        entry = rec["canary_watch"]["retries"][0]
+        self.assertEqual(entry["error_kind"], "e" * 80)
+        self.assertEqual(entry["system"], "s" * 80)
+        self.assertEqual(entry["reason"], "r" * 200)
+
+    def test_completion_diagnostics_folded(self):
+        _handle, rec, sid = self._armed()
+        turn_id = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e23"
+        method, params = _completed_frame(
+            sid, turn_id, terminal="failed",
+            error={"kind": "quotaExceeded",
+                   "message": "out of quota",
+                   "retryable": True,
+                   "requestDenied": True,
+                   "quota": {"limitKind": "weekly",
+                             "resetsAtMs": 1730000000000}},
+            reason="stopped")
+        params["durationMs"] = 4500
+        params["timeToFirstTokenMs"] = 900
+        params["usage"] = {"inputTokens": 120,
+                           "outputTokens": 9}
+        self._send(rec, method, params)
+        completion = rec["canary_watch"]["completion"]
+        self.assertEqual(completion["terminal"], "failed")
+        self.assertEqual(completion["turn_id"], turn_id)
+        self.assertEqual(
+            completion["error"],
+            {"kind": "quotaExceeded",
+             "message": "out of quota",
+             "retryable": True})
+        self.assertTrue(completion["request_denied"])
+        self.assertEqual(completion["quota"],
+                         {"limit_kind": "weekly",
+                          "resets_at_ms": 1730000000000})
+        self.assertEqual(completion["duration_ms"], 4500)
+        self.assertEqual(completion["ttft_ms"], 900)
+        self.assertEqual(completion["usage_input"], 120)
+        self.assertEqual(completion["usage_output"], 9)
+        self.assertEqual(completion["reason"], "stopped")
+
+    def test_completion_denied_false_and_bad_quota_absent(
+            self):
+        _handle, rec, sid = self._armed()
+        turn_id = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e24"
+        method, params = _completed_frame(
+            sid, turn_id, terminal="failed",
+            error={"kind": "k", "message": "m",
+                   "retryable": False,
+                   "requestDenied": False,
+                   "quota": {"limitKind": 5,
+                             "resetsAtMs": "x"}})
+        self._send(rec, method, params)
+        completion = rec["canary_watch"]["completion"]
+        self.assertNotIn("request_denied", completion)
+        self.assertNotIn("quota", completion)
+        method2, params2 = _completed_frame(
+            sid, "other-turn", terminal="failed",
+            error={"kind": "k", "message": "m",
+                   "retryable": False,
+                   "quota": "weekly"})
+        self._send(rec, method2, params2)
+        completion2 = rec["canary_watch"]["completion"]
+        self.assertNotIn("quota", completion2)
+
+    def test_completion_int_guards_and_caps(self):
+        _handle, rec, sid = self._armed()
+        turn_id = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e25"
+        method, params = _completed_frame(
+            sid, turn_id, terminal="failed",
+            error={"kind": "k", "message": "m" * 600,
+                   "retryable": False},
+            reason="r" * 600)
+        params["durationMs"] = True
+        params["timeToFirstTokenMs"] = "900"
+        params["usage"] = {"inputTokens": "120",
+                           "outputTokens": None}
+        self._send(rec, method, params)
+        completion = rec["canary_watch"]["completion"]
+        self.assertNotIn("duration_ms", completion)
+        self.assertNotIn("ttft_ms", completion)
+        self.assertNotIn("usage_input", completion)
+        self.assertNotIn("usage_output", completion)
+        self.assertEqual(completion["error"]["message"],
+                         "m" * 500)
+        self.assertEqual(completion["reason"], "r" * 500)
+
+    def test_finish_reason_folded_and_guarded(self):
+        _handle, rec, sid = self._armed()
+        turn_id = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e26"
+        method, params = _usage_frame(sid, turn_id)
+        params["finishReason"] = "stop"
+        self._send(rec, method, params)
+        self.assertEqual(
+            rec["canary_watch"]["finish_reason"], "stop")
+        method2, params2 = _usage_frame(sid, turn_id)
+        params2["finishReason"] = "x" * 100
+        self._send(rec, method2, params2)
+        self.assertEqual(
+            rec["canary_watch"]["finish_reason"], "x" * 80)
+        method3, params3 = _usage_frame(sid, turn_id)
+        params3["finishReason"] = 9
+        self._send(rec, method3, params3)
+        # Wrong type keeps the last good value.
+        self.assertEqual(
+            rec["canary_watch"]["finish_reason"], "x" * 80)
+
+    def test_snapshot_returns_new_fields(self):
+        _handle, rec, sid = self._armed()
+        turn_id = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e27"
+        method, params = _retry_frame(sid, turn_id,
+                                      model=True)
+        params["errorKind"] = "k"
+        params["httpStatus"] = 500
+        params["system"] = "s"
+        self._send(rec, method, params)
+        method2, params2 = _usage_frame(sid, turn_id)
+        params2["finishReason"] = "stop"
+        self._send(rec, method2, params2)
+        snap = muse_mod._canary_watch_snapshot(
+            rec.get("canary_watch"))
+        self.assertEqual(snap["retries"][0]["error_kind"],
+                         "k")
+        self.assertEqual(snap["retries"][0]["http_status"],
+                         500)
+        self.assertEqual(snap["retries"][0]["system"], "s")
+        self.assertEqual(snap["finish_reason"], "stop")
+        # A fresh copy: mutating it keeps the watch intact.
+        snap["retries"][0]["error_kind"] = "mut"
+        snap["finish_reason"] = "mut"
+        snap["token_counts"]["input"] = -1
+        watch = rec["canary_watch"]
+        self.assertEqual(
+            watch["retries"][0]["error_kind"], "k")
+        self.assertEqual(watch["finish_reason"], "stop")
+        self.assertEqual(watch["token_counts"]["input"],
+                         100)
+
+    def test_non_canary_keeps_no_diagnostics(self):
+        handle, child = self._bootstrap("accountLogin")
+        try:
+            self._start_session(handle, child, 3)
+            rec = muse_mod._MSP_WORKERS[handle]
+            sid = rec["worker_session"]["id"]
+            turn_id = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e28"
+            method, params = _retry_frame(sid, turn_id,
+                                          model=True)
+            params["errorKind"] = "sekrit-kind-294"
+            params["system"] = "sekrit-system-294"
+            method2, params2 = _usage_frame(sid, turn_id)
+            params2["finishReason"] = "sekrit-finish-294"
+            method3, params3 = _completed_frame(
+                sid, turn_id, terminal="failed",
+                error={"kind": "k", "message": "m",
+                       "retryable": True,
+                       "requestDenied": True,
+                       "quota": {"limitKind": "weekly",
+                                 "resetsAtMs": 1}},
+                reason="sekrit-reason-294")
+            for meth, par in ((method, params),
+                              (method2, params2),
+                              (method3, params3)):
+                raw = json.dumps(
+                    {"jsonrpc": "2.0", "method": meth,
+                     "params": par}).encode()
+                muse_mod._dispatch_worker_inbox(rec, raw)
+            self.assertNotIn("canary_watch", rec)
+            blob = json.dumps(rec.get("lifecycle"))
+            for secret in ("sekrit-kind-294",
+                           "sekrit-system-294",
+                           "sekrit-finish-294",
+                           "sekrit-reason-294"):
+                self.assertNotIn(secret, blob)
         finally:
             self._close(handle)

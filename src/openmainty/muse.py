@@ -3458,6 +3458,7 @@ def _ledger_turn_notification(rec: dict, method: str,
             ledger.append({"method": method,
                            "session_id": sid})
             del ledger[:-_MSP_WORKER_LIFECYCLE_MAX]
+            _canary_watch_update_locked(rec, method, params)
     if action is not None:
         rec["broken_method"] = method
         _msp_break(rec, action)
@@ -3486,6 +3487,275 @@ def _ledger_host_notification(rec: dict, method: str) -> None:
         del ledger[:-_MSP_WORKER_LIFECYCLE_MAX]
 
 
+_MSP_CANARY_WATCH_MAX_ITEMS = 4096
+_MSP_CANARY_WATCH_MAX_RETRIES = 64
+_MSP_CANARY_WATCH_SLEEP_S = 0.2
+
+
+def _canary_watch_armed(rec: dict) -> bool:
+    """True only on a canary handle past the turn flag."""
+    return (rec.get("profile") == "subscription-canary"
+            and rec.get("worker_canary_turn_sent") is True)
+
+
+def _canary_watch_new() -> dict:
+    return {"item_kinds": [], "items_capped": False,
+            "tool_hit": None, "text": "", "text_bytes": 0,
+            "text_truncated": False, "token_counts": {},
+            "model_id": None, "finish_reason": None,
+            "retries": [], "retries_capped": False,
+            "completion": None}
+
+
+def _canary_watch_snapshot(watch: dict) -> dict:
+    """Fresh copy of a watch for the canary return."""
+    if not isinstance(watch, dict):
+        watch = _canary_watch_new()
+    completion = watch.get("completion")
+    tool_hit = watch.get("tool_hit")
+    if isinstance(completion, dict):
+        completion_out = {
+            "terminal": completion.get("terminal"),
+            "turn_id": completion.get("turn_id"),
+            "error": (dict(completion.get("error"))
+                      if isinstance(completion.get("error"),
+                                    dict) else None),
+            "reason": completion.get("reason")}
+        for key in ("request_denied", "quota", "duration_ms",
+                    "ttft_ms", "usage_input", "usage_output"):
+            if key in completion:
+                value = completion[key]
+                completion_out[key] = (
+                    dict(value)
+                    if isinstance(value, dict) else value)
+    else:
+        completion_out = None
+    return {
+        "item_kinds": list(watch.get("item_kinds") or []),
+        "items_capped": watch.get("items_capped") is True,
+        "tool_hit": (dict(tool_hit)
+                     if isinstance(tool_hit, dict) else None),
+        "text": watch.get("text") or "",
+        "text_bytes": watch.get("text_bytes") or 0,
+        "text_truncated": watch.get("text_truncated") is True,
+        "token_counts": dict(watch.get("token_counts") or {}),
+        "model_id": watch.get("model_id"),
+        "finish_reason": watch.get("finish_reason"),
+        "retries": [dict(entry)
+                    for entry in watch.get("retries") or []],
+        "retries_capped": watch.get("retries_capped") is True,
+        "completion": completion_out,
+    }
+
+
+def _canary_watch_append_text(watch: dict, text) -> None:
+    if not isinstance(text, str) or not text:
+        return
+    if watch["text_truncated"]:
+        return
+    data = text.encode("utf-8")
+    room = _MSP_CANARY_TEXT_MAX - watch["text_bytes"]
+    if len(data) > room:
+        data = data[:max(room, 0)]
+        watch["text_truncated"] = True
+    watch["text"] += data.decode("utf-8", "ignore")
+    watch["text_bytes"] = len(watch["text"].encode("utf-8"))
+    if watch["text_bytes"] >= _MSP_CANARY_TEXT_MAX:
+        watch["text_truncated"] = True
+
+
+def _canary_watch_tokens(watch: dict, params: dict) -> None:
+    """Fold session/tokenUsage counts + verbatim modelId."""
+    usage = params.get("usage")
+    counts = {}
+    if isinstance(usage, dict):
+        for key, out in (("inputTokens", "input"),
+                          ("outputTokens", "output")):
+            value = usage.get(key)
+            if isinstance(value, int) \
+                    and not isinstance(value, bool):
+                counts[out] = value
+    for key, out in (("promptTokens", "prompt"),
+                     ("totalTokens", "total")):
+        value = params.get(key)
+        if isinstance(value, int) \
+                and not isinstance(value, bool):
+            counts[out] = value
+    if counts:
+        watch["token_counts"] = counts
+    model = params.get("modelId")
+    if isinstance(model, str) and model:
+        watch["model_id"] = model[:256]
+    finish = params.get("finishReason")
+    if isinstance(finish, str) and finish:
+        watch["finish_reason"] = finish[:80]
+
+
+def _canary_watch_retry(watch: dict, method: str,
+                        params: dict) -> None:
+    """Fold one retry schedule (reason only where schemad)."""
+    if len(watch["retries"]) >= _MSP_CANARY_WATCH_MAX_RETRIES:
+        watch["retries_capped"] = True
+        return
+    entry = {"method": method}
+    for key, out in (("attempt", "attempt"),
+                     ("maxAttempts", "max_attempts"),
+                     ("retryDelayMs", "retry_delay_ms")):
+        value = params.get(key)
+        if isinstance(value, int) \
+                and not isinstance(value, bool):
+            entry[out] = value
+    nxt = params.get("nextAttempt")
+    if isinstance(nxt, int) and not isinstance(nxt, bool):
+        entry["next_attempt"] = nxt
+    elif isinstance(nxt, str):
+        entry["next_attempt"] = nxt[:64]
+    if method == "turn/retryScheduled":
+        reason = params.get("reason")
+        if isinstance(reason, str):
+            entry["reason"] = reason[:200]
+    # Failure cause, both retry methods (E32 ended with one
+    # modelRetryScheduled and no cause).
+    error_kind = params.get("errorKind")
+    if isinstance(error_kind, str) and error_kind:
+        entry["error_kind"] = error_kind[:80]
+    http_status = params.get("httpStatus")
+    if isinstance(http_status, int) \
+            and not isinstance(http_status, bool):
+        entry["http_status"] = http_status
+    system = params.get("system")
+    if isinstance(system, str) and system:
+        entry["system"] = system[:80]
+    watch["retries"].append(entry)
+
+
+def _canary_watch_completion(watch: dict, params: dict) -> None:
+    """Fold turn/completed (TurnError: kind/message/retryable).
+
+    The schema's TurnError has NO code member, so none is
+    recorded. request_denied is written only when exactly
+    True; quota only when a dict with valid members;
+    duration/ttft/usage members only when ints (bools are
+    not ints). Latest completion wins; the waiter matches
+    turn_id against the ack.
+    """
+    error = params.get("error")
+    out_err = None
+    if isinstance(error, dict):
+        kind = error.get("kind")
+        message = error.get("message")
+        retryable = error.get("retryable")
+        out_err = {
+            "kind": (kind[:80]
+                     if isinstance(kind, str) else None),
+            "message": (message[:500]
+                        if isinstance(message, str)
+                        else None),
+            "retryable": (retryable
+                          if isinstance(retryable, bool)
+                          else None),
+        }
+    terminal = params.get("terminal")
+    turn_id = params.get("turnId")
+    reason = params.get("reason")
+    folded = {
+        "terminal": (terminal
+                     if isinstance(terminal, str)
+                     else "non-string-terminal"),
+        "turn_id": (turn_id
+                    if isinstance(turn_id, str) else None),
+        "error": out_err,
+        "reason": (reason[:500]
+                   if isinstance(reason, str) else None),
+    }
+    if isinstance(error, dict):
+        if error.get("requestDenied") is True:
+            folded["request_denied"] = True
+        quota = error.get("quota")
+        if isinstance(quota, dict):
+            folded_quota = {}
+            limit_kind = quota.get("limitKind")
+            if isinstance(limit_kind, str) and limit_kind:
+                folded_quota["limit_kind"] = limit_kind[:80]
+            resets_at = quota.get("resetsAtMs")
+            if isinstance(resets_at, int) \
+                    and not isinstance(resets_at, bool):
+                folded_quota["resets_at_ms"] = resets_at
+            if folded_quota:
+                folded["quota"] = folded_quota
+    duration = params.get("durationMs")
+    if isinstance(duration, int) \
+            and not isinstance(duration, bool):
+        folded["duration_ms"] = duration
+    ttft = params.get("timeToFirstTokenMs")
+    if isinstance(ttft, int) and not isinstance(ttft, bool):
+        folded["ttft_ms"] = ttft
+    aggregate = params.get("usage")
+    if isinstance(aggregate, dict):
+        usage_in = aggregate.get("inputTokens")
+        if isinstance(usage_in, int) \
+                and not isinstance(usage_in, bool):
+            folded["usage_input"] = usage_in
+        usage_out = aggregate.get("outputTokens")
+        if isinstance(usage_out, int) \
+                and not isinstance(usage_out, bool):
+            folded["usage_output"] = usage_out
+    watch["completion"] = folded
+
+
+def _canary_watch_update_locked(rec: dict, method: str,
+                                params) -> None:
+    """Fold one validated notification into rec["canary_watch"].
+
+    Caller holds break_lock and has validated the frame
+    through the normal ledger path. No-op unless the handle
+    is armed (subscription-canary profile + turn flag set),
+    so every other profile keeps today's no-payload
+    behaviour. Only the watched members below are retained.
+    """
+    if not _canary_watch_armed(rec):
+        return
+    if not isinstance(params, dict):
+        return
+    if method in ("item/started", "item/completed"):
+        watch = rec.get("canary_watch")
+        if not isinstance(watch, dict):
+            watch = rec["canary_watch"] = _canary_watch_new()
+        kinds = watch["item_kinds"]
+        if len(kinds) >= _MSP_CANARY_WATCH_MAX_ITEMS:
+            watch["items_capped"] = True
+            return
+        item = params.get("item")
+        flagged, shown, name = _canary_flag_item(item)
+        if flagged:
+            kinds.append(shown)
+        else:
+            kinds.append(item.get("kind"))
+        if flagged and watch["tool_hit"] is None:
+            watch["tool_hit"] = {"index": len(kinds) - 1,
+                                 "kind": shown, "name": name}
+        if method == "item/completed" \
+                and isinstance(item, dict) \
+                and item.get("kind") == "agentMessage":
+            _canary_watch_append_text(watch, item.get("text"))
+    elif method == "session/tokenUsage":
+        watch = rec.get("canary_watch")
+        if not isinstance(watch, dict):
+            watch = rec["canary_watch"] = _canary_watch_new()
+        _canary_watch_tokens(watch, params)
+    elif method in ("turn/retryScheduled",
+                    "turn/modelRetryScheduled"):
+        watch = rec.get("canary_watch")
+        if not isinstance(watch, dict):
+            watch = rec["canary_watch"] = _canary_watch_new()
+        _canary_watch_retry(watch, method, params)
+    elif method == "turn/completed":
+        watch = rec.get("canary_watch")
+        if not isinstance(watch, dict):
+            watch = rec["canary_watch"] = _canary_watch_new()
+        _canary_watch_completion(watch, params)
+
+
 def _dispatch_worker_inbox(rec: dict, raw: bytes) -> None:
     """Bounded typed lifecycle handling for worker handles.
 
@@ -3498,6 +3768,10 @@ def _dispatch_worker_inbox(rec: dict, raw: bytes) -> None:
     the same way, plus an uncapped per-method count.
     Host-scoped methods (_MSP_WORKER_HOST_NOTIFICATIONS)
     ledger with session_id None and no sid requirement.
+    Validated frames also fold watched members into
+    rec["canary_watch"], but ONLY on an armed handle
+    (subscription-canary profile + turn flag set); every
+    other profile keeps no payload.
     account/changed breaks like the readonly path; a durable
     model change under us breaks with model-changed rather
     than continuing on a changed model; unknown methods,
@@ -3603,6 +3877,7 @@ def _dispatch_worker_inbox(rec: dict, raw: bytes) -> None:
                 ledger = rec["lifecycle"] = []
             ledger.append({"method": method, "session_id": sid})
             del ledger[:-_MSP_WORKER_LIFECYCLE_MAX]
+            _canary_watch_update_locked(rec, method, params)
     if action is not None:
         _msp_break(rec, action)
 
@@ -4288,7 +4563,6 @@ _MSP_CANARY_PROMPT = (
 _MSP_CANARY_MESSAGE_KINDS = frozenset(
     ["userMessage", "agentMessage", "reasoning"])
 
-_MSP_CANARY_POLL_S = 2.0
 _MSP_CANARY_TEXT_MAX = 4096
 
 
@@ -4297,7 +4571,9 @@ def _canary_flag_item(item):
 
     Allowlist: only _MSP_CANARY_MESSAGE_KINDS pass. Reads
     ONLY the "kind" field; the name lookup is metadata for
-    the record. Truncated strings only, never payloads.
+    the record, from the schema's per-kind members (tool,
+    commandText, query, url, label, callId). Truncated
+    strings only, never payloads.
     """
     if not isinstance(item, dict):
         return True, "non-dict-item", None
@@ -4305,8 +4581,8 @@ def _canary_flag_item(item):
     if isinstance(kind, str) and kind in _MSP_CANARY_MESSAGE_KINDS:
         return False, None, None
     name = None
-    for key in ("name", "toolName", "tool", "function",
-                "command", "server"):
+    for key in ("tool", "commandText", "query", "url",
+                "label", "callId"):
         value = item.get(key)
         if isinstance(value, str) and value:
             name = value[:80]
@@ -4320,92 +4596,8 @@ def _canary_flag_item(item):
     return True, shown, name
 
 
-def _canary_item_kinds(items):
-    """Ordered kind list of raw items (kinds only, no payload)."""
-    kinds = []
-    if not isinstance(items, list):
-        return kinds
-    for item in items:
-        if not isinstance(item, dict):
-            kinds.append("non-dict-item")
-            continue
-        kind = item.get("kind")
-        if isinstance(kind, str):
-            kinds.append(kind[:80])
-        elif kind is None:
-            kinds.append("missing-kind")
-        else:
-            kinds.append("non-string-kind")
-    return kinds
-
-
-def _canary_collect_text(items):
-    """Response text from raw items, capped at 4 KiB.
-
-    Returns (text, byte_len, truncated). Only "text" /
-    "content" / "output" string members are read.
-    """
-    parts = []
-    total = 0
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        for key in ("text", "content", "output"):
-            value = item.get(key)
-            if isinstance(value, str) and value:
-                room = _MSP_CANARY_TEXT_MAX - total
-                if room <= 0:
-                    break
-                take = value[:room]
-                parts.append(take)
-                total += len(take.encode("utf-8"))
-    blob = "".join(parts)
-    size = len(blob.encode("utf-8"))
-    return blob, size, size >= _MSP_CANARY_TEXT_MAX
-
-
-def _canary_token_counts(obj, depth=0):
-    """Numeric values under token-ish keys only (depth <= 3)."""
-    found = {}
-    if depth > 3 or not isinstance(obj, dict):
-        return found
-    for key, value in obj.items():
-        if not isinstance(key, str):
-            continue
-        if "token" in key.lower() and isinstance(value, dict):
-            for sub, num in value.items():
-                if isinstance(sub, str) and isinstance(
-                        num, (int, float)) \
-                        and not isinstance(num, bool):
-                    found[key + "." + sub] = num
-        elif isinstance(value, dict):
-            for sub, num in _canary_token_counts(
-                    value, depth + 1).items():
-                found.setdefault(sub, num)
-    return found
-
-
-def _canary_model_strings(obj, depth=0):
-    """Verbatim model/provider/route strings, top levels only."""
-    found = []
-    if depth > 2 or not isinstance(obj, dict):
-        return found
-    for key, value in obj.items():
-        if not isinstance(key, str):
-            continue
-        low = key.lower()
-        if low in ("model", "modelid", "model_id",
-                   "provider", "providerid", "route",
-                   "endpoint") and isinstance(value, str):
-            found.append((key, value[:128]))
-        elif isinstance(value, dict) and depth < 2:
-            found.extend(_canary_model_strings(value,
-                                               depth + 1))
-    return found
-
-
 def msp_worker_canary_turn(handle: str, *,
-                           timeout: float = 120) -> dict:
+                           timeout: float = 300) -> dict:
     """Send the single canary turn and watch it to completion.
 
     Gates (MspError, no wire write): the handle's profile must
@@ -4420,24 +4612,35 @@ def msp_worker_canary_turn(handle: str, *,
     Sends exactly one turn/start with required params only
     (commandId + sessionId + one text input carrying the
     pinned _MSP_CANARY_PROMPT — there is NO prompt argument),
-    validates the ack, then polls raw session/read snapshots
-    on a bounded interval. "completed" needs BOTH the
-    turn/completed ledger entry AND an observed agentMessage
-    in the latest poll: a completion signal without an
-    observed agent response is not canary evidence yet, so
-    the watch continues (timeout then reports honestly, with
-    completion_seen set). Every polled item passes the
-    ALLOWLIST control: only
-    userMessage/agentMessage/reasoning; the first other item
-    records kind + name only, closes the handle, and returns
-    stop "tool-attempted" without any usage call.
+    validates the ack, then waits on rec["canary_watch"]
+    with NO further wire traffic: the live host refused
+    session/read with -32601 in E32, so polling is gone and
+    the dispatcher folds watched notification members while
+    the handle is armed. The completion must match the
+    ack's turn id. Every watched item passes the ALLOWLIST
+    control: only userMessage/agentMessage/reasoning; the
+    first other item records kind + name only, closes the
+    handle, and returns stop "tool-attempted" without any
+    usage call.
 
-    Returns {"stop", "ack", "ack_ms", "completion_seen",
-    "item_kinds", "text", "text_bytes", "text_truncated",
-    "token_counts", "model_strings", "ledger_counts",
-    "session_status", "polls", "tool_hit", "error"}. stop is
-    "completed", "tool-attempted", "timeout" (closes), or
-    "error" (closes; transport/ack/poll failure, no retry).
+    Stops, no retry anywhere: "tool-attempted" (closes);
+    "completed" (terminal completed + agentMessage seen;
+    left open for usage/read); "completed-no-message"
+    (terminal completed, no agentMessage; left open, said
+    so); "failed" (terminal failed/cancelled/unknown;
+    closes, with the error fields); "error" (closes; host
+    broken or transport/ack failure, with broken_method and
+    the watch so far); "timeout" (closes, with the watch so
+    far). Default timeout is 300 s: retry chains need room.
+
+    Returns {"stop", "ack", "ack_ms", "completion_seen"}
+    plus the watch fields {"item_kinds", "items_capped",
+    "text", "text_bytes", "text_truncated", "token_counts",
+    "model_id", "finish_reason", "retries", "retries_capped",
+    "completion", "tool_hit"} and {"ledger_counts", "error"}.
+    Retry entries carry error_kind/http_status/system;
+    completion carries request_denied/quota/duration_ms/
+    ttft_ms/usage_input/usage_output when served.
     msp_worker_turn keeps refusing and capability stays
     admitted False regardless of this function's outcome.
     """
@@ -4462,12 +4665,9 @@ def msp_worker_canary_turn(handle: str, *,
                        code="session-unbound")
     timeout = _msp_validate_timeout(timeout, "canary turn")
     out = {"stop": None, "ack": None, "ack_ms": None,
-           "completion_seen": False, "item_kinds": [],
-           "text": "", "text_bytes": 0,
-           "text_truncated": False, "token_counts": {},
-           "model_strings": [], "ledger_counts": {},
-           "session_status": None, "polls": 0,
-           "tool_hit": None, "error": None}
+           "completion_seen": False, "ledger_counts": {},
+           "error": None}
+    out.update(_canary_watch_snapshot(None))
 
     def _shut(stop, error=None):
         out["stop"] = stop
@@ -4506,67 +4706,36 @@ def msp_worker_canary_turn(handle: str, *,
                       ack["started_new_turn"]}
     out["ack_ms"] = int(time.time() * 1000)
     deadline = time.monotonic() + timeout
-    last_items = []
-    last_raw = None
     while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            out["item_kinds"] = _canary_item_kinds(last_items)
-            return _shut("timeout")
-        try:
-            raw = _worker_send_request(
-                handle, "session/read",
-                {"sessionId": bound["id"],
-                 "excludeItems": False},
-                min(10.0, remaining))
-        except MspError as exc:
-            out["item_kinds"] = _canary_item_kinds(last_items)
-            return _shut("error", {"code": exc.code,
-                                   "message": str(exc)})
-        out["polls"] += 1
-        last_raw = raw
-        items = ((raw.get("history") or {}).get("items")
-                 or [])
-        last_items = items
-        session = raw.get("session") or {}
-        if isinstance(session, dict):
-            out["session_status"] = session.get("status")
-        for index, item in enumerate(items):
-            flagged, kind, name = _canary_flag_item(item)
-            if flagged:
-                out["tool_hit"] = {"index": index,
-                                   "kind": kind, "name": name}
-                out["item_kinds"] = _canary_item_kinds(items)
-                return _shut("tool-attempted")
         with rec["break_lock"]:
-            entries = list(rec.get("lifecycle") or [])
-        completed = any(
-            isinstance(entry, dict)
-            and entry.get("method") == "turn/completed"
-            and entry.get("session_id") == bound["id"]
-            for entry in entries)
-        if completed:
+            snap = _canary_watch_snapshot(
+                rec.get("canary_watch"))
+            broken = rec.get("broken")
+            broken_method = rec.get("broken_method")
+        out.update(snap)
+        if snap["tool_hit"] is not None:
+            return _shut("tool-attempted")
+        completion = snap["completion"] or {}
+        if completion.get("turn_id") == ack["turn_id"]:
             out["completion_seen"] = True
-        answered = any(
-            isinstance(item, dict)
-            and item.get("kind") == "agentMessage"
-            for item in items)
-        if completed and answered:
-            break
+            out["ledger_counts"] = dict(
+                rec.get("turn_notification_counts") or {})
+            if completion.get("terminal") == "completed":
+                if "agentMessage" in snap["item_kinds"]:
+                    out["stop"] = "completed"
+                else:
+                    out["stop"] = "completed-no-message"
+                return out
+            return _shut("failed")
+        if broken is not None:
+            return _shut("error", {"code": broken,
+                                   "broken_method":
+                                       broken_method})
+        if time.monotonic() >= deadline:
+            return _shut("timeout")
         rest = deadline - time.monotonic()
         if rest > 0:
-            time.sleep(min(_MSP_CANARY_POLL_S, rest))
-    out["item_kinds"] = _canary_item_kinds(last_items)
-    text, size, truncated = _canary_collect_text(last_items)
-    out["text"] = text
-    out["text_bytes"] = size
-    out["text_truncated"] = truncated
-    out["token_counts"] = _canary_token_counts(last_raw or {})
-    out["model_strings"] = _canary_model_strings(last_raw or {})
-    out["ledger_counts"] = dict(
-        rec.get("turn_notification_counts") or {})
-    out["stop"] = "completed"
-    return out
+            time.sleep(min(_MSP_CANARY_WATCH_SLEEP_S, rest))
 
 
 def msp_worker_close(handle: str, reason: str = "done") -> dict:
