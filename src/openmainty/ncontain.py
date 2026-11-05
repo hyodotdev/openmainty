@@ -132,6 +132,21 @@ SUBSCRIPTION_CANARY_NETWORK_LINES = (
     '(literal "/private/var/run/mDNSResponder"))',
 )
 
+# Canary read lines, DNS-only (gate 2, slice 295b).
+# E35a5 leave-one-out (result 9076182f): removing ONLY
+# this line broke DNS (curl exit 6); removing any of the
+# other eight V1 lines (/private, /private/var,
+# /private/var/run, mDNSResponder read, resolv.conf,
+# hosts, services) still resolved. Those eight stay out.
+# Slice 295 also carried a TLS-roots group (a trust-roots
+# file plus its path metadata, evidence E35a4 V2 for
+# curl); E35 ran with it. E36 tests the worker without
+# it. Appended after the network lines, canary profile
+# only; the plain subscription text never carries them.
+SUBSCRIPTION_CANARY_READ_LINES = (
+    '(allow file-read-metadata (literal "/var"))',
+)
+
 
 class ContainmentError(Exception):
     pass
@@ -427,8 +442,10 @@ def subscription_canary_exceptions(home=None) -> list:
 
     The subscription list plus one {"path", "kind",
     "reason"} dict per SUBSCRIPTION_CANARY_NETWORK_LINES
-    entry (kind "network", path verbatim: no home
-    expansion — the lines carry no home path).
+    entry (kind "network") and per
+    SUBSCRIPTION_CANARY_READ_LINES entry (kind "read"),
+    path verbatim: no home expansion — the lines carry no
+    home path.
     """
     out = subscription_worker_exceptions(home)
     reasons = {
@@ -441,6 +458,14 @@ def subscription_canary_exceptions(home=None) -> list:
     for line in SUBSCRIPTION_CANARY_NETWORK_LINES:
         out.append({"path": line, "kind": "network",
                     "reason": reasons[line]})
+    read_reasons = {
+        SUBSCRIPTION_CANARY_READ_LINES[0]:
+            "DNS resolver path (E35a5: only this V1 line "
+            "was needed for DNS)",
+    }
+    for line in SUBSCRIPTION_CANARY_READ_LINES:
+        out.append({"path": line, "kind": "read",
+                    "reason": read_reasons[line]})
     return out
 
 
@@ -615,37 +640,44 @@ def build_subscription_worker_policy_text(root: str,
 
 
 def _prove_canary_plus(text: str, sub: str) -> None:
-    """Prove text is the subscription text plus exactly the two
-    canary network lines — removal style. Each line must be
-    absent from the subscription text and present exactly once
-    in the canary text; everything else must be identical.
+    """Prove text is the subscription text plus exactly the
+    canary network lines plus exactly the canary read
+    lines — removal style. Each line must be absent from
+    the subscription text and present exactly once in the
+    canary text, network lines first, then read lines;
+    everything else must be identical.
     """
-    for line in SUBSCRIPTION_CANARY_NETWORK_LINES:
+    expected = list(SUBSCRIPTION_CANARY_NETWORK_LINES) \
+        + list(SUBSCRIPTION_CANARY_READ_LINES)
+    for line in expected:
         if line in sub:
             raise ContainmentError(
-                "canary proof: network line already present")
+                "canary proof: canary line already present")
     tlines = text.splitlines()
     slines = sub.splitlines()
-    if tlines != slines + list(SUBSCRIPTION_CANARY_NETWORK_LINES):
+    if tlines != slines + expected:
         raise ContainmentError("canary proof: extra diff")
-    for line in SUBSCRIPTION_CANARY_NETWORK_LINES:
+    for line in expected:
         if tlines.count(line) != 1:
             raise ContainmentError(
-                "canary proof: network line not unique")
+                "canary proof: canary line not unique")
 
 
 def build_subscription_canary_policy_text(root: str,
                                           exe_path: str,
                                           home=None) -> str:
     """Canary profile: subscription text plus exactly the two
-    E31 network lines (gate (2), root431 steer).
+    E31 network lines plus exactly the 295 read lines for
+    DNS + TLS roots (gate (2)).
 
     Appended at the END (SBPL last-match-wins) with
     (deny network*) kept: outbound TCP 443 plus the DNS
-    resolver socket only; inbound stays denied. File-write,
-    file-read, exec pin, and securityd deny are identical to
-    the subscription text — proven by removal; anything else
-    raises ContainmentError. Nothing here authorizes a model
+    resolver socket, then the resolver-path and TLS-root
+    reads the E35a4/E35a5 curl probes measured; inbound
+    stays denied. File-write, file-read, exec pin, and
+    securityd deny are identical to the subscription text
+    — proven by removal; anything else raises
+    ContainmentError. Nothing here authorizes a model
     worker: the single canary turn is gated in muse.py, and
     the "subscription" profile stays network-denied.
     """
@@ -653,8 +685,9 @@ def build_subscription_canary_policy_text(root: str,
         root, exe_path, home)
     if not sub.endswith("\n"):
         raise ContainmentError("canary proof: base text shape")
-    text = sub + "\n".join(SUBSCRIPTION_CANARY_NETWORK_LINES) \
-        + "\n"
+    text = sub + "\n".join(
+        list(SUBSCRIPTION_CANARY_NETWORK_LINES)
+        + list(SUBSCRIPTION_CANARY_READ_LINES)) + "\n"
     _prove_canary_plus(text, sub)
     return text
 

@@ -105,6 +105,13 @@ CANARY_LINES = (
     "(literal \"/private/var/run/mDNSResponder\"))",
 )
 
+# Slice 295b: DNS-only. The 295 TLS-roots group is
+# removed so E36 can test whether the worker needs it;
+# see tests/test_295_canary_reads.py.
+CANARY_READ_LINES = (
+    "(allow file-read-metadata (literal \"/var\"))",
+)
+
 
 def _settings_result(**over):
     values = {"provider": "meta",
@@ -319,7 +326,7 @@ class PolicyCase(unittest.TestCase):
         self.assertEqual(got, GOLDEN_SUBSCRIPTION_TEXT)
         self.assertNotIn("network-outbound", got)
 
-    def test_canary_is_base_plus_exactly_two_lines(self):
+    def test_canary_is_base_plus_network_and_read_lines(self):
         import difflib
         sub = ncontain.build_subscription_worker_policy_text(
             FAKE_ROOT, FAKE_EXE, FAKE_HOME)
@@ -335,8 +342,9 @@ class PolicyCase(unittest.TestCase):
                    if ln.startswith("-")
                    and not ln.startswith("---")]
         self.assertEqual(removed, [])
-        self.assertEqual(added, list(CANARY_LINES))
-        for line in CANARY_LINES:
+        self.assertEqual(added, list(CANARY_LINES)
+                         + list(CANARY_READ_LINES))
+        for line in (CANARY_LINES + CANARY_READ_LINES):
             self.assertEqual(got.count(line), 1)
 
     def test_canary_create_writes_identity(self):
