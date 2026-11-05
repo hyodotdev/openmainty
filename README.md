@@ -20,6 +20,18 @@ No direct model APIs, no pay-per-use keys.
 Subscriber-only: `chat` and worker runs require `muse login`;
 API-key billing (`META_API_KEY`) is refused.
 
+## Screenshots
+
+Demo video (16 s, no audio): [docs/media/openmainty-demo.mp4](docs/media/openmainty-demo.mp4)
+
+| At a glance | Control center |
+|---|---|
+| ![At a glance](docs/media/glance-1280.jpg) | ![Control center](docs/media/command-1280.jpg) |
+| **Runs** | **Daily digest** |
+| ![Runs](docs/media/runs-1280.jpg) | ![Daily digest](docs/media/digest-1280.jpg) |
+
+Phone width (390 px): [docs/media/command-390.png](docs/media/command-390.png)
+
 ## Hackathon
 
 OpenMainty is entered in the Meta Global AI Developer Hackathon
