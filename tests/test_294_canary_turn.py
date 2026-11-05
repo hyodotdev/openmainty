@@ -24,14 +24,17 @@ was observed). This slice:
   rec["canary_watch"] with NO wire traffic (the live host
   refused session/read with -32601 in E32, so polling is
   gone): ordered item kinds with the ALLOWLIST control
-  (only userMessage/agentMessage/reasoning pass; first
-  other item records kind + name, closes, returns
-  "tool-attempted"), agentMessage text capped at 4 KiB,
-  token counts + verbatim modelId, retry attempts, and the
+  (only userMessage/agentMessage/reasoning pass, plus the
+  OBSERVED kind reminderChild, which folds id metadata
+  and never stops the canary; first other item records
+  kind + name, closes, returns "tool-attempted"),
+  agentMessage text capped at 4 KiB, token counts +
+  verbatim modelId, retry attempts, and the
   turn/completed terminal matched to the ack turn id.
-  completed-no-message stays open; failed/timeout/error
-  close. No retry anywhere. msp_worker_turn keeps refusing;
-  capability stays False.
+  turn/foregroundCompleted folds its blocking agent ids
+  and never ends the wait. completed-no-message stays
+  open; failed/timeout/error close. No retry anywhere.
+  msp_worker_turn keeps refusing; capability stays False.
 
 Offline only: scripted-child fixtures. No live spawn, no
 real binary, no model turn. Isolated temp homes only; never
@@ -1391,3 +1394,511 @@ class CanaryWatchDiagnosticsCase(Worker273Mixin,
                 self.assertNotIn(secret, blob)
         finally:
             self._close(handle)
+
+
+def _foreground_frame(sid, turn_id, agents):
+    """One turn/foregroundCompleted frame, schema members."""
+    return ("turn/foregroundCompleted",
+            {"blockingAgents": list(agents),
+             "sessionId": sid,
+             "sourceRange": {"start": 0, "end": 1},
+             "turnId": turn_id, "viewCursor": "v11"})
+
+
+def _reminder_item(**over):
+    """Schema-shaped reminderChild item (E33 kind)."""
+    item = {"itemId": "r1", "kind": "reminderChild",
+            "revision": 1, "status": "inProgress",
+            "reminderAgentId": "agent-7",
+            "generationId": 3, "taskId": "task-9",
+            "childSessionId":
+                "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e77",
+            "blocking": True}
+    item.update(over)
+    return item
+
+
+class CanaryObservedKindsCase(Worker273Mixin,
+                              unittest.TestCase):
+    """294e: observed kinds + foreground fold in the watch.
+
+    E33 stopped at item index 1 on kind reminderChild with
+    no completion, no text, no tokens and no usage call.
+    The schema says reminderChild is a child record for a
+    reminder agent (blocking holds the turn open) and
+    turn/foregroundCompleted is explicitly non-terminal.
+    Observed kinds append to item_kinds and fold bounded
+    metadata without stopping the canary; every other
+    non-message kind still stops with tool-attempted.
+    """
+
+    REMINDER_KEYS = frozenset(
+        ["reminder_agent_id", "generation_id", "task_id",
+         "child_session_id", "blocking", "status",
+         "method"])
+
+    def setUp(self):
+        self._worker_fixture()
+
+    def _spawn_root(self):
+        root_tmp = tempfile.TemporaryDirectory(
+            prefix="msp294-root-")
+        self.addCleanup(root_tmp.cleanup)
+        root = os.path.realpath(root_tmp.name)
+        os.chmod(root, 0o700)
+        return root
+
+    def _boot_script(self, root):
+        home = os.path.join(root, "data", "muse")
+        return {"initialize": [_msp_test_ok(
+                    1, _msp_test_init_result(home))],
+                "account/read": [_msp_test_ok(
+                    2, {"state": "accountLogin",
+                        "credentialRequired": True})]}
+
+    def _armed(self):
+        """Admitted canary handle, flag hand-set, open."""
+        root = self._spawn_root()
+        child = _MspScriptedChild(script={})
+        self.addCleanup(child.force_close)
+        self._spawn_with(child)
+        handle = muse_mod.spawn_msp_worker(
+            root, profile="subscription-canary")
+        self.addCleanup(self._close_quiet, handle)
+        child._script.update(self._boot_script(root))
+        muse_mod.msp_worker_bootstrap(handle, timeout=10,
+                                      app_version="t")
+        self.root = root
+        self._start_session(handle, child, 3)
+        rec = muse_mod._MSP_WORKERS[handle]
+        sid = rec["worker_session"]["id"]
+        child._script["settings/read"] = [_msp_test_ok(
+            4, _settings_result())]
+        muse_mod.msp_worker_settings_read(handle, timeout=10)
+        child._script["hook/list"] = [_msp_test_ok(
+            5, {"hooks": []})]
+        muse_mod.msp_worker_hooks(handle, timeout=10)
+        admitted = muse_mod.canary_admission(handle)
+        self.assertTrue(admitted["admitted_once"])
+        rec["worker_canary_turn_sent"] = True
+        return handle, rec, sid
+
+    def _admitted_canary(self):
+        """Bootstrap+session+settings+hooks+canary on canary."""
+        self._stop_worker_patches()
+        root = self._spawn_root()
+        child = _MspScriptedChild(script={})
+        self.addCleanup(child.force_close)
+        self._spawn_with(child)
+        handle = muse_mod.spawn_msp_worker(
+            root, profile="subscription-canary")
+        self.addCleanup(self._close_quiet, handle)
+        child._script.update(self._boot_script(root))
+        muse_mod.msp_worker_bootstrap(handle, timeout=10,
+                                      app_version="t")
+        self.root = root
+        self._start_session(handle, child, 3)
+        rec = muse_mod._MSP_WORKERS[handle]
+        sid = rec["worker_session"]["id"]
+        child._script["settings/read"] = [_msp_test_ok(
+            4, _settings_result())]
+        muse_mod.msp_worker_settings_read(handle, timeout=10)
+        child._script["hook/list"] = [_msp_test_ok(
+            5, {"hooks": []})]
+        muse_mod.msp_worker_hooks(handle, timeout=10)
+        admitted = muse_mod.canary_admission(handle)
+        self.assertTrue(admitted["admitted_once"])
+        return handle, child, sid
+
+    def _close_quiet(self, handle):
+        try:
+            muse_mod.msp_worker_close(handle, reason="t")
+        except muse_mod.MspError:
+            pass
+
+    def _turn_ack(self, req_id, command_id, turn_id):
+        return _msp_test_ok(req_id, {
+            "commandId": command_id,
+            "disposition": "started",
+            "startedNewTurn": True, "status": "accepted",
+            "turnId": turn_id})
+
+    def _drive(self, handle, frames, gap=0.01):
+        rec = muse_mod._MSP_WORKERS[handle]
+        done = threading.Event()
+
+        def run():
+            for _ in range(400):
+                if rec.get("worker_canary_turn_sent") \
+                        is True:
+                    break
+                time.sleep(0.025)
+            for method, params in frames:
+                raw = json.dumps(
+                    {"jsonrpc": "2.0", "method": method,
+                     "params": params}).encode()
+                muse_mod._dispatch_worker_inbox(rec, raw)
+                time.sleep(gap)
+            done.set()
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        return worker, done
+
+    def _send(self, rec, method, params):
+        raw = json.dumps(
+            {"jsonrpc": "2.0", "method": method,
+             "params": params}).encode()
+        muse_mod._dispatch_worker_inbox(rec, raw)
+
+    def _user_item(self):
+        return {"itemId": "u", "kind": "userMessage",
+                "revision": 1, "status": "completed",
+                "text": "probe"}
+
+    def _agent_item(self, text="done-line"):
+        return {"itemId": "a", "kind": "agentMessage",
+                "revision": 1, "status": "completed",
+                "text": text}
+
+    def _run_turn(self, handle, child, frames, turn_id,
+                  timeout=30):
+        fixed = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e40"
+        child._script["turn/start"] = [
+            self._turn_ack(6, fixed, turn_id)]
+        worker, done = self._drive(handle, frames)
+        with mock.patch.object(
+                muse_mod, "_msp_new_command_id",
+                return_value=fixed):
+            out = muse_mod.msp_worker_canary_turn(
+                handle, timeout=timeout)
+        self.assertTrue(done.wait(30))
+        worker.join(30)
+        return out
+
+    def test_observed_kinds_constant(self):
+        self.assertEqual(
+            muse_mod._MSP_CANARY_OBSERVED_KINDS,
+            frozenset(["reminderChild"]))
+        self.assertEqual(
+            muse_mod._MSP_CANARY_MESSAGE_KINDS,
+            frozenset(["userMessage", "agentMessage",
+                       "reasoning"]))
+
+    def test_reminder_child_passes_and_folds_metadata(self):
+        handle, child, sid = self._admitted_canary()
+        try:
+            turn_id = ("0193e0f0-7a2b-7c3d-9e4f-"
+                       "5a6b7c8d9e41")
+            started = _reminder_item(
+                status="inProgress",
+                text="sekrit-reminder-text",
+                modelVisibleContent="sekrit-visible",
+                result={"sekrit": "sekrit-result"},
+                childSessionLogPath="sekrit/path.log")
+            finished = _reminder_item(
+                status="completed", revision=2)
+            out = self._run_turn(handle, child, [
+                _item_frame(sid, self._user_item()),
+                _item_frame(sid, started),
+                _item_frame(sid, finished,
+                            completed=True),
+                _item_frame(sid, self._agent_item(),
+                            completed=True),
+                _completed_frame(sid, turn_id),
+            ], turn_id)
+            self.assertEqual(out["stop"], "completed")
+            self.assertIsNone(out["tool_hit"])
+            self.assertEqual(
+                out["item_kinds"],
+                ["userMessage", "reminderChild",
+                 "reminderChild", "agentMessage"])
+            reminders = out["reminders"]
+            self.assertEqual(len(reminders), 2)
+            self.assertEqual(
+                reminders[0]["reminder_agent_id"],
+                "agent-7")
+            self.assertEqual(
+                reminders[0]["generation_id"], 3)
+            self.assertEqual(
+                reminders[0]["task_id"], "task-9")
+            self.assertEqual(
+                reminders[0]["child_session_id"],
+                "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e77")
+            self.assertIs(reminders[0]["blocking"], True)
+            self.assertEqual(reminders[0]["status"],
+                             "inProgress")
+            self.assertEqual(reminders[0]["method"],
+                             "item/started")
+            self.assertEqual(reminders[1]["method"],
+                             "item/completed")
+            for entry in reminders:
+                self.assertLessEqual(set(entry),
+                                     self.REMINDER_KEYS)
+            blob = json.dumps(out)
+            for secret in ("sekrit-reminder-text",
+                           "sekrit-visible",
+                           "sekrit-result",
+                           "sekrit/path.log"):
+                self.assertNotIn(secret, blob)
+            self.assertIn(handle, muse_mod._MSP_WORKERS)
+        finally:
+            self._close_quiet(handle)
+
+    def test_reminder_wrong_types_dropped(self):
+        _handle, rec, sid = self._armed()
+        item = _reminder_item(reminderAgentId=7,
+                              generationId=True,
+                              taskId=None,
+                              childSessionId=["x"],
+                              blocking=False, status=5)
+        method, params = _item_frame(sid, item)
+        self._send(rec, method, params)
+        snap = muse_mod._canary_watch_snapshot(
+            rec.get("canary_watch"))
+        self.assertEqual(snap["item_kinds"],
+                         ["reminderChild"])
+        self.assertIsNone(snap["tool_hit"])
+        self.assertEqual(len(snap["reminders"]), 1)
+        self.assertEqual(snap["reminders"][0],
+                         {"method": "item/started"})
+
+    def test_unhashable_kind_does_not_raise_and_flags(self):
+        _handle, rec, sid = self._armed()
+        for bad_kind in ([], {}):
+            item = {"itemId": "b", "kind": bad_kind,
+                    "revision": 1, "status": "open"}
+            method, params = _item_frame(sid, item)
+            self._send(rec, method, params)
+        snap = muse_mod._canary_watch_snapshot(
+            rec.get("canary_watch"))
+        self.assertEqual(snap["item_kinds"],
+                         ["non-string-kind",
+                          "non-string-kind"])
+        self.assertEqual(snap["tool_hit"]["kind"],
+                         "non-string-kind")
+        self.assertEqual(snap["reminders"], [])
+
+    def test_reminder_generation_id_string_capped(self):
+        _handle, rec, sid = self._armed()
+        item = _reminder_item(generationId="g" * 100)
+        method, params = _item_frame(sid, item)
+        self._send(rec, method, params)
+        snap = muse_mod._canary_watch_snapshot(
+            rec.get("canary_watch"))
+        self.assertEqual(
+            snap["reminders"][0]["generation_id"],
+            "g" * 80)
+
+    def test_reminder_caps_enforced(self):
+        _handle, rec, sid = self._armed()
+        long_id = "a" * 100
+        item = _reminder_item(
+            reminderAgentId=long_id, taskId=long_id,
+            childSessionId=long_id,
+            status="s" * 100)
+        method, params = _item_frame(sid, item)
+        for _ in range(65):
+            self._send(rec, method, params)
+        snap = muse_mod._canary_watch_snapshot(
+            rec.get("canary_watch"))
+        self.assertEqual(len(snap["reminders"]), 64)
+        self.assertTrue(snap["reminders_capped"])
+        first = snap["reminders"][0]
+        self.assertEqual(first["reminder_agent_id"],
+                         "a" * 80)
+        self.assertEqual(first["task_id"], "a" * 80)
+        self.assertEqual(first["child_session_id"],
+                         "a" * 80)
+        self.assertEqual(first["status"], "s" * 40)
+
+    def test_bad_item_after_reminder_still_stops(self):
+        bad_items = [
+            ({"kind": "toolCall", "tool": "read"},
+             "toolCall", "read"),
+            ({"kind": "webSearch", "query": "q"},
+             "webSearch", "q"),
+            ({"kind": "subagent",
+              "agentPath": "sekrit-path"}, "subagent",
+             None),
+            ({"kind": "SomethingNew"}, "SomethingNew",
+             None),
+            (["not", "a", "dict"], "non-dict-item",
+             None),
+        ]
+        for item, want_kind, want_name in bad_items:
+            handle, child, sid = self._admitted_canary()
+            try:
+                with self.subTest(item=item):
+                    turn_id = ("0193e0f0-7a2b-7c3d-9e4f-"
+                               "5a6b7c8d9e42")
+                    if isinstance(item, dict):
+                        bad = dict(item)
+                        bad.setdefault("itemId", "b")
+                        bad.setdefault("revision", 1)
+                        bad.setdefault("status", "open")
+                        frame = _item_frame(sid, bad)
+                    else:
+                        frame = ("item/started",
+                                 {"item": item,
+                                  "sessionId": sid,
+                                  "viewCursor": "v1"})
+                    out = self._run_turn(handle, child, [
+                        _item_frame(sid, self._user_item()),
+                        _item_frame(sid, _reminder_item()),
+                        frame,
+                    ], turn_id)
+                    self.assertEqual(out["stop"],
+                                     "tool-attempted")
+                    self.assertEqual(
+                        out["tool_hit"]["kind"], want_kind)
+                    self.assertEqual(
+                        out["tool_hit"]["name"], want_name)
+                    self.assertEqual(
+                        out["tool_hit"]["index"], 2)
+                    self.assertNotIn(
+                        handle, muse_mod._MSP_WORKERS)
+            finally:
+                self._close_quiet(handle)
+
+    def test_reminder_alone_completed_is_no_message(self):
+        handle, child, sid = self._admitted_canary()
+        try:
+            turn_id = ("0193e0f0-7a2b-7c3d-9e4f-"
+                       "5a6b7c8d9e43")
+            out = self._run_turn(handle, child, [
+                _item_frame(sid, _reminder_item()),
+                _item_frame(sid, _reminder_item(
+                    revision=2, status="completed"),
+                    completed=True),
+                _completed_frame(sid, turn_id),
+            ], turn_id)
+            self.assertEqual(out["stop"],
+                             "completed-no-message")
+            self.assertEqual(len(out["reminders"]), 2)
+            self.assertIn(handle, muse_mod._MSP_WORKERS)
+        finally:
+            self._close_quiet(handle)
+
+    def test_foreground_folds_and_does_not_end_wait(
+            self):
+        handle, child, sid = self._admitted_canary()
+        try:
+            turn_id = ("0193e0f0-7a2b-7c3d-9e4f-"
+                       "5a6b7c8d9e44")
+            agents = ["agent-7", "agent-9"]
+            out = self._run_turn(handle, child, [
+                _item_frame(sid, self._user_item()),
+                _foreground_frame(sid, turn_id, agents),
+                _item_frame(sid, self._agent_item(),
+                            completed=True),
+                _completed_frame(sid, turn_id),
+            ], turn_id)
+            self.assertEqual(out["stop"], "completed")
+            self.assertTrue(out["completion_seen"])
+            self.assertTrue(out["foreground_seen"])
+            self.assertEqual(out["foreground_completed"],
+                             agents)
+            # The foreground method ledgers through the
+            # normal lifecycle path (never the per-method
+            # turn counts, like turn/completed).
+            rec = muse_mod._MSP_WORKERS[handle]
+            methods = [entry.get("method")
+                       for entry in rec.get("lifecycle")
+                       or []]
+            self.assertIn("turn/foregroundCompleted",
+                          methods)
+        finally:
+            self._close_quiet(handle)
+
+    def test_foreground_foreign_sid_breaks(self):
+        _handle, rec, sid = self._armed()
+        _bound = sid
+        foreign = "0193e0f0-7a2b-7c3d-9e4f-5a6b7c8d9e99"
+        turn_id = ("0193e0f0-7a2b-7c3d-9e4f-"
+                   "5a6b7c8d9e45")
+        method, params = _foreground_frame(
+            foreign, turn_id, ["agent-7"])
+        self._send(rec, method, params)
+        self.assertEqual(rec.get("broken"),
+                         "session-mismatch")
+        self.assertEqual(rec.get("broken_method"),
+                         "turn/foregroundCompleted")
+
+    def test_non_canary_keeps_no_reminder_or_foreground(
+            self):
+        handle, child = self._bootstrap("accountLogin")
+        try:
+            self._start_session(handle, child, 3)
+            rec = muse_mod._MSP_WORKERS[handle]
+            sid = rec["worker_session"]["id"]
+            turn_id = ("0193e0f0-7a2b-7c3d-9e4f-"
+                       "5a6b7c8d9e46")
+            item = _reminder_item(
+                reminderAgentId="sekrit-agent-294",
+                taskId="sekrit-task-294")
+            method, params = _item_frame(sid, item)
+            method2, params2 = _foreground_frame(
+                sid, turn_id, ["sekrit-fg-294"])
+            for meth, par in ((method, params),
+                              (method2, params2)):
+                raw = json.dumps(
+                    {"jsonrpc": "2.0", "method": meth,
+                     "params": par}).encode()
+                muse_mod._dispatch_worker_inbox(rec, raw)
+            self.assertNotIn("canary_watch", rec)
+            blob = json.dumps(rec.get("lifecycle"))
+            for secret in ("sekrit-agent-294",
+                           "sekrit-task-294",
+                           "sekrit-fg-294"):
+                self.assertNotIn(secret, blob)
+        finally:
+            self._close(handle)
+
+    def test_turn_started_child_sid_breaks_named(self):
+        _handle, rec, _sid = self._armed()
+        child_sid = ("0193e0f0-7a2b-7c3d-9e4f-"
+                     "5a6b7c8d9e78")
+        self._send(rec, "turn/started",
+                   {"sessionId": child_sid,
+                    "sourceRange": {"start": 0, "end": 1},
+                    "turnId": "0193e0f0-7a2b-7c3d-9e4f-"
+                              "5a6b7c8d9e79",
+                    "viewCursor": "v12"})
+        self.assertEqual(rec.get("broken"),
+                         "session-mismatch")
+        self.assertEqual(rec.get("broken_method"),
+                         "turn/started")
+
+    def test_session_started_child_sid_breaks_named(self):
+        _handle, rec, _sid = self._armed()
+        child_sid = ("0193e0f0-7a2b-7c3d-9e4f-"
+                     "5a6b7c8d9e78")
+        self._send(rec, "session/started",
+                   {"session": {"sessionId": child_sid},
+                    "viewCursor": "v12"})
+        self.assertEqual(rec.get("broken"),
+                         "session-mismatch")
+        self.assertEqual(rec.get("broken_method"),
+                         "session/started")
+
+    def test_timeout_carries_reminders_and_foreground(
+            self):
+        handle, child, sid = self._admitted_canary()
+        try:
+            turn_id = ("0193e0f0-7a2b-7c3d-9e4f-"
+                       "5a6b7c8d9e47")
+            out = self._run_turn(handle, child, [
+                _item_frame(sid, _reminder_item()),
+                _foreground_frame(sid, turn_id,
+                                  ["agent-7"]),
+            ], turn_id, timeout=1.5)
+            self.assertEqual(out["stop"], "timeout")
+            self.assertEqual(len(out["reminders"]), 1)
+            self.assertTrue(out["foreground_seen"])
+            self.assertEqual(out["foreground_completed"],
+                             ["agent-7"])
+            self.assertNotIn(handle,
+                             muse_mod._MSP_WORKERS)
+        finally:
+            self._close_quiet(handle)

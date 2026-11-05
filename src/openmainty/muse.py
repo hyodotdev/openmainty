@@ -3489,6 +3489,8 @@ def _ledger_host_notification(rec: dict, method: str) -> None:
 
 _MSP_CANARY_WATCH_MAX_ITEMS = 4096
 _MSP_CANARY_WATCH_MAX_RETRIES = 64
+_MSP_CANARY_WATCH_MAX_REMINDERS = 64
+_MSP_CANARY_WATCH_MAX_FOREGROUND = 16
 _MSP_CANARY_WATCH_SLEEP_S = 0.2
 
 
@@ -3504,7 +3506,10 @@ def _canary_watch_new() -> dict:
             "text_truncated": False, "token_counts": {},
             "model_id": None, "finish_reason": None,
             "retries": [], "retries_capped": False,
-            "completion": None}
+            "completion": None, "reminders": [],
+            "reminders_capped": False,
+            "foreground_seen": False,
+            "foreground_completed": []}
 
 
 def _canary_watch_snapshot(watch: dict) -> dict:
@@ -3545,6 +3550,15 @@ def _canary_watch_snapshot(watch: dict) -> dict:
                     for entry in watch.get("retries") or []],
         "retries_capped": watch.get("retries_capped") is True,
         "completion": completion_out,
+        "reminders": [dict(entry)
+                      for entry in watch.get("reminders")
+                      or []],
+        "reminders_capped": watch.get("reminders_capped")
+        is True,
+        "foreground_seen": watch.get("foreground_seen")
+        is True,
+        "foreground_completed": list(
+            watch.get("foreground_completed") or []),
     }
 
 
@@ -3703,6 +3717,68 @@ def _canary_watch_completion(watch: dict, params: dict) -> None:
     watch["completion"] = folded
 
 
+def _canary_watch_reminder(watch: dict, method: str,
+                             item: dict) -> None:
+    """Fold one observed reminderChild item's ids (E33 kind).
+
+    Schema $defs/Item reminderChild members: only the
+    agent, generation, task and child-session ids plus
+    blocking and status are kept. Text,
+    modelVisibleContent, result and the child log path are
+    NEVER retained. blocking is written only when exactly
+    True (the schema never sends False); generationId is
+    an integer per the schema, with a capped string
+    tolerated.
+    """
+    if len(watch["reminders"]) >= _MSP_CANARY_WATCH_MAX_REMINDERS:
+        watch["reminders_capped"] = True
+        return
+    entry = {"method": method}
+    agent = item.get("reminderAgentId")
+    if isinstance(agent, str) and agent:
+        entry["reminder_agent_id"] = agent[:80]
+    gen = item.get("generationId")
+    if isinstance(gen, int) and not isinstance(gen, bool):
+        entry["generation_id"] = gen
+    elif isinstance(gen, str) and gen:
+        entry["generation_id"] = gen[:80]
+    task = item.get("taskId")
+    if isinstance(task, str) and task:
+        entry["task_id"] = task[:80]
+    child = item.get("childSessionId")
+    if isinstance(child, str) and child:
+        entry["child_session_id"] = child[:80]
+    if item.get("blocking") is True:
+        entry["blocking"] = True
+    status = item.get("status")
+    if isinstance(status, str) and status:
+        entry["status"] = status[:40]
+    watch["reminders"].append(entry)
+
+
+def _canary_watch_foreground(watch: dict,
+                             params: dict) -> None:
+    """Fold turn/foregroundCompleted: explicitly non-terminal.
+
+    Schema TurnForegroundCompletedParams: foreground work
+    is done and named background reminder checks hold the
+    turn open; the turn ends only at turn/completed or
+    turn/unqueued. Only agent ids are kept (max 16,
+    capped); the wait in msp_worker_canary_turn never
+    ends on this method.
+    """
+    agents = params.get("blockingAgents")
+    kept = []
+    if isinstance(agents, list):
+        for agent in agents:
+            if len(kept) >= _MSP_CANARY_WATCH_MAX_FOREGROUND:
+                break
+            if isinstance(agent, str) and agent:
+                kept.append(agent[:80])
+    watch["foreground_seen"] = True
+    watch["foreground_completed"] = kept
+
+
 def _canary_watch_update_locked(rec: dict, method: str,
                                 params) -> None:
     """Fold one validated notification into rec["canary_watch"].
@@ -3734,6 +3810,11 @@ def _canary_watch_update_locked(rec: dict, method: str,
         if flagged and watch["tool_hit"] is None:
             watch["tool_hit"] = {"index": len(kinds) - 1,
                                  "kind": shown, "name": name}
+        kind = (item.get("kind")
+                if isinstance(item, dict) else None)
+        if isinstance(kind, str) \
+                and kind in _MSP_CANARY_OBSERVED_KINDS:
+            _canary_watch_reminder(watch, method, item)
         if method == "item/completed" \
                 and isinstance(item, dict) \
                 and item.get("kind") == "agentMessage":
@@ -3754,6 +3835,13 @@ def _canary_watch_update_locked(rec: dict, method: str,
         if not isinstance(watch, dict):
             watch = rec["canary_watch"] = _canary_watch_new()
         _canary_watch_completion(watch, params)
+    elif method == "turn/foregroundCompleted":
+        # Ledgered through the normal lifecycle path (the
+        # method is listed); folded here, never terminal.
+        watch = rec.get("canary_watch")
+        if not isinstance(watch, dict):
+            watch = rec["canary_watch"] = _canary_watch_new()
+        _canary_watch_foreground(watch, params)
 
 
 def _dispatch_worker_inbox(rec: dict, raw: bytes) -> None:
@@ -3879,6 +3967,11 @@ def _dispatch_worker_inbox(rec: dict, raw: bytes) -> None:
             del ledger[:-_MSP_WORKER_LIFECYCLE_MAX]
             _canary_watch_update_locked(rec, method, params)
     if action is not None:
+        if action == "session-mismatch":
+            # A foreign or child session id stays
+            # fail-closed, and names its method so the next
+            # failure (E34) is diagnosable.
+            rec["broken_method"] = method
         _msp_break(rec, action)
 
 
@@ -4563,22 +4656,36 @@ _MSP_CANARY_PROMPT = (
 _MSP_CANARY_MESSAGE_KINDS = frozenset(
     ["userMessage", "agentMessage", "reasoning"])
 
+# Observed-but-not-message kinds: E33 stopped at item index
+# 1 on reminderChild, a child record for a reminder agent
+# (schema $defs/Item: reminderAgentId, generationId,
+# taskId, childSessionId, blocking holds the turn open).
+# Observed kinds append to item_kinds and fold bounded id
+# metadata without setting tool_hit and without stopping
+# the canary. An observed kind NEVER counts as an agent
+# answer: only agentMessage completes the turn.
+_MSP_CANARY_OBSERVED_KINDS = frozenset(["reminderChild"])
+
 _MSP_CANARY_TEXT_MAX = 4096
 
 
 def _canary_flag_item(item):
     """(flagged, kind, name) for one raw history item.
 
-    Allowlist: only _MSP_CANARY_MESSAGE_KINDS pass. Reads
-    ONLY the "kind" field; the name lookup is metadata for
-    the record, from the schema's per-kind members (tool,
-    commandText, query, url, label, callId). Truncated
-    strings only, never payloads.
+    Allowlist: only _MSP_CANARY_MESSAGE_KINDS pass, plus
+    _MSP_CANARY_OBSERVED_KINDS (observed: folded, never
+    flagged). Reads ONLY the "kind" field; the name lookup
+    is metadata for the record, from the schema's per-kind
+    members (tool, commandText, query, url, label, callId).
+    Truncated strings only, never payloads.
     """
     if not isinstance(item, dict):
         return True, "non-dict-item", None
     kind = item.get("kind")
     if isinstance(kind, str) and kind in _MSP_CANARY_MESSAGE_KINDS:
+        return False, None, None
+    if isinstance(kind, str) \
+            and kind in _MSP_CANARY_OBSERVED_KINDS:
         return False, None, None
     name = None
     for key in ("tool", "commandText", "query", "url",
@@ -4618,10 +4725,14 @@ def msp_worker_canary_turn(handle: str, *,
     the dispatcher folds watched notification members while
     the handle is armed. The completion must match the
     ack's turn id. Every watched item passes the ALLOWLIST
-    control: only userMessage/agentMessage/reasoning; the
-    first other item records kind + name only, closes the
-    handle, and returns stop "tool-attempted" without any
-    usage call.
+    control: only userMessage/agentMessage/reasoning, plus
+    the OBSERVED kinds (reminderChild: folded id metadata,
+    never an agent answer); the first other item records
+    kind + name only, closes the handle, and returns stop
+    "tool-attempted" without any usage call.
+    turn/foregroundCompleted is explicitly non-terminal per
+    the schema: it folds its blocking agent ids and never
+    ends the wait.
 
     Stops, no retry anywhere: "tool-attempted" (closes);
     "completed" (terminal completed + agentMessage seen;
@@ -4637,7 +4748,9 @@ def msp_worker_canary_turn(handle: str, *,
     plus the watch fields {"item_kinds", "items_capped",
     "text", "text_bytes", "text_truncated", "token_counts",
     "model_id", "finish_reason", "retries", "retries_capped",
-    "completion", "tool_hit"} and {"ledger_counts", "error"}.
+    "completion", "tool_hit", "reminders",
+    "reminders_capped", "foreground_seen",
+    "foreground_completed"} and {"ledger_counts", "error"}.
     Retry entries carry error_kind/http_status/system;
     completion carries request_denied/quota/duration_ms/
     ttft_ms/usage_input/usage_output when served.
