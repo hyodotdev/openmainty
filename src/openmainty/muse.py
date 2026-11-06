@@ -59,26 +59,27 @@ _DEDICATED_STREAM_MAX_BYTES = 4 * 1024 * 1024
 
 # The ONE command contract for this profile: explicit
 # meta/muse-spark-1.3/contributor-ON, exactly one network mode
-# (`restricted`), approval never with the judge off, no interactive
-# input, and the CONFIRMED CLI step/output bounds below (help
-# surface: --max-model-steps "Cap the number of steps",
-# --max-tool-output-bytes "Cap tool output bytes fed back to the
-# model", 0 or >=9). No other bounding flags are invented; app
-# timeout + stream caps + owned process-group reaping add the
-# runtime side. Raw flags below are REQUESTED state, not observed
-# enforcement; effective file-only/MCP/hooks/delegation proof is a
-# separate blocking gate (preflight channels stay UNKNOWN until
-# genuinely observed).
+# (`brokered`: observed against the broker log per attempt, never
+# a requested label), approval never with the judge off, no
+# interactive input, and the CONFIRMED CLI step/output bounds
+# below (help surface: --max-model-steps "Cap the number of
+# steps", --max-tool-output-bytes "Cap tool output bytes fed
+# back to the model", 0 or >=9). No other bounding flags are
+# invented; app timeout + stream caps + owned process-group
+# reaping add the runtime side. Raw flags below are REQUESTED
+# state, not observed enforcement; effective file-only/MCP/
+# hooks/delegation proof is a separate blocking gate
+# (preflight channels stay UNKNOWN until genuinely observed).
 SOURCE_REPAIR_PROFILE = {
-    "profile": "source-repair",
+    "profile": "repair-broker",
     "provider": "meta",
     "model": "muse-spark-1.3",
     "contributor_mode": True,
     "approval_mode": "never",
     "approval_judge": "off",
-    "network_mode": "restricted",
+    "network_mode": "brokered",
     "disable_request_user_input": True,
-    "trust_workspace": True,
+    "trust_workspace": False,
     "max_model_steps": 25,
     "max_tool_output_bytes": 200000,
 }
@@ -476,7 +477,7 @@ def agent_info(model=None) -> dict:
 
 
 def build_source_repair_cmd(prompt: str, workdir, output_schema=None) -> list:
-    """Argv for the DEDICATED source-repair profile (restricted network).
+    """Argv for the DEDICATED source-repair profile (brokered network).
 
     `workdir` (the isolated fixture/preview workspace) is REQUIRED:
     this profile never runs without an explicit workspace. The ONLY
@@ -531,16 +532,18 @@ def build_source_repair_cmd(prompt: str, workdir, output_schema=None) -> list:
         "--disable-request-user-input",
         "--approval-mode", SOURCE_REPAIR_PROFILE["approval_mode"],
         "--approval-judge", SOURCE_REPAIR_PROFILE["approval_judge"],
-        "--trust-workspace",
-        # Exactly ONE network mode for this profile: restricted. The
-        # older dependency-worker default (`enabled`) is NOT reused
-        # here; appending it would be a duplicate the parser rejects.
-        "--sandbox-network", SOURCE_REPAIR_PROFILE["network_mode"],
+        # No --trust-workspace: a target repo's own skills and rules
+        # must not steer the worker (E41 ran without it). No
+        # --sandbox-network: the kernel policy governs egress and
+        # the only observed transport is the broker ("brokered" is
+        # checked against the broker log per attempt, never passed
+        # as a mode the binary was never seen to accept).
         "--max-model-steps",
         str(SOURCE_REPAIR_PROFILE["max_model_steps"]),
         "--max-tool-output-bytes",
         str(SOURCE_REPAIR_PROFILE["max_tool_output_bytes"]),
         "--json",
+        "--no-session-log",
     ]
     cmd += ["--workspace", str(workdir)]
     if output_schema is not None:

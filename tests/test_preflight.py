@@ -1124,14 +1124,15 @@ class MuseDedicatedCase(PreflightCase):
     def test_build_argv_exact(self):
         argv = muse.build_source_repair_cmd("do repair", "/w")
         self.assertEqual(argv[0:2], ["muse", "exec"])
-        self.assertEqual(argv.count("--sandbox-network"), 1)
-        self.assertIn("restricted",
-                      argv[argv.index("--sandbox-network") + 1])
+        for flag in ("--trust-workspace", "--sandbox-network",
+                     "--disable-write"):
+            self.assertNotIn(flag, argv)
         for flag in ("--disable-shell", "--disable-web-tools",
                      "--disable-reminders",
                      "--no-foreign-personal-context",
                      "--disable-request-user-input",
                      "--approval-mode", "--approval-judge",
+                     "--no-session-log",
                      "--max-model-steps", "--max-tool-output-bytes"):
             self.assertIn(flag, argv)
         self.assertEqual(

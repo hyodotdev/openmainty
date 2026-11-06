@@ -25,16 +25,24 @@ except ImportError:  # discover top-level mode: tests/ is on sys.path
 HAVE_GIT = shutil.which("git") is not None
 
 
+# dir= values the guard trusts as home-relative (non-tmp)
+# targets. A plain name outside this tuple still counts as
+# the system tmp: the guard cannot prove where it points.
+_NON_TMP_DIR_NAMES = ("roots_parent",)
+
+
 def _system_tmp_prefixes(source, path="<src>"):
     """prefix="..." constants from calls that create on system tmp.
 
     Parses the source with ast and walks Call nodes named
-    mkdtemp or TemporaryDirectory. A call with a dir keyword
-    creates wherever dir points, not on the system tmp, so
-    its prefix is skipped — except dir=None, which is the
-    default temp dir and still counts. A prefix that is not
-    a string constant fails the guard instead of being
-    skipped. Unparseable source raises, never an empty set.
+    mkdtemp or TemporaryDirectory. Positional arguments fail
+    the guard: a positional prefix or dir is invisible to the
+    scan. A call with a dir keyword counts as the system tmp
+    unless the value is a plain name in _NON_TMP_DIR_NAMES;
+    anything else (a call, an attribute, a constant such as
+    None) still counts. A prefix that is not a string
+    constant fails the guard instead of being skipped.
+    Unparseable source raises, never an empty set.
     """
     found = set()
     tree = ast.parse(source, filename=str(path))
@@ -50,16 +58,21 @@ def _system_tmp_prefixes(source, path="<src>"):
             continue
         if name not in ("mkdtemp", "TemporaryDirectory"):
             continue
+        if node.args:
+            raise AssertionError(
+                "%s:%s: %s takes no positional arguments"
+                % (path, node.lineno, name))
         keywords = {}
         for keyword in node.keywords:
             if keyword.arg is not None:
                 keywords[keyword.arg] = keyword.value
         if "prefix" not in keywords:
             continue
-        if "dir" in keywords and not (
-                isinstance(keywords["dir"], ast.Constant)
-                and keywords["dir"].value is None):
-            continue
+        if "dir" in keywords:
+            dvalue = keywords["dir"]
+            if isinstance(dvalue, ast.Name) \
+                    and dvalue.id in _NON_TMP_DIR_NAMES:
+                continue
         value = keywords["prefix"]
         if not isinstance(value, ast.Constant) \
                 or not isinstance(value.value, str):
@@ -498,10 +511,11 @@ class ApplyTests(GcFixture):
         # creates on the system tmp — and every such prefix is
         # listed. A bare "openmainty-" would match the supervision
         # record; "om66-" is Root's scratch. A prefix whose
-        # mkdtemp call passes an explicit non-tmp dir= (today
-        # msp-repair-, under <home>/repair-roots) is not a temp
-        # prefix and must stay unlisted; the scanner states that
-        # by construction instead of dodging it.
+        # mkdtemp call passes dir= with a trusted home-relative
+        # name (today msp-repair- with roots_parent, under
+        # <home>/repair-roots) is not a temp prefix and must
+        # stay unlisted; the scanner states that by
+        # construction instead of dodging it.
         srcd = (Path(__file__).resolve().parent.parent / "src" /
                 "openmainty")
         created = set()
@@ -512,7 +526,6 @@ class ApplyTests(GcFixture):
         self.assertNotIn("openmainty-", gc.OWNED_TMP_PREFIXES)
         self.assertNotIn("om66-", gc.OWNED_TMP_PREFIXES)
         self.assertNotIn("msp-repair-", gc.OWNED_TMP_PREFIXES)
-
 
     def test_supervision_and_foreign_names_never_listed(self):
         for name in ("openmainty-supervision-x", "om66-x",
@@ -658,10 +671,22 @@ class TmpPrefixScanTest(unittest.TestCase):
                 'tempfile.mkdtemp(prefix="x-", dir=None)\n'),
             {"x-"})
 
+    def test_system_tmp_dir_call_collected(self):
+        self.assertEqual(
+            _system_tmp_prefixes(
+                'tempfile.mkdtemp(prefix="m-", '
+                'dir=tempfile.gettempdir())\n'),
+            {"m-"})
+
     def test_non_constant_prefix_fails(self):
         with self.assertRaises(AssertionError):
             _system_tmp_prefixes(
                 'tempfile.mkdtemp(prefix=PREFIX)\n')
+
+    def test_positional_args_fail(self):
+        with self.assertRaises(AssertionError):
+            _system_tmp_prefixes(
+                'tempfile.mkdtemp("x-")\n')
 
 
 if __name__ == "__main__":

@@ -78,15 +78,15 @@ _MANAGED_SOURCE_MAX_BYTES = 4 * 1024 * 1024
 # output bytes fed back to the model"); step/output safety never
 # relies on app timeout text alone.
 REQUIRED_POLICY = {
-    "profile": "source-repair",
+    "profile": "repair-broker",
     "provider": "meta",
     "model": "muse-spark-1.3",
     "contributor_mode": True,
     "approval_mode": "never",
     "approval_judge": "off",
-    "network_mode": "restricted",
+    "network_mode": "brokered",
     "disable_request_user_input": True,
-    "trust_workspace": True,
+    "trust_workspace": False,
     "max_model_steps": 25,
     "max_tool_output_bytes": 200000,
 }
@@ -3468,8 +3468,10 @@ def describe_preflight(home=None):
         "inputs_sha256": outcome.get("inputs_sha256"),
         "binary": {"path": binary.get("path"),
                    "sha256": binary.get("sha256")},
-        "policy": {"profile": "source-repair", "model": "muse-spark-1.3",
-                   "network_mode": "restricted"},
+        "policy": {"profile": REQUIRED_POLICY["profile"],
+                   "model": "muse-spark-1.3",
+                   "network_mode": REQUIRED_POLICY[
+                       "network_mode"]},
         "config_status": (inputs.get("config") or {}).get("status"),
         "auth": {"meta_api_key_present": bool(
             (outcome.get("auth") or {}).get("meta_api_key_present")),
