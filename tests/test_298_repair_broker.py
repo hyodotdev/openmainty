@@ -122,8 +122,10 @@ class RepairBrokerPolicyCase(unittest.TestCase):
                           % other)
             read_line = ('(allow file-read* (subpath "%s"))'
                          % other)
+            deny_line = ncontain._repair_git_deny_line(other)
             self.assertEqual(got, sub + write_line + "\n"
-                             + read_line + "\n")
+                             + read_line + "\n"
+                             + deny_line + "\n")
             self.assertIn("(deny network*)", got)
             self.assertNotIn("*:443", got)
         finally:
@@ -142,7 +144,9 @@ class RepairBrokerPolicyCase(unittest.TestCase):
                 work)
             write_line = ('(allow file-write* (subpath "%s"))'
                           % work)
-            self.assertEqual(got, sub + write_line + "\n")
+            deny_line = ncontain._repair_git_deny_line(work)
+            self.assertEqual(got, sub + write_line + "\n"
+                             + deny_line + "\n")
         finally:
             _keep.cleanup()
 
@@ -226,7 +230,7 @@ class RepairBrokerPolicyCase(unittest.TestCase):
             good = ncontain.build_repair_broker_policy_text(
                 root, "/usr/bin/false", FAKE_HOME, FAKE_PORT,
                 other)
-            extra = good.splitlines()[-2:]
+            extra = good.splitlines()[-3:]
             ncontain._prove_repair_plus(good, sub, extra)
             dropped = "\n".join(
                 good.splitlines()[:-1]) + "\n"

@@ -318,11 +318,11 @@ class ChainFixture(unittest.TestCase):
         try:
             real_snap = runner.source_snapshot
 
-            def fail_leaf(work):
+            def fail_leaf(work, git_bound=None):
                 if str(work) == str(self.cands["leaf"]):
                     raise runner.SourceUnreadable("read poisoned-rel",
                                                   rc=5)
-                return real_snap(work)
+                return real_snap(work, git_bound=git_bound)
 
             with mock.patch.object(runner, "source_snapshot",
                                    side_effect=fail_leaf):

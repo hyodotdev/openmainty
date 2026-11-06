@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import os
 import pwd
+import re
 import stat as _stat
 import sys
 
@@ -825,10 +826,13 @@ def _prove_repair_plus(text: str, sub: str,
     must be absent; everything else must be identical.
     """
     extra_lines = list(extra_lines)
-    if not extra_lines or len(extra_lines) > 2:
+    if len(extra_lines) not in (2, 3):
         raise ContainmentError(
-            "repair proof: one or two lines, got %d"
+            "repair proof: two or three lines, got %d"
             % len(extra_lines))
+    if not extra_lines[-1].startswith("(deny file-write*"):
+        raise ContainmentError(
+            "repair proof: .git deny must be last")
     for line in extra_lines:
         if line in sub:
             raise ContainmentError(
@@ -849,6 +853,51 @@ def _prove_repair_plus(text: str, sub: str,
             "repair proof: 443 line forbidden")
 
 
+def _repair_git_deny_line(work: str) -> str:
+    """Deny writes to any .git path under the workdir (299b).
+
+    One regex rule, built RAW: the #"..." literal is read
+    raw by the kernel, so _sb_literal doubling would ask
+    for a literal backslash and deny nothing. Covers the
+    top pointer/dir itself, anything under it, and nested
+    sub/.git paths, in any case ([gG][iI][tT]: on
+    case-insensitive volumes .GIT aliases .git). Plain
+    names like .gitignore or sub.git never match. The
+    worker has no reason to write any .git path; the
+    kernel test and the E45 controls prove the deny wins.
+    """
+    for char in work:
+        if char == '"' or char == "\\" or ord(char) < 0x20 \
+                or char == "\x7f":
+            raise ContainmentError(
+                "repair workdir not safe for a raw regex "
+                "literal")
+    pattern = "^%s/(.*/)?\\.[gG][iI][tT](/.*)?$" % re.escape(
+        work)
+    return '(deny file-write* (regex #"%s"))' % pattern
+
+
+def _repair_extra_lines(work: str, root: str) -> list:
+    """The exact lines the repair builder appends (order fixed).
+
+    Write rule, read rule when the workdir sits outside the
+    owned root, then the .git write deny LAST so it wins over
+    the workdir allow.
+    """
+    write_line = ('(allow file-write* (subpath %s))'
+                  % _sb_literal(work))
+    real_root = os.path.realpath(root)
+    if work == real_root or work.startswith(
+            real_root + os.sep):
+        extra = [write_line]
+    else:
+        extra = [write_line,
+                 '(allow file-read* (subpath %s))'
+                 % _sb_literal(work)]
+    extra.append(_repair_git_deny_line(work))
+    return extra
+
+
 def build_repair_broker_policy_text(root: str,
                                     exe_path: str,
                                     home,
@@ -861,11 +910,11 @@ def build_repair_broker_policy_text(root: str,
     the base text does not already allow the workdir (i.e.
     it sits outside the owned root). Both are appended at
     the END (SBPL last-match-wins) with (deny network*)
-    kept. No other path becomes writable. Proven by
-    removal; anything else raises ContainmentError. The
-    "subscription", "subscription-canary" and
-    "subscription-broker" texts are untouched by this
-    builder.
+    kept, followed by the .git write deny (299b), which wins
+    over the workdir allow. No other path becomes writable.
+    Proven by removal; anything else raises ContainmentError.
+    The "subscription", "subscription-canary" and
+    "subscription-broker" texts are untouched by this builder.
     """
     sub = build_subscription_broker_policy_text(
         root, exe_path, home, port)
@@ -875,16 +924,7 @@ def build_repair_broker_policy_text(root: str,
     if not sub.endswith("\n"):
         raise ContainmentError(
             "repair proof: base text shape")
-    write_line = ('(allow file-write* (subpath %s))'
-                  % _sb_literal(work))
-    real_root = os.path.realpath(root)
-    if work == real_root or work.startswith(
-            real_root + os.sep):
-        extra = [write_line]
-    else:
-        extra = [write_line,
-                 '(allow file-read* (subpath %s))'
-                 % _sb_literal(work)]
+    extra = _repair_extra_lines(work, root)
     text = sub + "".join(
         ln + "\n" for ln in extra)
     _prove_repair_plus(text, sub, extra)
