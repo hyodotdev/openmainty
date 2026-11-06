@@ -992,7 +992,7 @@ def _git_head(cwd: str, rev: str) -> str | None:
     return head
 
 
-def _snapshot_status(worktree: str) -> tuple:
+def _snapshot_status(worktree: str, *, git_bound=None) -> tuple:
     """(core_snap_or_None, category, op, rc). _snapshot() === core + clean.
 
     Categories are a fixed enum (missing_dir, snapshot_error,
@@ -1002,7 +1002,8 @@ def _snapshot_status(worktree: str) -> tuple:
     if not worktree or not Path(worktree).is_dir():
         return None, "missing_dir", None, None
     try:
-        snap = runner.source_snapshot(Path(worktree))
+        snap = runner.source_snapshot(Path(worktree),
+                                      git_bound=git_bound)
     except runner.SourceUnreadable as exc:
         return None, "source_unreadable", exc.op, exc.rc
     except (OSError, ValueError):
@@ -1019,13 +1020,13 @@ def _snapshot_status(worktree: str) -> tuple:
             "untracked_sample": sample}, None, None, None
 
 
-def _snapshot(worktree: str) -> dict | None:
+def _snapshot(worktree: str, *, git_bound=None) -> dict | None:
     """Actual-bytes source snapshot (runner contract) or None unreadable."""
-    snap, _, _, _ = _snapshot_status(worktree)
+    snap, _, _, _ = _snapshot_status(worktree, git_bound=git_bound)
     if snap is None:
         return None
     return {"head": snap["head"], "fingerprint": snap["fingerprint"],
-            "clean": _source_clean(worktree)}
+            "clean": _source_clean(worktree, git_bound=git_bound)}
 
 
 def _git_text(args, cwd) -> str | None:
@@ -1044,13 +1045,32 @@ def _git_text(args, cwd) -> str | None:
     return out.stdout.strip()
 
 
-def _git_lines(args, cwd) -> list | None:
+def _git_lines(args, cwd, *, git_bound=None) -> list | None:
     """Porcelain output as raw lines: leading XY spaces preserved.
 
     _git_text strips the whole output, which corrupts fixed-width
     porcelain columns (" M file" -> "M file"); status parsing must use
-    these raw lines instead.
+    these raw lines instead. Bound (worker-touched tree):
+    re-prove the .git pointer and run over the hardened path.
     """
+    if git_bound is not None:
+        try:
+            paths = runner.reprove_git_pointer(cwd, git_bound)
+        except runner.SourceUnreadable:
+            return None
+        argv = runner.hardened_git_argv(
+            list(args), gitdir=paths["gitdir"],
+            worktree=paths["worktree"])
+        try:
+            out = subprocess.run(
+                argv, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, timeout=60, text=True,
+                env=runner.hardened_git_env())
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if out.returncode != 0:
+            return None
+        return out.stdout.rstrip("\n").splitlines()
     argv = ["git"] + list(args)
     try:
         with git_readonly_child_env(argv, cwd=cwd) as child_env:
@@ -1066,7 +1086,8 @@ def _git_lines(args, cwd) -> list | None:
     return out.stdout.rstrip("\n").splitlines()
 
 
-def _source_clean_diag(worktree: str) -> tuple:
+def _source_clean_diag(worktree: str, *,
+                       git_bound=None) -> tuple:
     """(clean, status_ok, offender). _source_clean() === [0].
 
     offender is the first repo-relative path (bounded to _DIAG_PATH_CHARS)
@@ -1076,7 +1097,8 @@ def _source_clean_diag(worktree: str) -> tuple:
     """
     from . import runner
     lines = _git_lines(["-c", "core.quotePath=false", "status",
-                        "--porcelain=v1", "--untracked-files=all"], worktree)
+                        "--porcelain=v1", "--untracked-files=all"],
+                       worktree, git_bound=git_bound)
     if lines is None:
         return False, False, ""
     for line in lines:
@@ -1098,7 +1120,7 @@ def _source_clean_diag(worktree: str) -> tuple:
     return True, True, ""
 
 
-def _source_clean(worktree: str):
+def _source_clean(worktree: str, *, git_bound=None):
     """Source-aware cleanliness under the runner noise contract.
 
     Reserved generated/cache paths (node_modules, .openmainty-cache,
@@ -1108,7 +1130,7 @@ def _source_clean(worktree: str):
     source, and unreadable status block (False); unresolvable git
     status is fail-closed (False), never a silent clean.
     """
-    clean, _, _ = _source_clean_diag(worktree)
+    clean, _, _ = _source_clean_diag(worktree, git_bound=git_bound)
     return clean
 
 

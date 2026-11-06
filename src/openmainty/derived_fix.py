@@ -39,6 +39,7 @@ import threading
 from pathlib import Path
 
 from . import batches, issue_recovery as _ir, muse
+from . import runner as _runner
 from . import paths as _paths
 from . import preflight as _preflight
 
@@ -279,6 +280,20 @@ def derived_path(dfix_id: str):
 
 def _expected_work_path(dfix_id: str) -> str:
     return os.path.normpath(str(_home() / "derived" / dfix_id / "work"))
+
+
+def _canonicalise_workdir(path: str) -> str:
+    """Canonical workdir for the repair policy builder.
+
+    The recorded ws path may pass through the symlinked
+    app home (live: ~/.openmainty is a symlink to the
+    owner's SSD store), while the policy check rightly
+    refuses any workdir whose realpath differs. Resolve
+    here, at the caller — never loosen the check. Pure
+    realpath; the builder still refuses anything that is
+    not an existing directory under the canonical home.
+    """
+    return os.path.realpath(path)
 
 
 def _secure_work_chain(dfix_id: str) -> str:
@@ -1511,6 +1526,12 @@ _WS_KEYS = {"path", "head", "fingerprint", "clean", "base_head",
             "prep_tree", "prep_head", "applied", "conflict_reset",
             "retained_base", "allowed_changed_paths", "result_head",
             "result_tree", "scope"}
+# 299b: new records carry the prep-time .git identity ("git").
+# Legacy records lack it (never rewritten); they validate but run
+# unbound (hardened flags/env, discovery-based paths).
+_NEW_WS_KEYS = _WS_KEYS | {"git"}
+_GIT_REC_KEYS = {"kind", "gitdir", "pointer_hex", "config_sha256",
+                 "hooks"}
 _SCOPE_KEYS = {"conflicts", "original_touched", "touched"}
 _APPLIED_KEYS = {"path", "bytes", "blob_sha256"}
 _RESET_KEYS = {"path", "base_blob", "base_blob_sha256",
@@ -1831,10 +1852,39 @@ def _validate_derived_record(rec: dict, for_write: bool = False) -> dict:
     return rec
 
 
+def _validate_git_record(rec) -> None:
+    if not isinstance(rec, dict) or set(rec.keys()) != _GIT_REC_KEYS:
+        raise DerivedFixError("derived git record malformed",
+                              status=502, code="corrupt")
+    if rec.get("kind") not in ("file", "dir"):
+        raise DerivedFixError("derived git record malformed",
+                              status=502, code="corrupt")
+    if not isinstance(rec.get("gitdir"), str) or not os.path.isabs(
+            rec["gitdir"]):
+        raise DerivedFixError("derived git record malformed",
+                              status=502, code="corrupt")
+    if not isinstance(rec.get("pointer_hex"), str):
+        raise DerivedFixError("derived git record malformed",
+                              status=502, code="corrupt")
+    try:
+        bytes.fromhex(rec["pointer_hex"])
+    except ValueError:
+        raise DerivedFixError("derived git record malformed",
+                              status=502, code="corrupt") from None
+    if not isinstance(rec.get("config_sha256"), str) or \
+            not isinstance(rec.get("hooks"), list) or \
+            any(not isinstance(h, str) for h in rec["hooks"]):
+        raise DerivedFixError("derived git record malformed",
+                              status=502, code="corrupt")
+
+
 def _validate_workspace(ws: dict, dfix_id: str) -> dict:
-    if not isinstance(ws, dict) or set(ws.keys()) != _WS_KEYS:
+    if not isinstance(ws, dict) or set(ws.keys()) not in (
+            _WS_KEYS, _NEW_WS_KEYS):
         raise DerivedFixError("derived workspace malformed",
                               status=502, code="corrupt")
+    if "git" in ws:
+        _validate_git_record(ws["git"])
     # The work path is canonical: exactly home/derived/<dfix>/work.
     # Anything else (sibling dirs, symlinked roots, other records) is
     # corruption, never a workspace.
@@ -2101,21 +2151,44 @@ def _validate_worker_report(report: dict) -> dict:
     return report
 
 
-def _git(repo_dir: str, args: list, timeout: int = _GIT_TIMEOUT_S):
-    """Run git in a repo dir; failures are typed, output bounded."""
+def _git(repo_dir: str, args: list, timeout: int = _GIT_TIMEOUT_S,
+         *, git_bound=None):
+    """Run git in a repo dir; failures are typed, output bounded.
+
+    Always over the hardened path: -c overrides plus the scrubbed
+    env (system/global/XDG config off), in the unbound branch too.
+    Bound (worker-touched tree): re-prove the .git pointer against
+    the prep record first and pin --git-dir/--work-tree from it,
+    never from discovery. A changed pointer refuses
+    git-pointer-changed before any spawn. Because global config
+    is off everywhere here, `git worktree add` no longer sees a
+    global LFS filter.
+    """
+    if git_bound is None:
+        argv = _runner.hardened_git_argv(
+            ["-C", str(repo_dir)] + list(args))
+    else:
+        try:
+            paths = _runner.reprove_git_pointer(repo_dir, git_bound)
+        except _runner.SourceUnreadable as exc:
+            raise DerivedFixError(
+                "worktree git identity changed since prepare",
+                status=502, code="git-pointer-changed") from exc
+        argv = _runner.hardened_git_argv(
+            list(args), gitdir=paths["gitdir"],
+            worktree=paths["worktree"])
     try:
         proc = subprocess.run(
-            ["git"] + list(args), cwd=str(repo_dir),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=timeout)
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout, env=_runner.hardened_git_env())
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise DerivedFixError(f"git unavailable: {exc}",
                               status=502, code="unreadable") from exc
     return proc
 
 
-def _git_ok(repo_dir: str, args: list):
-    proc = _git(repo_dir, args)
+def _git_ok(repo_dir: str, args: list, *, git_bound=None):
+    proc = _git(repo_dir, args, git_bound=git_bound)
     if proc.returncode != 0:
         detail = proc.stderr.decode("utf-8", "replace")[:200]
         raise DerivedFixError(
@@ -2221,12 +2294,12 @@ def _read_workspace_text(work: str, rel: str):
             raw).hexdigest(), True
 
 
-def _snapshot_worktree(path: str):
+def _snapshot_worktree(path: str, *, git_bound=None):
     """Real worktree descriptor via the shared snapshot helper.
 
     Returns {head, fingerprint, clean} as observed — never hardcoded.
     """
-    snap = batches._snapshot(str(path))
+    snap = batches._snapshot(str(path), git_bound=git_bound)
     if not isinstance(snap, dict) or not snap.get("head") \
             or not snap.get("fingerprint"):
         raise DerivedFixError("worktree snapshot unavailable",
@@ -2952,16 +3025,19 @@ def _verify_result_identity(rec: dict) -> bool:
         if not work or not ws.get("result_head") \
                 or not ws.get("result_tree"):
             return False
+        bound = ws.get("git")
         out = _git(work, ["rev-parse",
-                          f"{ws['result_head']}^{{commit}}"])
+                          f"{ws['result_head']}^{{commit}}"],
+                   git_bound=bound)
         if out.returncode != 0:
             return False
         out = _git(work, ["rev-parse",
-                          f"{ws['result_head']}^{{tree}}"])
+                          f"{ws['result_head']}^{{tree}}"],
+                   git_bound=bound)
         if out.returncode != 0 or out.stdout.decode(
                 "utf-8", "replace").strip() != ws["result_tree"]:
             return False
-        snap = _snapshot_worktree(work)
+        snap = _snapshot_worktree(work, git_bound=bound)
         # A recorded result settles clean at the result head; a dirty
         # tree, a moved head, or a changed fingerprint is not the
         # recorded result — stale, never rebound.
@@ -3088,7 +3164,8 @@ def _candidate_diff(repo_dir: str, old_head: str, new_head: str,
     return proc.stdout
 
 
-def _tree_entry_state(repo_dir: str, head: str, path: str) -> str:
+def _tree_entry_state(repo_dir: str, head: str, path: str, *,
+                      git_bound=None) -> str:
     """present|absent from a proven-readable pinned tree (fail-closed).
 
     Reuses the UNCHANGED original absence proof: the commit must
@@ -3097,11 +3174,12 @@ def _tree_entry_state(repo_dir: str, head: str, path: str) -> str:
     never a silent absence. A missing or corrupt tree/blob behind a
     present commit can no longer be mislabeled absent.
     """
-    if not _ir._ref_readable(repo_dir, head):
+    if not _ir._ref_readable(repo_dir, head, git_bound=git_bound):
         raise DerivedFixError("pinned commit unreadable",
                               status=502, code="unreadable")
     try:
-        absent = _ir._path_absent(repo_dir, head, path)
+        absent = _ir._path_absent(repo_dir, head, path,
+                                  git_bound=git_bound)
     except _ir.IssueRecoveryError as exc:
         raise _wrap_ir(exc) from exc
     return "absent" if absent else "present"
@@ -3149,19 +3227,20 @@ def _base_blob_info(repo_dir: str, base_head: str, path: str):
     return oid, hashlib.sha256(raw).hexdigest(), False, size
 
 
-def _stage_only(work: str, paths) -> None:
+def _stage_only(work: str, paths, *, git_bound=None) -> None:
     """Stage EXACTLY these validated paths (nothing else, ever)."""
     ordered = sorted(set(paths))
     for path in ordered:
         _clean_rel(path)
     if not ordered:
         return
-    proc = _git(work, ["add", "--"] + ordered)
+    proc = _git(work, ["add", "--"] + ordered, git_bound=git_bound)
     if proc.returncode != 0:
         detail = proc.stderr.decode("utf-8", "replace")[:200]
         raise DerivedFixError(f"staging failed: {detail}",
                               status=502, code="unreadable")
-    out = _git_ok(work, ["diff", "--cached", "--name-only", "-z"])
+    out = _git_ok(work, ["diff", "--cached", "--name-only", "-z"],
+                    git_bound=git_bound)
     staged = sorted(p for p in out.decode("utf-8", "replace").split(
         "\x00") if p)
     if staged != ordered:
@@ -3171,16 +3250,18 @@ def _stage_only(work: str, paths) -> None:
 
 
 def _commit_work(work: str, dfix_id: str, message: str,
-                 allow_empty: bool = False) -> str:
+                 allow_empty: bool = False, *,
+                 git_bound=None) -> str:
     args = _git_identity_args() + ["commit", "-qm", message]
     if allow_empty:
         args.append("--allow-empty")
-    proc = _git(work, args)
+    proc = _git(work, args, git_bound=git_bound)
     if proc.returncode != 0:
         detail = proc.stderr.decode("utf-8", "replace")[:200]
         raise DerivedFixError(f"commit failed: {detail}",
                               status=502, code="unreadable")
-    return _git_ok(work, ["rev-parse", "HEAD"]).decode(
+    return _git_ok(work, ["rev-parse", "HEAD"],
+                   git_bound=git_bound).decode(
         "utf-8", "replace").strip()
 
 
@@ -3256,15 +3337,33 @@ def prepare_repair_workspace(dfix_id: str) -> dict:
             status=exc.http_status, code=exc.code) from None
 
 
-def _git_patch(work: str, patch: bytes, check_only: bool):
-    """Run git apply [--check] with explicit stdin bytes (no inherit)."""
-    args = ["git", "apply", "--check", "-"] if check_only else [
-        "git", "apply", "-"]
+def _git_patch(work: str, patch: bytes, check_only: bool,
+               *, git_bound=None):
+    """Run git apply [--check] with explicit stdin bytes (no inherit).
+
+    Prep-time only, but over the same hardened path: bound calls
+    re-prove the pointer and pin git-dir/work-tree from the record.
+    """
+    verb = ["apply", "--check", "-"] if check_only else [
+        "apply", "-"]
+    if git_bound is None:
+        argv = _runner.hardened_git_argv(["-C", str(work)] + verb)
+    else:
+        try:
+            paths = _runner.reprove_git_pointer(work, git_bound)
+        except _runner.SourceUnreadable as exc:
+            raise DerivedFixError(
+                "worktree git identity changed since prepare",
+                status=502, code="git-pointer-changed") from exc
+        argv = _runner.hardened_git_argv(
+            verb, gitdir=paths["gitdir"],
+            worktree=paths["worktree"])
     try:
-        proc = subprocess.run(args, cwd=work, input=patch,
+        proc = subprocess.run(argv, input=patch,
                               stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE,
-                              timeout=_GIT_TIMEOUT_S)
+                              timeout=_GIT_TIMEOUT_S,
+                              env=_runner.hardened_git_env())
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise DerivedFixError(f"git unavailable: {exc}",
                               status=502, code="unreadable") from exc
@@ -3422,6 +3521,7 @@ def _prepare_in_worktree(rec, repo_dir, work, base_head, cand_head):
         "conflict_reset": conflict_reset, "retained_base": retained,
         "allowed_changed_paths": list(_ALLOWED_SOURCE_PATHS),
         "result_head": None, "result_tree": None, "scope": scope,
+        "git": _runner.record_git_pointer(work),
     }
     rec["updated_at"] = _utcnow()
     _write_record(rec)
@@ -3896,6 +3996,15 @@ def _pre_transport_proof(rec: dict, ws: dict) -> dict:
     pins. The recorded candidate checkout is the read-only command
     cwd (same common repo as base, proved at prepare time). Returns
     the repo dir and the fresh origin proof for the prompt build."""
+    # Slice 300: a broker attempt on a workspace with no git
+    # record would silently run unbound (m27/m29), so it
+    # refuses here, before any spawn. A legacy record still
+    # validates; only a new attempt on it refuses.
+    if not isinstance(ws.get("git"), dict):
+        raise DerivedFixError("workspace has no git record; "
+                              "broker attempt refused before "
+                              "spawn",
+                              status=409, code="repair-no-git-record")
     cur = _reprove_origin(rec)
     _reprove_work_chain(rec["op_id"])
     _verify_prep_identity(rec)
@@ -3947,7 +4056,7 @@ def _post_transport_proof(rec: dict) -> None:
                               status=502, code="workspace-changed")
 
 
-def _real_diff_stat(work: str, prep_head: str):
+def _real_diff_stat(work: str, prep_head: str, *, git_bound=None):
     """(files, insertions, deletions) of the real staged diff.
 
     Parsed from ``git diff prep_head --numstat`` AFTER the backend
@@ -3955,7 +4064,8 @@ def _real_diff_stat(work: str, prep_head: str):
     vs the prep head. Binary entries (``-`` counts) and unparseable
     lines refuse as unverifiable, never as proven counts.
     """
-    out = _git_ok(work, ["diff", "--numstat", prep_head, "--", "."])
+    out = _git_ok(work, ["diff", "--numstat", prep_head, "--", "."],
+                    git_bound=git_bound)
     files = insertions = deletions = 0
     for line in out.decode("utf-8", "replace").splitlines():
         if not line.strip():
@@ -3996,7 +4106,7 @@ def _finish_explained(rec: dict, attempt: dict, status: str,
                     meta)
 
 
-def _worktree_changes(work: str, prep_head: str):
+def _worktree_changes(work: str, prep_head: str, *, git_bound=None):
     """(changed, new): typed before/after detection vs the prep head.
 
     Uses --raw name-status so deletions (D), renames (R), and type
@@ -4006,7 +4116,8 @@ def _worktree_changes(work: str, prep_head: str):
     stay out of the commit (symlink-walked for escapes), allowed new
     files join the backend-staged set, everything else refuses.
     """
-    out = _git_ok(work, ["diff", "--raw", "-z", prep_head, "--", "."])
+    out = _git_ok(work, ["diff", "--raw", "-z", prep_head, "--", "."],
+                    git_bound=git_bound)
     tokens = out.decode("utf-8", "replace").split("\x00")
     changed = []
     i = 0
@@ -4051,14 +4162,16 @@ def _worktree_changes(work: str, prep_head: str):
         _assert_no_symlink_components(work, path)
     # Mode-only M: identical bytes to the prep blob refuses.
     for path in list(changed):
-        proc = _git(work, ["show", f"{prep_head}:{path}"])
+        proc = _git(work, ["show", f"{prep_head}:{path}"],
+                    git_bound=git_bound)
         if proc.returncode == 0:
             if proc.stdout == _read_workspace_bytes(work, path):
                 raise DerivedFixError(
                     f"refused mode-only change: {path}",
                     status=502, code="mode-only-change")
     status_out = _git_ok(work, ["status", "--porcelain=v1", "-uall",
-                                "-z"])
+                                "-z"],
+                            git_bound=git_bound)
     new_files = []
     for line in status_out.decode("utf-8", "replace").split("\x00"):
         if not line.startswith("??"):
@@ -4082,7 +4195,8 @@ def _worktree_changes(work: str, prep_head: str):
         # A tracked path shadowed by an untracked twin refuses; the
         # tree proof fails closed so an unreadable prep tree never
         # lets a shadow through as "untracked".
-        if _tree_entry_state(work, prep_head, rel) == "present":
+        if _tree_entry_state(work, prep_head, rel,
+                             git_bound=git_bound) == "present":
             raise DerivedFixError(
                 f"refused shadowed tracked path: {rel}",
                 status=502, code="corrupt")
@@ -4198,7 +4312,8 @@ def run_repair_worker(dfix_id: str, attempt_id: str, job_id=None,
         # NOT used here even though it stays byte-identical for the
         # older dependency workers.
         exit_code, raw_stream, _usage = muse.exec_source_repair(
-            prompt, ws["path"], timeout=_WORKER_TIMEOUT_S,
+            prompt, _canonicalise_workdir(ws["path"]),
+            timeout=_WORKER_TIMEOUT_S,
             cancel_event=cancel_event, trace=False,
             preflight_home=home_str, admission_kind="target")
     except Exception as exc:
@@ -4263,9 +4378,11 @@ def run_repair_worker(dfix_id: str, attempt_id: str, job_id=None,
         _finish_explained(rec, attempt, "source-error", exc, job_id,
                           meta, "workspace preserved")
         return 1
+    bound = ws.get("git")
     try:
         changed, new_files = _worktree_changes(ws["path"],
-                                               ws["prep_head"])
+                                               ws["prep_head"],
+                                               git_bound=bound)
         _assert_scope(ws["path"], changed, new_files)
         if not changed and not new_files:
             raise DerivedFixError(
@@ -4316,7 +4433,7 @@ def run_repair_worker(dfix_id: str, attempt_id: str, job_id=None,
         return 1
     try:
         _reprove_work_chain(dfix_id)
-        _stage_only(ws["path"], list(verified))
+        _stage_only(ws["path"], list(verified), git_bound=bound)
     except DerivedFixError as exc:
         _finish_explained(rec, attempt, "source-error", exc, job_id,
                           meta, "nothing committed")
@@ -4328,7 +4445,8 @@ def run_repair_worker(dfix_id: str, attempt_id: str, job_id=None,
     # output refuses as unverifiable, never as proven.
     try:
         files_n, ins_n, dels_n = _real_diff_stat(ws["path"],
-                                                ws["prep_head"])
+                                                ws["prep_head"],
+                                                git_bound=bound)
         diff = report.get("diff_stat") or {}
         if files_n != diff.get("files") \
                 or ins_n != diff.get("insertions") \
@@ -4342,32 +4460,36 @@ def run_repair_worker(dfix_id: str, attempt_id: str, job_id=None,
         _finish_explained(rec, attempt, "refused", exc, job_id, meta,
                           "nothing committed")
         return 1
-    tree = _git_ok(ws["path"], ["write-tree"]).decode(
+    tree = _git_ok(ws["path"], ["write-tree"],
+                   git_bound=bound).decode(
         "utf-8", "replace").strip()
     try:
         _reprove_work_chain(dfix_id)
         head = _commit_work(ws["path"], dfix_id,
-                            f"derived {dfix_id} repaired")
+                            f"derived {dfix_id} repaired",
+                            git_bound=bound)
     except DerivedFixError as exc:
         _finish_explained(rec, attempt, "source-error", exc, job_id,
                           meta, "nothing recorded")
         return 1
     try:
         tree_at_head = _git_ok(ws["path"], ["rev-parse",
-                                             f"{head}^{{tree}}"]).decode(
+                                             f"{head}^{{tree}}"],
+                                    git_bound=bound).decode(
                                                  "utf-8",
                                                  "replace").strip()
         if tree_at_head != tree:
             raise DerivedFixError("result commit tree mismatch",
                                   status=502, code="corrupt")
         out = _git_ok(ws["path"], ["ls-tree", "-r", "--name-only",
-                                   head])
+                                   head],
+                      git_bound=bound)
         committed = out.decode("utf-8", "replace").splitlines()
         if any(p == ".openmainty-cache" or p.startswith(
                 ".openmainty-cache/") for p in committed):
             raise DerivedFixError("result commit contains cache files",
                                   status=502, code="corrupt")
-        snap = _snapshot_worktree(ws["path"])
+        snap = _snapshot_worktree(ws["path"], git_bound=bound)
         if snap["head"] != head or snap["clean"] is not True:
             raise DerivedFixError("result worktree did not settle "
                                   "clean at the result head",

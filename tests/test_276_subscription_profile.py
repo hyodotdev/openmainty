@@ -7,9 +7,11 @@ subscription_worker_exceptions UI list. muse.spawn_msp_worker
 gains profile="subscription" (HOME/XDG_CONFIG real, museHome/
 cache/TMPDIR owned; default stays "product"), and hook/list +
 usage/read record their observations on the worker record so
-the canary's hooks/usage legs clear honestly. config_established
-is still never set: the canary keeps refusing on
-config-unestablished. describe_preflight reports the profile,
+the canary's hooks/usage legs clear honestly. (Slice 293
+later added the observer-backed config_established criterion
+and the one D2 settings-lock write rule pinned in the golden
+below; at 276 time the canary kept refusing on
+config-unestablished.) describe_preflight reports the profile,
 and the panel lists it in plain words (mirror only, no gate).
 
 Offline only: scripted-child fixtures, mocked wrapper seam. No
@@ -57,6 +59,7 @@ GOLDEN_SUBSCRIPTION_TEXT = """\
 (deny file-read* (require-not (require-any (subpath "/Users/fake276/.config/muse") (subpath "/Users/fake276/Library/Keychains/login.keychain-db") (subpath "/Users/fake276/Library/Preferences/com.apple.security.plist") (subpath "/Users/fake276/.claude/skills") (subpath "/Users/fake276/.codex/skills") (literal "/Library") (literal "/Library/Application Support") (literal "/Users/fake276/.claude/CLAUDE.md") (subpath "/private/tmp/fake276/root") (literal "/Users/fake276/.local/bin/muse-bin-test") (literal "/") (require-all (subpath "/System") (require-not (subpath "/System/Volumes/Data"))) (subpath "/usr/lib") (subpath "/usr/share") (subpath "/Library/Apple/System") (literal "/dev/null") (literal "/dev/random") (literal "/dev/urandom"))))
 (deny process-exec (require-not (literal "/Users/fake276/.local/bin/muse-bin-test")))
 (allow file-read-metadata (literal "/private/tmp/fake276") (literal "/private/tmp") (literal "/private") (literal "/") (literal "/Users/fake276/.local/bin") (literal "/Users/fake276/.local") (literal "/Users/fake276") (literal "/Users") (literal "/Users/fake276/.config") (literal "/Users/fake276/Library/Keychains") (literal "/Users/fake276/Library") (literal "/Users/fake276/Library/Preferences") (literal "/Users/fake276/.claude") (literal "/Users/fake276/.codex") (literal "/Library") (literal "/Library/Application Support"))
+(allow file-write-data file-write-create (literal "/Users/fake276/.config/muse/.settings.json.lock"))
 """
 
 EXPECTED_EXCEPTION_SPECS = (

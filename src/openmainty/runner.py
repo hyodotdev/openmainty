@@ -11,6 +11,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -466,17 +467,246 @@ class SourceUnreadable(Exception):
 _GIT_PROBE_TIMEOUT = 30
 
 
-def _git_z(work: Path, args: list, op: str) -> list:
-    code, out, _ = run_cmd(["git", "-C", str(work)] + args,
-                           timeout=_GIT_PROBE_TIMEOUT)
+# Hardened git path (299b, root493): the ONLY way app code runs git
+# on a tree a worker has touched. -c overrides outrank every config
+# file (repo, global, XDG, system); the env drops system/global/XDG
+# scope plus every GIT_* control a planted env could smuggle.
+_HARDENED_GIT_CONFIG = (
+    ("core.fsmonitor", "false"),  # never run a monitor hook script
+    ("core.hooksPath", "/dev/null"),  # never run repo hooks
+    ("core.sshCommand", ""),  # no network verb runs; fail closed
+    ("core.attributesFile", "/dev/null"),  # no global attributes
+)
+_GIT_KEEP_ENV = ("GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL",
+                 "GIT_OPTIONAL_LOCKS")
+
+
+def hardened_git_argv(args: list, *, gitdir=None,
+                      worktree=None) -> list:
+    """Argv for one hardened git call. Bound (gitdir given) pins
+    --git-dir/--work-tree before the verb, inserts
+    --ignore-submodules=all after the verb of diff/status so
+    no child gitdir is consulted, and --no-ext-diff/
+    --no-textconv after the verb of diff so no driver runs.
+    Insertion sits right after the verb: appended flags
+    would land past a "--" separator and be read as paths.
+    Unbound keeps the caller's -C, but the -c overrides above
+    still apply: fsmonitor, hooks and the global attributes
+    file stay off, so this is not a bare git call."""
+    argv = ["git"]
+    for key, value in _HARDENED_GIT_CONFIG:
+        argv += ["-c", "%s=%s" % (key, value)]
+    rest = list(args)
+    if "-C" in rest and gitdir is not None:
+        raise ValueError("bound call must not carry -C")
+    if gitdir is not None:
+        argv += ["--git-dir", str(gitdir),
+                "--work-tree", str(worktree)]
+    base = len(argv)
+    argv += rest
+    idx = 0
+    while idx < len(rest):
+        if rest[idx] in ("-C", "-c"):
+            idx += 2
+        else:
+            break
+    verb = rest[idx] if idx < len(rest) else ""
+    extra = []
+    if gitdir is not None and verb in ("diff", "status"):
+        extra.append("--ignore-submodules=all")
+    if gitdir is not None and verb == "diff":
+        # No external diff drivers or textconv on a worker tree:
+        # a planted .gitattributes could otherwise name a driver
+        # the recorded config defines. --raw/--numstat/--cached
+        # output is unaffected.
+        extra += ["--no-ext-diff", "--no-textconv"]
+    if extra:
+        argv[base + idx + 1:base + idx + 1] = extra
+    return argv
+
+
+def hardened_git_env(base=None) -> dict:
+    """Scrubbed env for one hardened git call. Drops every GIT_*
+    control and PAGER, then forces config scope off: system via
+    GIT_CONFIG_NOSYSTEM, global+XDG via GIT_CONFIG_GLOBAL."""
+    env = dict(os.environ if base is None else base)
+    for key in [k for k in env if k.startswith("GIT_")]:
+        del env[key]
+    env.pop("PAGER", None)
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    return env
+
+
+def record_git_pointer(work) -> dict:
+    """Record the .git identity of a trusted tree (prep time).
+
+    File shape (linked worktree): pointer bytes plus the resolved
+    gitdir. Directory shape: gitdir plus the config sha and hook
+    names, since a planted config there is the same threat."""
+    node = Path(str(work)) / ".git"
+    try:
+        st = os.lstat(node)
+    except OSError as exc:
+        raise SourceUnreadable("git-pointer") from exc
+    if stat.S_ISLNK(st.st_mode):
+        raise SourceUnreadable("git-pointer")
+    if stat.S_ISDIR(st.st_mode):
+        cfg = node / "config"
+        try:
+            digest = _hash_bytes(cfg.read_bytes())
+        except OSError:
+            digest = ""
+        try:
+            hooks = sorted(e.name for e in os.scandir(node / "hooks")
+                           if e.name not in (".", ".."))
+        except OSError:
+            hooks = []
+        return {"kind": "dir",
+                "gitdir": os.path.realpath(node),
+                "pointer_hex": "",
+                "config_sha256": digest, "hooks": hooks}
+    try:
+        raw = node.read_bytes()
+    except OSError as exc:
+        raise SourceUnreadable("git-pointer") from exc
+    text = raw.decode("utf-8", "replace").strip()
+    if not text.startswith("gitdir: "):
+        raise SourceUnreadable("git-pointer")
+    target = text[len("gitdir: "):].strip()
+    if not os.path.isabs(target):
+        target = os.path.join(str(work), target)
+    return {"kind": "file", "pointer_hex": raw.hex(),
+            "gitdir": os.path.realpath(target),
+            "config_sha256": "", "hooks": []}
+
+
+def refuse_nested_git(work) -> None:
+    """Fail closed on any nested .git the kernel cannot see.
+
+    Walks the worktree without following symlinks and raises
+    SourceUnreadable("nested-git") on any entry whose
+    casefolded name is .git, other than the top-level
+    pointer the prep record covers. Does not descend into
+    the top-level .git: the kernel deny owns everything
+    under it. The vector this closes is a directory renamed
+    in from a writable area outside the workdir, whose
+    target the deny regex never sees. Unreadable entries
+    fail closed too.
+    """
+    root = os.path.realpath(str(work))
+    stack = [root]
+    while stack:
+        here = stack.pop()
+        try:
+            entries = list(os.scandir(here))
+        except OSError as exc:
+            raise SourceUnreadable("nested-git") from exc
+        for entry in entries:
+            if here == root and entry.name == ".git":
+                continue
+            if entry.name.casefold() == ".git":
+                raise SourceUnreadable("nested-git")
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError as exc:
+                raise SourceUnreadable("nested-git") from exc
+            if is_dir:
+                stack.append(entry.path)
+
+
+def reprove_git_pointer(work, record: dict) -> dict:
+    """Re-verify .git against the prep record; fail closed.
+
+    Returns {"gitdir", "worktree"} for hardened_git_argv. Any
+    difference — bytes, identity, kind, symlink — raises
+    SourceUnreadable("git-pointer"); a nested .git planted
+    after prepare raises SourceUnreadable("nested-git").
+    Callers on the derived path translate either to the
+    named refusal before any spawn."""
+    node = Path(str(work)) / ".git"
+    try:
+        st = os.lstat(node)
+    except OSError as exc:
+        raise SourceUnreadable("git-pointer") from exc
+    if stat.S_ISLNK(st.st_mode) or record.get("kind") not in (
+            "file", "dir"):
+        raise SourceUnreadable("git-pointer")
+    if stat.S_ISDIR(st.st_mode) != (record.get("kind") == "dir"):
+        raise SourceUnreadable("git-pointer")
+    if record.get("kind") == "dir":
+        if os.path.realpath(node) != record.get("gitdir"):
+            raise SourceUnreadable("git-pointer")
+        try:
+            digest = _hash_bytes((node / "config").read_bytes())
+        except OSError:
+            digest = ""
+        try:
+            hooks = sorted(e.name for e in os.scandir(node / "hooks")
+                           if e.name not in (".", ".."))
+        except OSError:
+            hooks = []
+        if digest != record.get("config_sha256") or \
+                hooks != list(record.get("hooks") or []):
+            raise SourceUnreadable("git-pointer")
+        paths = {"gitdir": os.path.realpath(node),
+                 "worktree": os.path.realpath(str(work))}
+        refuse_nested_git(paths["worktree"])
+        return paths
+    try:
+        raw = node.read_bytes()
+    except OSError as exc:
+        raise SourceUnreadable("git-pointer") from exc
+    if raw.hex() != record.get("pointer_hex"):
+        raise SourceUnreadable("git-pointer")
+    text = raw.decode("utf-8", "replace").strip()
+    target = text[len("gitdir: "):].strip() if text.startswith(
+        "gitdir: ") else ""
+    if not target:
+        raise SourceUnreadable("git-pointer")
+    if not os.path.isabs(target):
+        target = os.path.join(str(work), target)
+    if os.path.realpath(target) != record.get("gitdir"):
+        raise SourceUnreadable("git-pointer")
+    paths = {"gitdir": os.path.realpath(target),
+             "worktree": os.path.realpath(str(work))}
+    refuse_nested_git(paths["worktree"])
+    return paths
+
+
+def _hgit_run(work, args: list, *, git_bound=None,
+              timeout: int):
+    """run_cmd over the hardened git path.
+
+    Bound (worker-touched tree): re-prove the .git pointer, pin
+    --git-dir/--work-tree, run in the scrubbed env. Unbound (owner
+    tree): the same -c flags over -C with the inherited env.
+    The -c flags still turn off fsmonitor, hooks and the global
+    attributes file, so hook/filter behavior differs from a bare
+    call; excludes still apply and global config is still read."""
+    if git_bound is None:
+        argv = hardened_git_argv(["-C", str(work)] + list(args))
+        return run_cmd(argv, timeout=timeout)
+    paths = reprove_git_pointer(work, git_bound)
+    argv = hardened_git_argv(list(args), gitdir=paths["gitdir"],
+                            worktree=paths["worktree"])
+    return run_cmd(argv, timeout=timeout, env=hardened_git_env())
+
+
+def _git_z(work: Path, args: list, op: str,
+           *, git_bound=None) -> list:
+    code, out, _ = _hgit_run(work, args, git_bound=git_bound,
+                             timeout=_GIT_PROBE_TIMEOUT)
     if code != 0:
         raise SourceUnreadable(op, rc=code)
     return [p for p in out.split("\0") if p]
 
 
-def _is_ignored(work: Path, rel: str) -> bool:
-    code, _, _ = run_cmd(["git", "-C", str(work), "check-ignore", "-q", "--", rel],
-                         timeout=_GIT_PROBE_TIMEOUT)
+def _is_ignored(work: Path, rel: str, *, git_bound=None) -> bool:
+    code, _, _ = _hgit_run(work, ["check-ignore", "-q", "--", rel],
+                           git_bound=git_bound,
+                           timeout=_GIT_PROBE_TIMEOUT)
     return code == 0
 
 
@@ -539,7 +769,8 @@ def _noise_covered_dir(rel: str) -> bool:
     return bool(rel) and _noise_rel(rel + "/_")
 
 
-def _check_ignore_set(work: Path, rels: list) -> set:
+def _check_ignore_set(work: Path, rels: list, *,
+                      git_bound=None) -> set:
     """Subset of rels that git ignores (one batch call).
 
     A failed batch answers empty, which callers treat as "nothing
@@ -548,9 +779,9 @@ def _check_ignore_set(work: Path, rels: list) -> set:
     """
     if not rels:
         return set()
-    code, out, _ = run_cmd(
-        ["git", "-C", str(work), "check-ignore", "--"] + list(rels),
-        timeout=_GIT_PROBE_TIMEOUT)
+    code, out, _ = _hgit_run(
+        work, ["check-ignore", "--"] + list(rels),
+        git_bound=git_bound, timeout=_GIT_PROBE_TIMEOUT)
     if code not in (0, 1):
         return set()
     return {ln for ln in (out or "").splitlines() if ln}
@@ -563,7 +794,8 @@ def _check_ignore_set(work: Path, rels: list) -> set:
 _WALK_LEVEL_BATCH_MIN = 200
 
 
-def _ensure_untracked_complete(work: Path) -> None:
+def _ensure_untracked_complete(work: Path, *,
+                               git_bound=None) -> None:
     """Prove git's untracked listing could not have missed source.
 
     `git status` exits 0 and only warns when it cannot open a
@@ -613,7 +845,8 @@ def _ensure_untracked_complete(work: Path) -> None:
                     continue
                 nxt.append(rel)
         if len(nxt) > _WALK_LEVEL_BATCH_MIN:
-            ignored = _check_ignore_set(work, nxt)
+            ignored = _check_ignore_set(work, nxt,
+                                        git_bound=git_bound)
             if ignored:
                 nxt = [d for d in nxt if d not in ignored]
         current = nxt
@@ -621,7 +854,7 @@ def _ensure_untracked_complete(work: Path) -> None:
         raise SourceUnreadable("list .")
     if not failed:
         return
-    ignored = _check_ignore_set(work, failed)
+    ignored = _check_ignore_set(work, failed, git_bound=git_bound)
     for rel in failed:
         if rel not in ignored:
             raise SourceUnreadable("list %s" % rel)
@@ -1355,7 +1588,7 @@ def worktree_signature(work: Path) -> str | None:
         return None
 
 
-def source_snapshot(work: Path) -> dict:
+def source_snapshot(work: Path, *, git_bound=None) -> dict:
     """Stable content snapshot of the exact source being verified.
 
     - `head`: exact git HEAD (or "unknown"); kept as a DISTINCT field, never
@@ -1376,8 +1609,9 @@ def source_snapshot(work: Path) -> dict:
     import hashlib
     work = Path(work)
     if _git_present(work):
-        code, out, _ = run_cmd(["git", "-C", str(work), "rev-parse", "HEAD"],
-                               timeout=_GIT_PROBE_TIMEOUT)
+        code, out, _ = _hgit_run(work, ["rev-parse", "HEAD"],
+                                 git_bound=git_bound,
+                                 timeout=_GIT_PROBE_TIMEOUT)
         head = out.strip() if code == 0 else ""
         if not head:
             # No readable HEAD: identity is unavailable, never a valid
@@ -1385,17 +1619,19 @@ def source_snapshot(work: Path) -> dict:
             raise SourceUnreadable("head", rc=code if code != 0 else None)
         # Prove the untracked listing below cannot silently miss
         # source hiding in directories git could not open.
-        _ensure_untracked_complete(work)
+        _ensure_untracked_complete(work, git_bound=git_bound)
         entries, untracked = [], []
-        for rel in _git_z(work, ["ls-files", "-z"], "tracked-list"):
+        for rel in _git_z(work, ["ls-files", "-z"], "tracked-list",
+                          git_bound=git_bound):
             if _noise_rel(rel):
                 continue
             p = work / rel
             try:
                 is_dir, is_file = _classify(p, rel)
                 if is_dir:
-                    code2, out2, _ = run_cmd(
-                        ["git", "-C", str(work), "ls-files", "-s", "--", rel],
+                    code2, out2, _ = _hgit_run(
+                        work, ["ls-files", "-s", "--", rel],
+                        git_bound=git_bound,
                         timeout=_GIT_PROBE_TIMEOUT)
                     if code2 != 0:
                         raise SourceUnreadable(f"gitlink {rel}", rc=code2)
@@ -1412,7 +1648,8 @@ def source_snapshot(work: Path) -> dict:
             except OSError:
                 raise SourceUnreadable(f"stat {rel}")
         for token in _git_z(work, ["status", "--porcelain=v1", "-z",
-                                   "--untracked-files=all"], "untracked-status"):
+                                   "--untracked-files=all"],
+                           "untracked-status", git_bound=git_bound):
             # `-z` separates entries with NUL; an untracked entry is `?? <path>`.
             if len(token) < 4 or not token.startswith("??"):
                 continue
@@ -1445,14 +1682,16 @@ def source_snapshot(work: Path) -> dict:
                     listed = _list_tree_strict(
                         work, rel,
                         lambda r: _noise_covered_dir(r)
-                        or _is_ignored(work, r))
+                        or _is_ignored(work, r,
+                                       git_bound=git_bound))
                     for srel, sub in listed:
                         if _noise_rel(srel):
                             continue
                         sub_is_dir, sub_is_file = _classify(sub, srel)
                         if not sub_is_file:
                             continue
-                        if _is_ignored(work, srel):
+                        if _is_ignored(work, srel,
+                                       git_bound=git_bound):
                             continue
                         try:
                             entries.append(

@@ -59,29 +59,106 @@ _DEDICATED_STREAM_MAX_BYTES = 4 * 1024 * 1024
 
 # The ONE command contract for this profile: explicit
 # meta/muse-spark-1.3/contributor-ON, exactly one network mode
-# (`restricted`), approval never with the judge off, no interactive
-# input, and the CONFIRMED CLI step/output bounds below (help
-# surface: --max-model-steps "Cap the number of steps",
-# --max-tool-output-bytes "Cap tool output bytes fed back to the
-# model", 0 or >=9). No other bounding flags are invented; app
-# timeout + stream caps + owned process-group reaping add the
-# runtime side. Raw flags below are REQUESTED state, not observed
-# enforcement; effective file-only/MCP/hooks/delegation proof is a
-# separate blocking gate (preflight channels stay UNKNOWN until
-# genuinely observed).
+# (`brokered`: observed against the broker log per attempt, never
+# a requested label), approval never with the judge off, no
+# interactive input, and the CONFIRMED CLI step/output bounds
+# below (help surface: --max-model-steps "Cap the number of
+# steps", --max-tool-output-bytes "Cap tool output bytes fed
+# back to the model", 0 or >=9). No other bounding flags are
+# invented; app timeout + stream caps + owned process-group
+# reaping add the runtime side. Raw flags below are REQUESTED
+# state, not observed enforcement; effective file-only/MCP/
+# hooks/delegation proof is a separate blocking gate
+# (preflight channels stay UNKNOWN until genuinely observed).
 SOURCE_REPAIR_PROFILE = {
-    "profile": "source-repair",
+    "profile": "repair-broker",
     "provider": "meta",
     "model": "muse-spark-1.3",
     "contributor_mode": True,
     "approval_mode": "never",
     "approval_judge": "off",
-    "network_mode": "restricted",
+    "network_mode": "brokered",
     "disable_request_user_input": True,
-    "trust_workspace": True,
+    "trust_workspace": False,
     "max_model_steps": 25,
     "max_tool_output_bytes": 200000,
 }
+
+# Tool names a repair attempt may use, seen on its own stream.
+# Slice 300: the ONLY name with evidence is write_file (E43b:
+# payload.event.task_kind tool.write_file, both tool_name
+# fields on tool_result; see Muse409-tool-names.md). Shell,
+# web, MCP and agent/sub-task tools are excluded: a
+# provider-served web tool would pass the exec pin, the
+# broker and the kernel rule, so the stream is the only
+# place left to catch it. read_file/edit_file are
+# expected-but-unseen guesses, deliberately NOT listed: a
+# too-narrow list fails a real attempt (recording the true
+# name) rather than passing the wrong one.
+REPAIR_TOOL_ALLOWLIST = frozenset({"write_file"})
+
+# Payload kinds the E43b stream actually carried (closed list:
+# a record with no payload kind refuses, and anything else
+# refuses and names the kind, so a new shape can only widen
+# this on stream evidence). Source for every closed list in
+# this slice: Root-E43b-actual-closed-grammar-evidence.json
+# (36 records, 0 kindless).
+REPAIR_STREAM_KINDS = frozenset({
+    "command_accepted", "run_model_configured",
+    "run_output_delta", "run_started", "run_terminal",
+    "run_usage", "session_run_linked", "task_lifecycle",
+    "task_stream_linked", "tool_result", "turn_input_user",
+})
+
+# Non-tool event.task_kind values E43b carried (closed list:
+# task_kind must be tool.<listed name> or one of these).
+# Same evidence source: only model.meta.response and
+# tool.write_file ever appeared.
+REPAIR_NON_TOOL_TASK_KINDS = frozenset({"model.meta.response"})
+
+# Closed envelope grammar from the same evidence. The actual
+# stream carries all three on every record (record_type str,
+# payload_type str, stream dict with kind), so each is
+# required: missing, null, mistyped or unknown values refuse
+# and name the value. Fixtures carry complete envelopes.
+REPAIR_RECORD_TYPES = frozenset({
+    "event", "reconciliation", "status",
+})
+
+REPAIR_PAYLOAD_TYPES = frozenset({
+    "run.lifecycle.started", "run.model.configured",
+    "run.output.delta", "run.terminal.completed",
+    "run.usage", "runtime.command.accepted",
+    "session.run.linked", "task.lifecycle.accepted",
+    "task.lifecycle.completed", "task.lifecycle.output",
+    "task.lifecycle.proposed", "task.lifecycle.scheduled",
+    "task.lifecycle.side_effect_intent",
+    "task.lifecycle.started", "task.lifecycle.status",
+    "task.stream.linked", "tool.result",
+    "turn.input.user",
+})
+
+# Observed stream kinds. The proved bytes are the exec attempt
+# output, so fixtures use exec.usage; session is the only other
+# observed stream name. The stream object itself is required,
+# as is its kind: missing, mistyped or unknown values refuse
+# and name the value.
+REPAIR_EXEC_STREAM_KINDS = frozenset({"exec.usage", "session"})
+
+# Lifecycle event grammar: every E43b task_lifecycle record
+# carries an event object with one of these kinds; operation,
+# when present on the event (or, unseen, bare on the payload),
+# is one of these. Note the punctuation: task_kind joins with
+# a dot (tool.write_file) while operation joins with a colon
+# (tool:write_file); both forms are observed, neither guessed.
+REPAIR_EVENT_KINDS = frozenset({
+    "accepted", "completed", "output", "proposed",
+    "scheduled", "side_effect_intent", "started", "status",
+})
+
+REPAIR_OPERATIONS = frozenset({
+    "model.meta.response", "tool:write_file",
+})
 
 # Explicit minimal child environment for the dedicated profile (no
 # ambient credential/config inheritance: only PATH/TMPDIR/HOME plus
@@ -476,7 +553,7 @@ def agent_info(model=None) -> dict:
 
 
 def build_source_repair_cmd(prompt: str, workdir, output_schema=None) -> list:
-    """Argv for the DEDICATED source-repair profile (restricted network).
+    """Argv for the DEDICATED source-repair profile (brokered network).
 
     `workdir` (the isolated fixture/preview workspace) is REQUIRED:
     this profile never runs without an explicit workspace. The ONLY
@@ -531,16 +608,18 @@ def build_source_repair_cmd(prompt: str, workdir, output_schema=None) -> list:
         "--disable-request-user-input",
         "--approval-mode", SOURCE_REPAIR_PROFILE["approval_mode"],
         "--approval-judge", SOURCE_REPAIR_PROFILE["approval_judge"],
-        "--trust-workspace",
-        # Exactly ONE network mode for this profile: restricted. The
-        # older dependency-worker default (`enabled`) is NOT reused
-        # here; appending it would be a duplicate the parser rejects.
-        "--sandbox-network", SOURCE_REPAIR_PROFILE["network_mode"],
+        # No --trust-workspace: a target repo's own skills and rules
+        # must not steer the worker (E41 ran without it). No
+        # --sandbox-network: the kernel policy governs egress and
+        # the only observed transport is the broker ("brokered" is
+        # checked against the broker log per attempt, never passed
+        # as a mode the binary was never seen to accept).
         "--max-model-steps",
         str(SOURCE_REPAIR_PROFILE["max_model_steps"]),
         "--max-tool-output-bytes",
         str(SOURCE_REPAIR_PROFILE["max_tool_output_bytes"]),
         "--json",
+        "--no-session-log",
     ]
     cmd += ["--workspace", str(workdir)]
     if output_schema is not None:
@@ -778,6 +857,432 @@ def _communicate_bounded(proc, timeout, cancel_event, max_bytes):
             out_cut[0], err_cut[0], joined_ok, reaped_ok)
 
 
+def _halt_exec_broker(broker) -> dict:
+    """Stop a repair broker; always return its final record.
+
+    Returns {"broker_log", "broker_stop"}. Stop runs FIRST
+    and the log is read after: an open tunnel's entry
+    completes only when its handler finishes, so a log
+    read before the stop would show at_close None and
+    zero bytes for the very evidence this exists to
+    collect. Safe on None (never started) and on broker
+    errors: the record says what happened instead of
+    raising.
+    """
+    if broker is None:
+        return {"broker_log": [],
+                "broker_stop": {"stopped": False,
+                                "reason": "not-started"}}
+    try:
+        stop = broker.stop()
+    except Exception as exc:
+        stop = {"stopped": False, "error": "%s" % exc}
+    try:
+        log = broker.log()
+    except Exception:
+        log = []
+    if not isinstance(log, list):
+        log = []
+    if not isinstance(stop, dict):
+        stop = {"stopped": False,
+                "reason": "bad-stop-shape"}
+    return {"broker_log": log, "broker_stop": stop}
+
+
+def _exec_repair_parent(preflight_home) -> str:
+    """<canonical home>/repair-roots, created owned, or MspError.
+
+    Each repair attempt's owned root lives here (never in
+    the system temp dir, which the OS cleaner reaps), so
+    the owned trace stays reviewable after the run. The
+    home is resolved first (production's home is a
+    symlink); the parent is created 0700 and then held to
+    the existing owned-dir discipline. Still no rmtree:
+    roots accumulate until the operator removes them.
+    """
+    from . import ncontain as _ncontain
+    if not isinstance(preflight_home, str) \
+            or not preflight_home:
+        raise MspError("repair needs an app home for its "
+                       "owned root", code="bad-input")
+    try:
+        parent = os.path.join(
+            os.path.realpath(preflight_home), "repair-roots")
+    except OSError as exc:
+        raise MspError("repair app home unresolvable: %s"
+                       % exc, code="unreadable") from exc
+    try:
+        os.mkdir(parent, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise MspError("repair roots unavailable: %s" % exc,
+                       code="unreadable") from exc
+    try:
+        _ncontain._check_owned_dir(parent)
+    except _ncontain.ContainmentError as exc:
+        raise MspError("repair roots refused: %s" % exc,
+                       code="containment") from exc
+    return parent
+
+
+def _walk_tool_names(rec):
+    """(names, null_hit): every tool_name value in rec, any depth.
+
+    names holds the non-empty string values in walk order.
+    null_hit is True when any tool_name key holds anything
+    else: a shape the check cannot read as a name.
+    """
+    names = []
+    null_hit = False
+    stack = [rec]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            items = node.items()
+        elif isinstance(node, list):
+            items = enumerate(node)
+        else:
+            continue
+        for key, value in items:
+            if key == "tool_name":
+                if isinstance(value, str) and value:
+                    names.append(value)
+                else:
+                    null_hit = True
+            if isinstance(value, (dict, list)):
+                stack.append(value)
+    return names, null_hit
+
+
+def _short_kind(value):
+    """Error-message form of a refused kind value (capped)."""
+    if isinstance(value, str) and len(value) <= 64:
+        return value
+    text = value if isinstance(value, str) else repr(value)
+    if len(text) > 64:
+        return text[:61] + "..."
+    return text
+
+
+def _check_repair_tools(stream) -> tuple:
+    """(used, refused_name, refused_kind, refused_detail).
+
+    used is the sorted names the stream shows inside
+    REPAIR_TOOL_ALLOWLIST. On refusal, refused_detail says
+    why, refused_name carries the first off-list tool name
+    and refused_kind the first off-list kind-like value
+    (record/payload-type, payload, stream, task, event or
+    operation kind; None when that class never appeared),
+    so a real attempt that fails still teaches the true
+    shapes. refused_detail is None on accept.
+
+    Fail closed throughout: the envelope (record_type,
+    payload_type, stream object and stream kind), the payload
+    kind and the lifecycle event grammar are required closed
+    lists from actual E43b evidence
+    (Root-E43b-actual-closed-grammar-evidence.json: 36
+    records, 0 kindless, every record carrying record_type
+    str, payload_type str, stream dict and stream kind, so a
+    payload with no kind refuses); a task_lifecycle record
+    with no event object refuses, as does any present event
+    on any other payload kind (even null or mistyped); an
+    empty tool. suffix refuses no matter what other readable
+    name the record carries. Every tool_name key anywhere in
+    a record counts as a name; a record with no payload, a
+    line that is not a record, and a stream with no records
+    at all each refuse. A turn whose records show no tool use
+    passes with used == [].
+    """
+    if not isinstance(stream, (bytes, bytearray)):
+        return ([], None, None, "no readable stream")
+    used = set()
+    refused_name = None
+    refused_kind = None
+    refused_detail = None
+    records = 0
+    for raw in bytes(stream).split(b"\n"):
+        if not raw.strip():
+            continue
+        try:
+            rec = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            if refused_detail is None:
+                refused_detail = "stream line unparseable"
+            continue
+        if not isinstance(rec, dict):
+            if refused_detail is None:
+                refused_detail = "stream line unparseable"
+            continue
+        records += 1
+        names, null_hit = _walk_tool_names(rec)
+        record_type = rec.get("record_type")
+        if not (isinstance(record_type, str)
+                and record_type in REPAIR_RECORD_TYPES):
+            if refused_kind is None and record_type is not None:
+                refused_kind = record_type
+            if refused_detail is None:
+                if record_type is None:
+                    refused_detail = (
+                        "record with no record type")
+                else:
+                    refused_detail = (
+                        "unknown record type: %s"
+                        % _short_kind(record_type))
+        payload_type = rec.get("payload_type")
+        if not (isinstance(payload_type, str)
+                and payload_type in REPAIR_PAYLOAD_TYPES):
+            if refused_kind is None \
+                    and payload_type is not None:
+                refused_kind = payload_type
+            if refused_detail is None:
+                if payload_type is None:
+                    refused_detail = (
+                        "record with no payload type")
+                else:
+                    refused_detail = (
+                        "unknown payload type: %s"
+                        % _short_kind(payload_type))
+        stream_obj = rec.get("stream")
+        if not isinstance(stream_obj, dict):
+            if refused_detail is None:
+                if "stream" in rec:
+                    refused_detail = (
+                        "record stream is not an object")
+                else:
+                    refused_detail = "record with no stream"
+        else:
+            stream_kind = stream_obj.get("kind")
+            if not (isinstance(stream_kind, str)
+                    and stream_kind in REPAIR_EXEC_STREAM_KINDS):
+                if refused_kind is None \
+                        and stream_kind is not None:
+                    refused_kind = stream_kind
+                if refused_detail is None:
+                    if stream_kind is None:
+                        refused_detail = (
+                            "stream with no kind")
+                    else:
+                        refused_detail = (
+                            "unknown stream kind: %s"
+                            % _short_kind(stream_kind))
+        payload = rec.get("payload")
+        kind = None
+        if not isinstance(payload, dict):
+            if refused_detail is None:
+                refused_detail = "record with no payload"
+            event = None
+        else:
+            if "kind" in payload:
+                kind = payload["kind"]
+            kind_ok = (isinstance(kind, str)
+                       and kind in REPAIR_STREAM_KINDS)
+            if not kind_ok:
+                if kind is not None and refused_kind is None:
+                    refused_kind = kind
+                if refused_detail is None:
+                    if kind is None:
+                        refused_detail = (
+                            "record with no payload kind")
+                    else:
+                        refused_detail = (
+                            "unknown payload kind: %s"
+                            % _short_kind(kind))
+            elif "operation" in payload:
+                # Bare payload operation is unseen (E43b
+                # carries operation only on the event); when
+                # the kind itself failed, that refusal stands
+                # alone instead of cascading here.
+                operation = payload["operation"]
+                if not (isinstance(operation, str)
+                        and operation in REPAIR_OPERATIONS):
+                    if refused_kind is None:
+                        refused_kind = operation
+                    if refused_detail is None:
+                        refused_detail = (
+                            "unknown operation: %s"
+                            % _short_kind(operation))
+            event = payload.get("event")
+        if kind == "task_lifecycle":
+            if not isinstance(event, dict):
+                if refused_detail is None:
+                    refused_detail = (
+                        "task_lifecycle with no event")
+                event = None
+        elif isinstance(payload, dict) and "event" in payload:
+            # Any present event outside lifecycle refuses, even
+            # null or mistyped: only absence passes this leg.
+            if refused_detail is None:
+                refused_detail = (
+                    "unexpected event on %s"
+                    % _short_kind(kind))
+            event = None
+        if isinstance(event, dict):
+            if "kind" in event:
+                event_kind = event["kind"]
+            else:
+                event_kind = None
+            if not (isinstance(event_kind, str)
+                    and event_kind in REPAIR_EVENT_KINDS):
+                if event_kind is not None \
+                        and refused_kind is None:
+                    refused_kind = event_kind
+                if refused_detail is None:
+                    if event_kind is None:
+                        refused_detail = (
+                            "task_lifecycle event with no kind")
+                    else:
+                        refused_detail = (
+                            "unknown event kind: %s"
+                            % _short_kind(event_kind))
+            if "operation" in event:
+                event_operation = event["operation"]
+                if not (isinstance(event_operation, str)
+                        and event_operation in REPAIR_OPERATIONS):
+                    if refused_kind is None:
+                        refused_kind = event_operation
+                    if refused_detail is None:
+                        refused_detail = (
+                            "unknown operation: %s"
+                            % _short_kind(event_operation))
+        stripped = None
+        empty_suffix = False
+        if isinstance(event, dict) and "task_kind" in event:
+            task_kind = event["task_kind"]
+            if isinstance(task_kind, str) \
+                    and task_kind.startswith("tool."):
+                stripped = task_kind[len("tool."):]
+                if stripped:
+                    names.append(stripped)
+                else:
+                    # An empty tool. suffix refuses even when
+                    # the record carries another readable
+                    # name: nothing may borrow past it.
+                    empty_suffix = True
+                    if refused_kind is None:
+                        refused_kind = task_kind
+            elif not isinstance(task_kind, str) \
+                    or task_kind not in \
+                    REPAIR_NON_TOOL_TASK_KINDS:
+                if refused_kind is None:
+                    refused_kind = task_kind
+                if refused_detail is None:
+                    refused_detail = (
+                        "unknown task kind: %s"
+                        % _short_kind(task_kind))
+        examined = (isinstance(payload, dict)
+                    and payload.get("kind") == "tool_result") \
+            or (isinstance(event, dict)
+                and isinstance(event.get("kind"), str)
+                and event["kind"].startswith("tool.")) \
+            or stripped is not None
+        if (null_hit or empty_suffix
+                or (examined and not names)) \
+                and refused_detail is None:
+            refused_detail = ("tool record with no name "
+                              "it can read")
+        for name in names:
+            if name in REPAIR_TOOL_ALLOWLIST:
+                used.add(name)
+            elif refused_name is None:
+                refused_name = name
+                if refused_detail is None:
+                    refused_detail = ("tool outside the repair "
+                                      "allowlist: %s" % name)
+    if records == 0 and refused_detail is None:
+        refused_detail = "stream has no records"
+    return (sorted(used), refused_name, refused_kind,
+            refused_detail)
+
+
+def _prove_exec_attempt(usage: dict, canon: str,
+                        broker_log, stream) -> tuple:
+    """(None, None) when this attempt proves itself, else
+    (error, code).
+
+    A repair attempt is accepted only on its own evidence:
+    contributor applied with the pinned model in its
+    stream (provider_model must equal the pinned id plus
+    "-contributor" exactly, not merely end with it), a
+    meta login credential with no masking in its owned
+    trace, an owned trace with at least one
+    transport=proxy mark and no transport=direct mark,
+    a broker log of nothing but allowed CONNECT
+    tunnels to api.meta.ai:443, and no tool outside
+    REPAIR_TOOL_ALLOWLIST on its own stream. The tool
+    check runs first so usage records repair_tools,
+    refused_tool and refused_kind even when an
+    earlier leg refuses; the tool refusal itself stays
+    last so every code keeps its own tests.
+    endpoint_transport.resolve api_key_present is
+    unexplained and is never evidence either way.
+    """
+    from . import preflight as _preflight
+    used, refused_name, refused_kind, refused_detail = \
+        _check_repair_tools(stream)
+    usage["repair_tools"] = used
+    if refused_detail is not None:
+        usage["refused_tool"] = refused_name
+        usage["refused_kind"] = refused_kind
+    want_model = SOURCE_REPAIR_PROFILE["model"]
+    if usage.get("contributor_applied") is not True \
+            or usage.get("model") != want_model \
+            or usage.get("provider_model") != \
+            want_model + "-contributor":
+        return ("repair attempt unproved: contributor not "
+                "applied with the pinned model (%s)"
+                % want_model,
+                "exec-contributor-unproved")
+    try:
+        cred, cred_reason = \
+            _preflight._read_worker_credential_trace(canon)
+    except Exception as exc:
+        return ("repair attempt unproved: credential read "
+                "failed (%s: %s)"
+                % (type(exc).__name__, exc),
+                "exec-credential-unproved")
+    if cred is None:
+        return ("repair attempt unproved: credential "
+                "unreadable (%s)" % cred_reason,
+                "exec-credential-unproved")
+    if cred.get("source") != "login" \
+            or cred.get("masks_login") != "false":
+        return ("repair attempt unproved: credential is "
+                "not a meta login",
+                "exec-credential-unproved")
+    try:
+        transport, _transport_reason = \
+            _preflight._read_worker_transport_trace(canon)
+    except Exception as exc:
+        return ("repair attempt unproved: transport read "
+                "failed (%s: %s)"
+                % (type(exc).__name__, exc),
+                "exec-transport-unproved")
+    if not isinstance(transport, dict) \
+            or transport.get("proxy", 0) < 1 \
+            or transport.get("direct", 0) > 0:
+        return ("repair attempt unproved: owned trace is "
+                "not all transport=proxy",
+                "exec-transport-unproved")
+    if not isinstance(broker_log, list) or not broker_log:
+        return ("repair attempt unproved: broker recorded "
+                "no tunnel",
+                "exec-broker-unproved")
+    for entry in broker_log:
+        if not isinstance(entry, dict) \
+                or entry.get("decision") != "allowed" \
+                or entry.get("method") != "CONNECT" \
+                or entry.get("target") != "api.meta.ai:443":
+            return ("repair attempt unproved: broker log "
+                    "is not all allowed CONNECT "
+                    "api.meta.ai:443",
+                    "exec-broker-unproved")
+    if refused_detail is not None:
+        return ("repair attempt unproved: %s" % refused_detail,
+                "exec-tool-unproved")
+    return None, None
+
+
 def exec_source_repair(prompt: str, workdir, timeout: int = 600,
                        env=None, cancel_event=None, output_schema=None,
                        trace: bool = False, preflight_home=None,
@@ -817,6 +1322,20 @@ def exec_source_repair(prompt: str, workdir, timeout: int = 600,
     bytes/SHA travel in `usage`; target jobs refuse trace and their
     stderr is counted, never silently kept. `usage` records the
     requested profile, never an observed enforcement.
+
+    After admission and only then, the child runs wrapped in
+    the repair-broker policy (broker text plus exactly the
+    write rule for the one derived worktree) with egress
+    only to an owned loopback CONNECT broker passed via -c
+    endpoint_transport.proxy. The owned root lives under
+    <home>/repair-roots and is recorded in usage as
+    repair_root. The broker stops on every exit path and
+    its final log and stop result travel in `usage`. A zero
+    exit is accepted only when the attempt
+    proves itself (contributor with the pinned model, meta
+    login credential, proxy transport mark, all-allowed
+    broker log); anything unproved returns nonzero with a
+    named exec-*-unproved code and no trusted output.
     """
     from . import preflight as _preflight
     if admission_kind not in ("stage0", "target"):
@@ -919,40 +1438,171 @@ def exec_source_repair(prompt: str, workdir, timeout: int = 600,
     except ValueError as exc:
         return 125, "", {"error": f"refused: {exc}",
                          "tokens_measurable": False, "tokens": None}
+    # Repair containment (slice 298): after admission and only
+    # then, start the owned loopback broker, build the
+    # repair-broker policy in a fresh owned root, and wrap the
+    # child in it. The broker stops on every exit path below,
+    # and its final log and stop result travel in `usage`.
     try:
-        proc = subprocess.Popen(
-            cmd, cwd=str(workdir),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL, env=base,
-            start_new_session=True,
-        )
-    except (FileNotFoundError, OSError) as exc:
-        return 127, "", {"error": f"pinned muse spawn failed: {exc}",
-                         "tokens_measurable": False, "tokens": None}
+        roots_parent = _exec_repair_parent(preflight_home)
+    except MspError as exc:
+        return 125, "", {"error": f"refused: {exc}",
+                         "code": exc.code or "containment",
+                         "tokens_measurable": False,
+                         "tokens": None}
+    from . import mspbroker as _mspbroker_mod
+    broker = None
     try:
-        out_b, err_b, outcome, out_cut, err_cut, joined_ok, \
-            reaped_ok = _communicate_bounded(
-                proc, timeout, cancel_event,
-                _DEDICATED_STREAM_MAX_BYTES)
-    except Exception as exc:
-        # Bounded cleanup on the exception path too: signal the
-        # owned group, best-effort reap, never propagate with a
-        # live child behind us.
-        _kill_owned_group(proc.pid)
         try:
-            proc.wait(timeout=5)
-        except Exception:
-            pass
-        return 1, "", {"error": "worker capture failed "
-                               f"({type(exc).__name__}); owned group "
-                               "signalled, nothing trusted",
-                       "tokens_measurable": False, "tokens": None}
+            broker_cls = _BROKER_CLASS or \
+                _mspbroker_mod.ConnectBroker
+            broker = broker_cls(
+                allow=_mspbroker_mod.DEFAULT_ALLOW)
+            broker_port = broker.start()
+        except Exception as exc:
+            return 125, "", dict(
+                _halt_exec_broker(broker),
+                error="refused: repair broker unavailable: "
+                      f"{exc}",
+                code="containment",
+                tokens_measurable=False, tokens=None)
+        if tuple(getattr(broker, "_allow", ())) != (
+                ("api.meta.ai", 443),):
+            final = _halt_exec_broker(broker)
+            return 125, "", dict(
+                final,
+                error="refused: repair broker allow list "
+                      "drifted from the default",
+                code="containment",
+                tokens_measurable=False, tokens=None)
+        try:
+            canon = os.path.realpath(
+                tempfile.mkdtemp(prefix="msp-repair-",
+                                 dir=roots_parent))
+        except OSError as exc:
+            final = _halt_exec_broker(broker)
+            return 125, "", dict(
+                final,
+                error="refused: repair owned root unavailable: "
+                      f"{exc}",
+                code="containment",
+                tokens_measurable=False, tokens=None)
+        try:
+            owned = _msp_host_env(canon)
+        except MspError as exc:
+            final = _halt_exec_broker(broker)
+            return 125, "", dict(
+                final,
+                error="refused: repair owned env unavailable: "
+                      f"{exc}",
+                code=exc.code or "containment",
+                repair_root=canon,
+                tokens_measurable=False, tokens=None)
+        try:
+            worker_home = pwd.getpwuid(os.getuid()).pw_dir
+        except KeyError as exc:
+            final = _halt_exec_broker(broker)
+            return 125, "", dict(
+                final,
+                error="refused: worker account home "
+                      f"unresolvable: {exc}",
+                code="unreadable",
+                repair_root=canon,
+                tokens_measurable=False, tokens=None)
+        # E41 environment shape on top of the narrowed env:
+        # account HOME and XDG_CONFIG_HOME for login, with
+        # museHome, cache, and TMPDIR owned.
+        base["HOME"] = worker_home
+        base["XDG_CONFIG_HOME"] = os.path.join(
+            worker_home, ".config")
+        base["XDG_DATA_HOME"] = owned["XDG_DATA_HOME"]
+        base["XDG_CACHE_HOME"] = owned["XDG_CACHE_HOME"]
+        base["TMPDIR"] = owned["TMPDIR"]
+        base["OPENMAINTY_HOME"] = owned["OPENMAINTY_HOME"]
+        try:
+            wrapped = _msp_build_wrapper(
+                canon, snap, profile="repair-broker",
+                home=worker_home, broker_port=broker_port,
+                workdir=str(workdir))
+        except MspError as exc:
+            final = _halt_exec_broker(broker)
+            return 125, "", dict(
+                final,
+                error="refused: repair containment "
+                      f"unavailable: {exc}",
+                code=exc.code or "containment",
+                repair_root=canon,
+                tokens_measurable=False, tokens=None)
+        try:
+            anchor = cmd.index("--contributor-mode")
+        except ValueError:
+            final = _halt_exec_broker(broker)
+            return 125, "", dict(
+                final,
+                error="refused: internal error: repair argv "
+                      "lost its contributor anchor",
+                code="containment",
+                repair_root=canon,
+                tokens_measurable=False, tokens=None)
+        proxy_flag = ["-c", 'endpoint_transport.proxy='
+                      '"http://127.0.0.1:%d"' % broker_port]
+        cmd = list(wrapped["argv"]) + cmd[1:anchor + 2] \
+            + proxy_flag + cmd[anchor + 2:]
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=str(workdir),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL, env=base,
+                start_new_session=True,
+            )
+        except (FileNotFoundError, OSError) as exc:
+            final = _halt_exec_broker(broker)
+            return 127, "", dict(
+                final,
+                error=f"pinned muse spawn failed: {exc}",
+                repair_root=canon,
+                tokens_measurable=False, tokens=None)
+        try:
+            out_b, err_b, outcome, out_cut, err_cut, joined_ok, \
+                reaped_ok = _communicate_bounded(
+                    proc, timeout, cancel_event,
+                    _DEDICATED_STREAM_MAX_BYTES)
+        except Exception as exc:
+            # Bounded cleanup on the exception path too: signal the
+            # owned group, best-effort reap, never propagate with a
+            # live child behind us.
+            _kill_owned_group(proc.pid)
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            final = _halt_exec_broker(broker)
+            return 1, "", dict(
+                final,
+                error="worker capture failed "
+                      f"({type(exc).__name__}); owned group "
+                      "signalled, nothing trusted",
+                repair_root=canon,
+                tokens_measurable=False, tokens=None)
+        final = _halt_exec_broker(broker)
+        broker = None
+    finally:
+        # Named paths halt explicitly above; this
+        # covers only the unexpected: an exception
+        # after broker.start() must never leave a
+        # live listener. A second halt is safe
+        # (stop is idempotent, log-after-stop).
+        if broker is not None:
+            _halt_exec_broker(broker)
     bounded = {"stdout_bytes": len(out_b),
                "stderr_bytes": len(err_b),
                "stdout_truncated": out_cut,
                "stderr_truncated": err_cut,
                "readers_joined": joined_ok,
                "child_reaped": reaped_ok,
+               "broker_log": final["broker_log"],
+               "broker_stop": final["broker_stop"],
+               "repair_root": canon,
                "tokens_measurable": False, "tokens": None}
     if outcome == "ok" and not (joined_ok and reaped_ok):
         # The leader exited but capture is incomplete (a descendant
@@ -1002,6 +1652,9 @@ def exec_source_repair(prompt: str, workdir, timeout: int = 600,
     usage["stderr_truncated"] = err_cut
     usage["readers_joined"] = joined_ok
     usage["child_reaped"] = reaped_ok
+    usage["broker_log"] = final["broker_log"]
+    usage["broker_stop"] = final["broker_stop"]
+    usage["repair_root"] = canon
     if trace:
         trace_path = os.path.join(str(workdir), "transport.trace")
         try:
@@ -1019,6 +1672,21 @@ def exec_source_repair(prompt: str, workdir, timeout: int = 600,
                 "path": "", "bytes": len(err_b), "sha256": "",
                 "note": f"trace pin failed: {exc}",
             }
+    if proc.returncode == 0:
+        # Each attempt proves itself before its output is
+        # trusted; anything unproved keeps the output out
+        # with a named refusal code. A nonzero child exit
+        # passes through unchanged (never a trusted result).
+        # The proof reads the raw bounded bytes: the decoded
+        # text form would fail the readable-stream leg and
+        # refuse every real attempt, and re-encoding text
+        # could mask malformed bytes the guard must see.
+        proof_error, proof_code = _prove_exec_attempt(
+            usage, canon, final["broker_log"], out_b)
+        if proof_code is not None:
+            usage["exit_code"] = 1
+            return 1, "", dict(usage, error=proof_error,
+                               code=proof_code)
     return proc.returncode, out, usage
 
 
@@ -1658,6 +2326,82 @@ def parse_msp_usage(result: dict) -> dict:
     }
 
 
+# settings/read returns the OWNER's composed values. Only these
+# keys' values may be observed; everything else is dropped by
+# the parser, never retained, returned, or logged.
+_MSP_SETTINGS_KEYS = (
+    "provider",
+    "model",
+    "reasoning_effort",
+    "contributor_mode_enabled",
+    "contributor_mode_disclosure_acknowledged",
+)
+
+_MSP_SETTING_SAFE_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "abcdefghijklmnopqrstuvwxyz"
+    "0123456789._:/-")
+
+
+def _msp_render_setting(value):
+    """Render one allowlisted setting value for records.
+
+    Booleans, numbers, and null pass through verbatim. Strings
+    pass through only when short, interpolation-free, and drawn
+    from the safe ident charset; anything else keeps only its
+    JSON type name, never its text. Returns (rendered,
+    verbatim_bool).
+    """
+    if value is None or isinstance(value, bool):
+        return value, True
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and (
+                value != value or value in (float("inf"),
+                                            float("-inf"))):
+            return "number", False
+        return value, True
+    if isinstance(value, str):
+        if (1 <= len(value) <= 64 and "${" not in value
+                and all(ch in _MSP_SETTING_SAFE_CHARS
+                        for ch in value)):
+            return value, True
+        return "str", False
+    if isinstance(value, list):
+        return "list", False
+    if isinstance(value, dict):
+        return "dict", False
+    return "unknown", False
+
+
+def parse_msp_settings_read(result: dict) -> dict:
+    """Validate a settings/read result; keep allowlisted keys only.
+
+    Requires a values object (missing/non-object values refuse
+    malformed: an unreadable file must surface as a host error,
+    never as silent absence). Each allowlisted key reports
+    {"served", "value", ["verbatim"]}; absent keys report
+    served False with value "absent". Every other key is
+    dropped entirely.
+    """
+    if not isinstance(result, dict):
+        raise MspError("settings result must be an object",
+                       code="malformed")
+    values = result.get("values")
+    if not isinstance(values, dict):
+        raise MspError("settings values must be an object",
+                       code="malformed")
+    allow = {}
+    for key in _MSP_SETTINGS_KEYS:
+        if key not in values:
+            allow[key] = {"served": False, "value": "absent"}
+            continue
+        rendered, verbatim = _msp_render_setting(values[key])
+        allow[key] = {"served": True, "value": rendered,
+                      "verbatim": verbatim}
+    return {"schemaVersion": result.get("schemaVersion"),
+            "allow": allow}
+
+
 def msp_usage_fresh_after(usage: dict, ack_ms: int) -> bool:
     """Stage-B freshness predicate for a parsed usage record.
 
@@ -1973,7 +2717,8 @@ def _msp_resolve_snapshot(binary):
 
 def _msp_build_wrapper(root: str, snap: dict, *,
                      profile: str = "product",
-                     home=None) -> dict:
+                     home=None, broker_port=None,
+                     workdir=None) -> dict:
     """Build the single native wrapper argv (IO boundary for tests).
 
     The production path creates the ncontain offline policy inside
@@ -1989,11 +2734,22 @@ def _msp_build_wrapper(root: str, snap: dict, *,
     profile "subscription" builds the contained
     subscription-worker policy (product A plus exactly the F2
     named read exception) for the given account home instead;
-    anything else refuses. The default keeps existing callers
-    on the product policy.
+    profile "subscription-canary" builds the canary policy
+    (subscription plus exactly the two E31 network lines);
+    profile "subscription-broker" builds the broker policy
+    (subscription plus exactly the one loopback egress line
+    for broker_port, which is required). Profile
+    "repair-broker" builds the repair policy (broker text
+    plus exactly the write rule for workdir, which is
+    required); only exec_source_repair uses it. anything
+    else refuses. The default keeps existing callers on the
+    product policy.
     """
     from . import ncontain as _ncontain
-    if profile not in ("product", "subscription"):
+    if profile not in ("product", "subscription",
+                       "subscription-canary",
+                       "subscription-broker",
+                       "repair-broker"):
         raise MspError(f"unknown worker profile: {profile!r}",
                        code="bad-input")
     try:
@@ -2008,7 +2764,25 @@ def _msp_build_wrapper(root: str, snap: dict, *,
                "mode": oct(stat.S_IMODE(st.st_mode)),
                "offline_only": True, "admits_worker": False}
     try:
-        if profile == "subscription":
+        if profile == "repair-broker":
+            if broker_port is None:
+                raise MspError("repair profile needs a port",
+                               code="bad-input")
+            if workdir is None:
+                raise MspError("repair profile needs a workdir",
+                               code="bad-input")
+            policy = _ncontain.create_repair_broker_policy(
+                root, exe_pin, home, broker_port, workdir)
+        elif profile == "subscription-broker":
+            if broker_port is None:
+                raise MspError("broker profile needs a port",
+                               code="bad-input")
+            policy = _ncontain.create_subscription_broker_policy(
+                root, exe_pin, home, broker_port)
+        elif profile == "subscription-canary":
+            policy = _ncontain.create_subscription_canary_policy(
+                root, exe_pin, home)
+        elif profile == "subscription":
             policy = _ncontain.create_subscription_worker_policy(
                 root, exe_pin, home)
         else:
@@ -2614,7 +3388,57 @@ _MSP_WORKERS: dict = {}
 
 _MSP_WORKER_METHODS = ("initialize", "account/read", "session/start",
                        "session/read", "hook/list", "model/list",
-                       "usage/read")
+                       "usage/read", "settings/read", "turn/start")
+
+# Turn-stream notifications (pinned schema "notifications"):
+# ledger-only during and after turns. Each records {method,
+# session_id} in the lifecycle ledger plus a per-method count
+# in rec["turn_notification_counts"]; payloads are NEVER
+# retained (streaming deltas would otherwise flood the
+# record). One-line schema reason each:
+# - item/delta: streaming appends to an open item, emitted
+#   throughout any live turn (the E31 breaker).
+# - item/updated: item body updates during a turn.
+# - session/tokenUsage: usage counters during a turn.
+# - session/contextUsage: context counters during a turn.
+# - turn/retryScheduled / turn/modelRetryScheduled: scheduler
+#   notices during a turn.
+# - turn/retracted / turn/unqueued: turn lifecycle outcomes.
+# - session/nameChanged: durable rename record only.
+# - session/viewHealthChanged: view-projection health; the
+#   canary polls raw snapshots, not the view stream.
+# - session/todoListChanged: model working notes only.
+# - recap/completed: recap result metadata; we never request
+#   recaps and keep no payload.
+# Deliberately NOT listed (still fail closed, tested):
+# session/permissionProfileChanged,
+# session/approvalModeChanged, session/branchChanged,
+# session/modelRouteUnserved, session/reasoningEffortChanged
+# (a route-unserved or effort change during the canary must
+# stop it, named), approval/*, admission/*, userInput/*,
+# mcpServer/*, plugin/*, monitor/*, peer/*, skill/*,
+# computerUse*, session/goalChanged, session/leaveCompleted,
+# session/driveChanged, and every other broadcast.
+_MSP_WORKER_TURN_NOTIFICATIONS = frozenset([
+    "item/delta", "item/updated", "session/tokenUsage",
+    "session/contextUsage", "turn/retryScheduled",
+    "turn/modelRetryScheduled", "turn/retracted",
+    "turn/unqueued", "session/nameChanged",
+    "session/viewHealthChanged", "session/todoListChanged",
+    "recap/completed",
+])
+
+# Host-scoped ledger-only notifications: the schema params
+# carry NO sessionId, so no sid requirement. usage/changed
+# carries SubscriptionUsage {observedAtMs, tier, weekly,
+# window} and fires right after a model turn's spend — it
+# is the evidence the canary exists to get, so requiring a
+# session id here would break the host as malformed before
+# usage/read. Ledgered as method + count with session_id
+# None; no payload kept.
+_MSP_WORKER_HOST_NOTIFICATIONS = frozenset([
+    "usage/changed",
+])
 
 _MSP_WORKER_LIFECYCLE_METHODS = ("session/started",
                                  "session/statusChanged",
@@ -2744,12 +3568,32 @@ def _worker_send_request(handle: str, method: str, params: dict,
     Private: closed handles refuse before any wire write; the live
     child/process binding is re-proved on every request; only
     _MSP_WORKER_METHODS with fixed params may be sent. The shared
-    transport contract lives in _msp_exchange.
+    transport contract lives in _msp_exchange. turn/start is
+    structurally single-use: it refuses before any wire write
+    unless the handle's profile is a canary profile, the
+    canary-turn flag is already set (only msp_worker_canary_turn
+    sets it, before its own wire write), and the one-shot wire
+    flag is still unused; the wire flag is set here, at the
+    write, so a second turn/start on any handle refuses.
     """
     rec = _worker_record(handle)
     if rec.get("closed"):
         raise MspError("MSP worker handle is closed",
                        code="unknown-handle")
+    if method == "turn/start":
+        if rec.get("profile") not in _MSP_TURN_PROFILES:
+            raise MspError("turn/start needs a canary "
+                           "profile (subscription-canary or "
+                           "subscription-broker)",
+                           code="canary-profile")
+        if rec.get("worker_canary_turn_sent") is not True:
+            raise MspError("turn/start needs the canary "
+                           "turn flag",
+                           code="canary-not-admitted")
+        if rec.get("worker_canary_wire_used") is True:
+            raise MspError("turn/start already sent on this "
+                           "handle", code="canary-already-sent")
+        rec["worker_canary_wire_used"] = True
     _worker_check_owner(rec)
     return _msp_exchange(rec, method, params, timeout,
                         _MSP_WORKER_METHODS)
@@ -3078,7 +3922,7 @@ def parse_msp_turn_start(result: dict, command_id: str) -> dict:
 def spawn_msp_worker(root: str, binary: Optional[str] = None, *,
                      timeout_s: float = 60,
                      profile: str = "product") -> str:
-    """Spawn an owned OFFLINE worker host and return its handle.
+    """Spawn an owned worker host and return its handle.
 
     Separate registry and lifecycle from the readonly metadata
     factory: the returned handle binds exactly one live process,
@@ -3086,19 +3930,31 @@ def spawn_msp_worker(root: str, binary: Optional[str] = None, *,
     one owned root. Fresh caller-owned SSD homes only (never the
     real user home, keychain, target repos, or network); META_API
     key presence refuses exactly like the readonly path. The host
-    starts offline (deny-all network, owned-root writes only) —
-    this is Phase 1 session-lifecycle capability, NOT model
-    admission: no model turn is authorized by spawning.
+    starts offline (deny-all network, owned-root writes
+    only) on "product" and "subscription" — this is Phase 1
+    session-lifecycle capability, NOT model admission: no model
+    turn is authorized by spawning. The "subscription-canary"
+    profile is narrow-network (see above) and exists only for
+    the single canary turn.
 
     profile "subscription" wraps the child in the contained
     subscription-worker policy instead (product A plus exactly
     the F2 named read exception, gate (2) root301) and points
     the child HOME and XDG_CONFIG_HOME at the real account
-    home; museHome, cache, and TMPDIR stay owned. The default
-    "product" keeps existing behaviour unchanged. Unknown
-    profiles refuse.
+    home; museHome, cache, and TMPDIR stay owned. Profile
+    "subscription-canary" is subscription plus exactly the two
+    E31 network lines (443 out, DNS resolver). Profile
+    "subscription-broker" starts an owned loopback CONNECT
+    broker, allows the child egress only to it, and passes
+    -c endpoint_transport.proxy for its port (E38 shape).
+    The default "product" keeps existing behaviour
+    unchanged. Unknown profiles refuse. A canary turn may
+    use subscription-canary or subscription-broker, under
+    exactly the same gates.
     """
-    if profile not in ("product", "subscription"):
+    if profile not in ("product", "subscription",
+                       "subscription-canary",
+                       "subscription-broker"):
         raise MspError(f"unknown worker profile: {profile!r}",
                        code="bad-input")
     timeout_s = _msp_validate_timeout(timeout_s, "worker spawn")
@@ -3116,32 +3972,85 @@ def spawn_msp_worker(root: str, binary: Optional[str] = None, *,
     env = _msp_host_env(canon)
     worker_home = None
     worker_exceptions = None
-    if profile == "subscription":
-        from . import ncontain as _ncontain
+    worker_broker = None
+    worker_broker_port = None
+    proxy_flag = []
+    if profile == "subscription-broker":
+        from . import mspbroker as _mspbroker_mod
+        broker_cls = _BROKER_CLASS or \
+            _mspbroker_mod.ConnectBroker
         try:
-            worker_home = pwd.getpwuid(os.getuid()).pw_dir
-        except KeyError as exc:
-            raise MspError("worker account home unresolvable: "
-                           f"{exc}", code="unreadable") from exc
-        try:
-            worker_exceptions = \
-                _ncontain.subscription_worker_exceptions(
-                    worker_home)
-        except _ncontain.ContainmentError as exc:
-            raise MspError(f"worker profile unavailable: {exc}",
+            worker_broker = broker_cls()
+            worker_broker_port = worker_broker.start()
+        except Exception as exc:
+            raise MspError(f"worker broker failed to start: "
+                           f"{exc}",
                            code="containment") from exc
-        env["HOME"] = worker_home
-        env["XDG_CONFIG_HOME"] = os.path.join(
-            worker_home, ".config")
-        wrapped = _msp_build_wrapper(
-            canon, snap, profile="subscription",
-            home=worker_home)
-    else:
-        wrapped = _msp_build_wrapper(canon, snap)
-    cmd = list(wrapped["argv"]) + ["serve"] + build_host_cmd()[2:]
+        proxy_flag = [
+            "-c", 'endpoint_transport.proxy='
+                  '"http://127.0.0.1:%d"' % worker_broker_port]
+    try:
+        if profile in ("subscription", "subscription-canary",
+                       "subscription-broker"):
+            from . import ncontain as _ncontain
+            try:
+                worker_home = pwd.getpwuid(os.getuid()).pw_dir
+            except KeyError as exc:
+                raise MspError(
+                    "worker account home unresolvable: "
+                    f"{exc}", code="unreadable") from exc
+            try:
+                if profile == "subscription-canary":
+                    worker_exceptions = \
+                        _ncontain.subscription_canary_exceptions(
+                            worker_home)
+                else:
+                    worker_exceptions = \
+                        _ncontain.subscription_worker_exceptions(
+                            worker_home)
+                    if profile == "subscription-broker":
+                        worker_exceptions = list(
+                            worker_exceptions) + [{
+                                "path":
+                                    "(allow network-outbound "
+                                    "(remote tcp "
+                                    '"localhost:%d"))'
+                                    % worker_broker_port,
+                                "kind": "network",
+                                "reason":
+                                    "loopback egress to the "
+                                    "owned CONNECT broker "
+                                    "(E38)"}]
+            except _ncontain.ContainmentError as exc:
+                raise MspError(
+                    f"worker profile unavailable: {exc}",
+                    code="containment") from exc
+            env["HOME"] = worker_home
+            env["XDG_CONFIG_HOME"] = os.path.join(
+                worker_home, ".config")
+            wrapped = _msp_build_wrapper(
+                canon, snap, profile=profile,
+                home=worker_home,
+                broker_port=worker_broker_port)
+        else:
+            wrapped = _msp_build_wrapper(canon, snap)
+    except Exception:
+        if worker_broker is not None:
+            try:
+                worker_broker.stop()
+            except Exception:
+                pass
+        raise
+    cmd = list(wrapped["argv"]) + ["serve"] + proxy_flag \
+        + build_host_cmd()[2:]
     try:
         proc = _msp_spawn_process(cmd, env, canon)
     except (OSError, ValueError, TypeError) as exc:
+        if worker_broker is not None:
+            try:
+                worker_broker.stop()
+            except Exception:
+                pass
         raise MspError(f"worker host failed to spawn: {exc}",
                        code="transport") from exc
     handle = _msp_handle()
@@ -3161,6 +4070,11 @@ def spawn_msp_worker(root: str, binary: Optional[str] = None, *,
             proc.wait(timeout=10)
         except Exception:
             pass
+        if worker_broker is not None:
+            try:
+                worker_broker.stop()
+            except Exception:
+                pass
         raise MspError("worker root vanished during spawn: "
                        f"{exc}", code="unreadable") from exc
     import secrets
@@ -3194,6 +4108,8 @@ def spawn_msp_worker(root: str, binary: Optional[str] = None, *,
         "profile": profile,
         "worker_home": worker_home,
         "worker_profile_exceptions": worker_exceptions,
+        "worker_broker": worker_broker,
+        "worker_broker_port": worker_broker_port,
     }
     _MSP_WORKERS[handle] = rec
     out_t = threading.Thread(target=_msp_stdout_reader, args=(rec,),
@@ -3258,6 +4174,442 @@ def _worker_lifecycle_shape_ok(method: str, params: dict) -> bool:
     return True
 
 
+def _ledger_turn_notification(rec: dict, method: str,
+                              params) -> None:
+    """Ledger one turn-stream notification; keep no payload.
+
+    Listed methods only (callers check membership). Requires
+    a string sessionId and, when a session is bound, an id
+    match — anything else breaks fail-closed exactly like the
+    session lifecycle path. Otherwise appends {method,
+    session_id} to the capped lifecycle ledger and bumps the
+    uncapped per-method turn_notification_counts. _msp_break
+    runs only after releasing break_lock (non-reentrant).
+    """
+    if rec.get("broken"):
+        return
+    sid = _worker_lifecycle_session_id(method, params)
+    if sid is None:
+        rec["broken_method"] = method
+        _msp_break(rec, "malformed")
+        return
+    action = None
+    with rec["break_lock"]:
+        bound = rec.get("worker_session")
+        bound_id = (bound.get("id")
+                    if isinstance(bound, dict) else None)
+        if bound_id is not None and sid != bound_id:
+            action = "session-mismatch"
+        else:
+            counts = rec.get("turn_notification_counts")
+            if not isinstance(counts, dict):
+                counts = rec["turn_notification_counts"] = {}
+            counts[method] = counts.get(method, 0) + 1
+            ledger = rec.get("lifecycle")
+            if not isinstance(ledger, list):
+                ledger = rec["lifecycle"] = []
+            ledger.append({"method": method,
+                           "session_id": sid})
+            del ledger[:-_MSP_WORKER_LIFECYCLE_MAX]
+            _canary_watch_update_locked(rec, method, params)
+    if action is not None:
+        rec["broken_method"] = method
+        _msp_break(rec, action)
+
+
+def _ledger_host_notification(rec: dict, method: str) -> None:
+    """Ledger one host-scoped notification; keep no payload.
+
+    Listed methods only (callers check membership). No
+    session id exists in the schema params, so none is
+    required: appends {method, session_id None} to the
+    capped lifecycle ledger and bumps the uncapped
+    per-method turn_notification_counts.
+    """
+    if rec.get("broken"):
+        return
+    with rec["break_lock"]:
+        counts = rec.get("turn_notification_counts")
+        if not isinstance(counts, dict):
+            counts = rec["turn_notification_counts"] = {}
+        counts[method] = counts.get(method, 0) + 1
+        ledger = rec.get("lifecycle")
+        if not isinstance(ledger, list):
+            ledger = rec["lifecycle"] = []
+        ledger.append({"method": method, "session_id": None})
+        del ledger[:-_MSP_WORKER_LIFECYCLE_MAX]
+
+
+_MSP_CANARY_WATCH_MAX_ITEMS = 4096
+_MSP_CANARY_WATCH_MAX_RETRIES = 64
+_MSP_CANARY_WATCH_MAX_REMINDERS = 64
+_MSP_CANARY_WATCH_MAX_FOREGROUND = 16
+_MSP_CANARY_WATCH_SLEEP_S = 0.2
+
+
+_MSP_TURN_PROFILES = ("subscription-canary",
+                      "subscription-broker")
+"""Profiles a canary turn may use: the narrow-network
+canary and the brokered profile (slice 296), which joins
+exactly the same gates (admission, one-shot wire flag,
+pinned prompt, watch arming)."""
+
+_BROKER_CLASS = None
+"""ConnectBroker class for broker spawns; tests patch this
+seam to observe broker lifecycle. Resolved lazily so the
+broker module loads only for broker spawns."""
+
+
+def _canary_watch_armed(rec: dict) -> bool:
+    """True only on a canary handle past the turn flag."""
+    return (rec.get("profile") in _MSP_TURN_PROFILES
+            and rec.get("worker_canary_turn_sent") is True)
+
+
+def _canary_watch_new() -> dict:
+    return {"item_kinds": [], "items_capped": False,
+            "tool_hit": None, "text": "", "text_bytes": 0,
+            "text_truncated": False, "token_counts": {},
+            "model_id": None, "finish_reason": None,
+            "retries": [], "retries_capped": False,
+            "completion": None, "reminders": [],
+            "reminders_capped": False,
+            "foreground_seen": False,
+            "foreground_completed": []}
+
+
+def _canary_watch_snapshot(watch: dict) -> dict:
+    """Fresh copy of a watch for the canary return."""
+    if not isinstance(watch, dict):
+        watch = _canary_watch_new()
+    completion = watch.get("completion")
+    tool_hit = watch.get("tool_hit")
+    if isinstance(completion, dict):
+        completion_out = {
+            "terminal": completion.get("terminal"),
+            "turn_id": completion.get("turn_id"),
+            "error": (dict(completion.get("error"))
+                      if isinstance(completion.get("error"),
+                                    dict) else None),
+            "reason": completion.get("reason")}
+        for key in ("request_denied", "quota", "duration_ms",
+                    "ttft_ms", "usage_input", "usage_output"):
+            if key in completion:
+                value = completion[key]
+                completion_out[key] = (
+                    dict(value)
+                    if isinstance(value, dict) else value)
+    else:
+        completion_out = None
+    return {
+        "item_kinds": list(watch.get("item_kinds") or []),
+        "items_capped": watch.get("items_capped") is True,
+        "tool_hit": (dict(tool_hit)
+                     if isinstance(tool_hit, dict) else None),
+        "text": watch.get("text") or "",
+        "text_bytes": watch.get("text_bytes") or 0,
+        "text_truncated": watch.get("text_truncated") is True,
+        "token_counts": dict(watch.get("token_counts") or {}),
+        "model_id": watch.get("model_id"),
+        "finish_reason": watch.get("finish_reason"),
+        "retries": [dict(entry)
+                    for entry in watch.get("retries") or []],
+        "retries_capped": watch.get("retries_capped") is True,
+        "completion": completion_out,
+        "reminders": [dict(entry)
+                      for entry in watch.get("reminders")
+                      or []],
+        "reminders_capped": watch.get("reminders_capped")
+        is True,
+        "foreground_seen": watch.get("foreground_seen")
+        is True,
+        "foreground_completed": list(
+            watch.get("foreground_completed") or []),
+    }
+
+
+def _canary_watch_append_text(watch: dict, text) -> None:
+    if not isinstance(text, str) or not text:
+        return
+    if watch["text_truncated"]:
+        return
+    data = text.encode("utf-8")
+    room = _MSP_CANARY_TEXT_MAX - watch["text_bytes"]
+    if len(data) > room:
+        data = data[:max(room, 0)]
+        watch["text_truncated"] = True
+    watch["text"] += data.decode("utf-8", "ignore")
+    watch["text_bytes"] = len(watch["text"].encode("utf-8"))
+    if watch["text_bytes"] >= _MSP_CANARY_TEXT_MAX:
+        watch["text_truncated"] = True
+
+
+def _canary_watch_tokens(watch: dict, params: dict) -> None:
+    """Fold session/tokenUsage counts + verbatim modelId."""
+    usage = params.get("usage")
+    counts = {}
+    if isinstance(usage, dict):
+        for key, out in (("inputTokens", "input"),
+                          ("outputTokens", "output")):
+            value = usage.get(key)
+            if isinstance(value, int) \
+                    and not isinstance(value, bool):
+                counts[out] = value
+    for key, out in (("promptTokens", "prompt"),
+                     ("totalTokens", "total")):
+        value = params.get(key)
+        if isinstance(value, int) \
+                and not isinstance(value, bool):
+            counts[out] = value
+    if counts:
+        watch["token_counts"] = counts
+    model = params.get("modelId")
+    if isinstance(model, str) and model:
+        watch["model_id"] = model[:256]
+    finish = params.get("finishReason")
+    if isinstance(finish, str) and finish:
+        watch["finish_reason"] = finish[:80]
+
+
+def _canary_watch_retry(watch: dict, method: str,
+                        params: dict) -> None:
+    """Fold one retry schedule (reason only where schemad)."""
+    if len(watch["retries"]) >= _MSP_CANARY_WATCH_MAX_RETRIES:
+        watch["retries_capped"] = True
+        return
+    entry = {"method": method}
+    for key, out in (("attempt", "attempt"),
+                     ("maxAttempts", "max_attempts"),
+                     ("retryDelayMs", "retry_delay_ms")):
+        value = params.get(key)
+        if isinstance(value, int) \
+                and not isinstance(value, bool):
+            entry[out] = value
+    nxt = params.get("nextAttempt")
+    if isinstance(nxt, int) and not isinstance(nxt, bool):
+        entry["next_attempt"] = nxt
+    elif isinstance(nxt, str):
+        entry["next_attempt"] = nxt[:64]
+    if method == "turn/retryScheduled":
+        reason = params.get("reason")
+        if isinstance(reason, str):
+            entry["reason"] = reason[:200]
+    # Failure cause, both retry methods (E32 ended with one
+    # modelRetryScheduled and no cause).
+    error_kind = params.get("errorKind")
+    if isinstance(error_kind, str) and error_kind:
+        entry["error_kind"] = error_kind[:80]
+    http_status = params.get("httpStatus")
+    if isinstance(http_status, int) \
+            and not isinstance(http_status, bool):
+        entry["http_status"] = http_status
+    system = params.get("system")
+    if isinstance(system, str) and system:
+        entry["system"] = system[:80]
+    watch["retries"].append(entry)
+
+
+def _canary_watch_completion(watch: dict, params: dict) -> None:
+    """Fold turn/completed (TurnError: kind/message/retryable).
+
+    The schema's TurnError has NO code member, so none is
+    recorded. request_denied is written only when exactly
+    True; quota only when a dict with valid members;
+    duration/ttft/usage members only when ints (bools are
+    not ints). Latest completion wins; the waiter matches
+    turn_id against the ack.
+    """
+    error = params.get("error")
+    out_err = None
+    if isinstance(error, dict):
+        kind = error.get("kind")
+        message = error.get("message")
+        retryable = error.get("retryable")
+        out_err = {
+            "kind": (kind[:80]
+                     if isinstance(kind, str) else None),
+            "message": (message[:500]
+                        if isinstance(message, str)
+                        else None),
+            "retryable": (retryable
+                          if isinstance(retryable, bool)
+                          else None),
+        }
+    terminal = params.get("terminal")
+    turn_id = params.get("turnId")
+    reason = params.get("reason")
+    folded = {
+        "terminal": (terminal
+                     if isinstance(terminal, str)
+                     else "non-string-terminal"),
+        "turn_id": (turn_id
+                    if isinstance(turn_id, str) else None),
+        "error": out_err,
+        "reason": (reason[:500]
+                   if isinstance(reason, str) else None),
+    }
+    if isinstance(error, dict):
+        if error.get("requestDenied") is True:
+            folded["request_denied"] = True
+        quota = error.get("quota")
+        if isinstance(quota, dict):
+            folded_quota = {}
+            limit_kind = quota.get("limitKind")
+            if isinstance(limit_kind, str) and limit_kind:
+                folded_quota["limit_kind"] = limit_kind[:80]
+            resets_at = quota.get("resetsAtMs")
+            if isinstance(resets_at, int) \
+                    and not isinstance(resets_at, bool):
+                folded_quota["resets_at_ms"] = resets_at
+            if folded_quota:
+                folded["quota"] = folded_quota
+    duration = params.get("durationMs")
+    if isinstance(duration, int) \
+            and not isinstance(duration, bool):
+        folded["duration_ms"] = duration
+    ttft = params.get("timeToFirstTokenMs")
+    if isinstance(ttft, int) and not isinstance(ttft, bool):
+        folded["ttft_ms"] = ttft
+    aggregate = params.get("usage")
+    if isinstance(aggregate, dict):
+        usage_in = aggregate.get("inputTokens")
+        if isinstance(usage_in, int) \
+                and not isinstance(usage_in, bool):
+            folded["usage_input"] = usage_in
+        usage_out = aggregate.get("outputTokens")
+        if isinstance(usage_out, int) \
+                and not isinstance(usage_out, bool):
+            folded["usage_output"] = usage_out
+    watch["completion"] = folded
+
+
+def _canary_watch_reminder(watch: dict, method: str,
+                             item: dict) -> None:
+    """Fold one observed reminderChild item's ids (E33 kind).
+
+    Schema $defs/Item reminderChild members: only the
+    agent, generation, task and child-session ids plus
+    blocking and status are kept. Text,
+    modelVisibleContent, result and the child log path are
+    NEVER retained. blocking is written only when exactly
+    True (the schema never sends False); generationId is
+    an integer per the schema, with a capped string
+    tolerated.
+    """
+    if len(watch["reminders"]) >= _MSP_CANARY_WATCH_MAX_REMINDERS:
+        watch["reminders_capped"] = True
+        return
+    entry = {"method": method}
+    agent = item.get("reminderAgentId")
+    if isinstance(agent, str) and agent:
+        entry["reminder_agent_id"] = agent[:80]
+    gen = item.get("generationId")
+    if isinstance(gen, int) and not isinstance(gen, bool):
+        entry["generation_id"] = gen
+    elif isinstance(gen, str) and gen:
+        entry["generation_id"] = gen[:80]
+    task = item.get("taskId")
+    if isinstance(task, str) and task:
+        entry["task_id"] = task[:80]
+    child = item.get("childSessionId")
+    if isinstance(child, str) and child:
+        entry["child_session_id"] = child[:80]
+    if item.get("blocking") is True:
+        entry["blocking"] = True
+    status = item.get("status")
+    if isinstance(status, str) and status:
+        entry["status"] = status[:40]
+    watch["reminders"].append(entry)
+
+
+def _canary_watch_foreground(watch: dict,
+                             params: dict) -> None:
+    """Fold turn/foregroundCompleted: explicitly non-terminal.
+
+    Schema TurnForegroundCompletedParams: foreground work
+    is done and named background reminder checks hold the
+    turn open; the turn ends only at turn/completed or
+    turn/unqueued. Only agent ids are kept (max 16,
+    capped); the wait in msp_worker_canary_turn never
+    ends on this method.
+    """
+    agents = params.get("blockingAgents")
+    kept = []
+    if isinstance(agents, list):
+        for agent in agents:
+            if len(kept) >= _MSP_CANARY_WATCH_MAX_FOREGROUND:
+                break
+            if isinstance(agent, str) and agent:
+                kept.append(agent[:80])
+    watch["foreground_seen"] = True
+    watch["foreground_completed"] = kept
+
+
+def _canary_watch_update_locked(rec: dict, method: str,
+                                params) -> None:
+    """Fold one validated notification into rec["canary_watch"].
+
+    Caller holds break_lock and has validated the frame
+    through the normal ledger path. No-op unless the handle
+    is armed (subscription-canary profile + turn flag set),
+    so every other profile keeps today's no-payload
+    behaviour. Only the watched members below are retained.
+    """
+    if not _canary_watch_armed(rec):
+        return
+    if not isinstance(params, dict):
+        return
+    if method in ("item/started", "item/completed"):
+        watch = rec.get("canary_watch")
+        if not isinstance(watch, dict):
+            watch = rec["canary_watch"] = _canary_watch_new()
+        kinds = watch["item_kinds"]
+        if len(kinds) >= _MSP_CANARY_WATCH_MAX_ITEMS:
+            watch["items_capped"] = True
+            return
+        item = params.get("item")
+        flagged, shown, name = _canary_flag_item(item)
+        if flagged:
+            kinds.append(shown)
+        else:
+            kinds.append(item.get("kind"))
+        if flagged and watch["tool_hit"] is None:
+            watch["tool_hit"] = {"index": len(kinds) - 1,
+                                 "kind": shown, "name": name}
+        kind = (item.get("kind")
+                if isinstance(item, dict) else None)
+        if isinstance(kind, str) \
+                and kind in _MSP_CANARY_OBSERVED_KINDS:
+            _canary_watch_reminder(watch, method, item)
+        if method == "item/completed" \
+                and isinstance(item, dict) \
+                and item.get("kind") == "agentMessage":
+            _canary_watch_append_text(watch, item.get("text"))
+    elif method == "session/tokenUsage":
+        watch = rec.get("canary_watch")
+        if not isinstance(watch, dict):
+            watch = rec["canary_watch"] = _canary_watch_new()
+        _canary_watch_tokens(watch, params)
+    elif method in ("turn/retryScheduled",
+                    "turn/modelRetryScheduled"):
+        watch = rec.get("canary_watch")
+        if not isinstance(watch, dict):
+            watch = rec["canary_watch"] = _canary_watch_new()
+        _canary_watch_retry(watch, method, params)
+    elif method == "turn/completed":
+        watch = rec.get("canary_watch")
+        if not isinstance(watch, dict):
+            watch = rec["canary_watch"] = _canary_watch_new()
+        _canary_watch_completion(watch, params)
+    elif method == "turn/foregroundCompleted":
+        # Ledgered through the normal lifecycle path (the
+        # method is listed); folded here, never terminal.
+        watch = rec.get("canary_watch")
+        if not isinstance(watch, dict):
+            watch = rec["canary_watch"] = _canary_watch_new()
+        _canary_watch_foreground(watch, params)
+
+
 def _dispatch_worker_inbox(rec: dict, raw: bytes) -> None:
     """Bounded typed lifecycle handling for worker handles.
 
@@ -3265,12 +4617,23 @@ def _dispatch_worker_inbox(rec: dict, raw: bytes) -> None:
     session/turn/item/view-gap broadcasts arrive: they are
     validated, checked against the bound session, and ledgered
     (method + session id only, cap 64, no payload retention)
-    instead of breaking the host. account/changed breaks like the
-    readonly path; a durable model change under us breaks with
-    model-changed rather than continuing on a changed model;
-    unknown methods, unknown shapes, foreign session ids, and
-    closed-session drift break fail-closed. Response-shaped
-    frames reuse the exact readonly response validation.
+    instead of breaking the host. Documented turn-stream
+    methods (_MSP_WORKER_TURN_NOTIFICATIONS) are ledger-only
+    the same way, plus an uncapped per-method count.
+    Host-scoped methods (_MSP_WORKER_HOST_NOTIFICATIONS)
+    ledger with session_id None and no sid requirement.
+    Validated frames also fold watched members into
+    rec["canary_watch"], but ONLY on an armed handle
+    (subscription-canary profile + turn flag set); every
+    other profile keeps no payload.
+    account/changed breaks like the readonly path; a durable
+    model change under us breaks with model-changed rather
+    than continuing on a changed model; unknown methods,
+    unknown shapes, foreign session ids, and closed-session
+    drift break fail-closed, and every notification break
+    records the exact method on rec["broken_method"].
+    Response-shaped frames reuse the exact readonly response
+    validation.
     """
     if rec.get("broken"):
         return
@@ -3287,7 +4650,17 @@ def _dispatch_worker_inbox(rec: dict, raw: bytes) -> None:
     if method == "account/changed":
         _msp_break(rec, "account-changed")
         return
+    if method in _MSP_WORKER_HOST_NOTIFICATIONS:
+        _ledger_host_notification(rec, method)
+        return
+    if method in _MSP_WORKER_TURN_NOTIFICATIONS:
+        _ledger_turn_notification(rec, method, obj.get("params"))
+        return
     if method not in _MSP_WORKER_LIFECYCLE_METHODS:
+        if isinstance(method, str):
+            rec["broken_method"] = method
+        else:
+            rec["broken_method"] = repr(method)
         _msp_break(rec, "server-notification")
         return
     params = obj.get("params")
@@ -3358,7 +4731,13 @@ def _dispatch_worker_inbox(rec: dict, raw: bytes) -> None:
                 ledger = rec["lifecycle"] = []
             ledger.append({"method": method, "session_id": sid})
             del ledger[:-_MSP_WORKER_LIFECYCLE_MAX]
+            _canary_watch_update_locked(rec, method, params)
     if action is not None:
+        if action == "session-mismatch":
+            # A foreign or child session id stays
+            # fail-closed, and names its method so the next
+            # failure (E34) is diagnosable.
+            rec["broken_method"] = method
         _msp_break(rec, action)
 
 
@@ -3614,6 +4993,7 @@ def msp_worker_session_start(handle: str, *, workspace_root: str,
                 rec, bound, params["workspaceRoot"])
             rec["worker_session"] = bound
             rec["worker_session_closed"] = False
+            rec["worker_session_pid"] = rec["child_pid"]
     except MspError:
         # Any start attempt/failure after the pre-wire checks is
         # non-rebindable on this handle: the host may hold a
@@ -3782,6 +5162,104 @@ def msp_worker_usage(handle: str, *,
     return parsed
 
 
+def _worker_evaluate_config(rec: dict, parsed: dict) -> None:
+    """Establish (or refuse) the observer-backed config identity.
+
+    The ONLY place that may set rec["config_established"]: the
+    flag goes True only when the parsed settings/read ran on
+    the same alive child pid as the bound session, after
+    bootstrap, and served provider "meta" verbatim,
+    contributor_mode_enabled True verbatim, and model equal to
+    the session-bound model id. Then rec["config_identity"] =
+    {pid, sha256 of the canonical allowlisted JSON, provider,
+    model, contributor}. Any other case deletes both and
+    records a precise rec["config_unset_reason"] instead — a
+    mismatch also revokes a prior establishment, since the
+    served config drifted. Pure state transition; no I/O.
+    """
+    bound = rec.get("worker_session")
+    if not isinstance(bound, dict) or not bound.get("id"):
+        reason = "no-session: no bound session on this handle"
+    elif rec.get("child_pid") != rec.get("worker_session_pid"):
+        reason = ("pid-changed: settings served by pid %r, "
+                  "session bound on pid %r"
+                  % (rec.get("child_pid"),
+                     rec.get("worker_session_pid")))
+    else:
+        allow = parsed["allow"]
+        provider = allow["provider"]
+        contributor = allow["contributor_mode_enabled"]
+        model = allow["model"]
+        if not provider["served"] or not provider["verbatim"] \
+                or provider["value"] != "meta":
+            reason = "provider-mismatch: served %r" % (
+                provider["value"],)
+        elif not contributor["served"] \
+                or contributor["value"] is not True:
+            reason = "contributor-not-enabled: served %r" % (
+                contributor["value"],)
+        elif not model["served"] or not model["verbatim"] \
+                or model["value"] != bound.get("model_id"):
+            reason = "model-mismatch: served %r, bound %r" % (
+                model["value"], bound.get("model_id"))
+        else:
+            reason = None
+    if reason is not None:
+        rec.pop("config_established", None)
+        rec.pop("config_identity", None)
+        rec["config_unset_reason"] = reason
+        return
+    canon = json.dumps(parsed["allow"], sort_keys=True,
+                       separators=(",", ":"))
+    rec["config_established"] = True
+    rec["config_identity"] = {
+        "pid": rec["child_pid"],
+        "sha256": hashlib.sha256(
+            canon.encode("utf-8")).hexdigest(),
+        "provider": "meta",
+        "model": bound.get("model_id"),
+        "contributor": True}
+    rec.pop("config_unset_reason", None)
+
+
+def msp_worker_settings_read(handle: str, *,
+                             timeout: float = 30.0) -> dict:
+    """Query settings/read: the host's served config, read-only.
+
+    Host-level (no session needed): sends exactly
+    "settings/read" with {} params. Anything starting with
+    "settings/write" is not a transport method and refuses
+    with bad-method before any wire write. The parser keeps
+    ONLY the allowlisted keys; every other served value is
+    dropped, never returned or recorded. Afterwards the
+    observer-backed config identity is evaluated (see
+    _worker_evaluate_config): a refused or errored query
+    records a precise unset reason and sets nothing. Takes no
+    caller argument for establishment — the served values
+    alone decide.
+    """
+    rec = _worker_record(handle)
+    if rec.get("closed"):
+        raise MspError("MSP worker handle is closed",
+                       code="unknown-handle")
+    if not rec.get("worker_bootstrapped"):
+        raise MspError("worker host is not bootstrapped",
+                       code="not-bootstrapped")
+    timeout = _msp_validate_timeout(timeout, "worker settings")
+    try:
+        result = _worker_send_request(handle, "settings/read",
+                                      {}, timeout)
+        parsed = parse_msp_settings_read(result)
+    except MspError as exc:
+        rec.pop("config_established", None)
+        rec.pop("config_identity", None)
+        rec["config_unset_reason"] = "settings-error:%s" % (
+            exc.code,)
+        raise
+    _worker_evaluate_config(rec, parsed)
+    return parsed
+
+
 def canary_admission(handle: str) -> dict:
     """Stage-A verdict: admit ONE bounded canary turn, never authority.
 
@@ -3789,14 +5267,14 @@ def canary_admission(handle: str) -> dict:
     credential lane, recorded hook count, recorded usage, config
     flag, and the single-use consumption flag. worker_hook_count
     and worker_usage are populated only by real hook/list and
-    usage/read runs, so those legs clear honestly; production
-    NEVER sets config_established in this slice, so production
-    always refuses on config-unestablished. OPEN: the criterion
-    that would establish config (an observer-backed config
-    identity bound to the same alive host) is not designed yet;
-    nothing here may set the flag by hand. On the single
-    admitting combination the consumption flag is set: a second
-    call refuses with canary-already-consumed. Full admission is
+    usage/read runs, so those legs clear honestly; config_ok
+    reads rec["config_established"], which ONLY
+    msp_worker_settings_read may set (same alive child pid as
+    the bound session, provider "meta", contributor enabled,
+    model matching — see _worker_evaluate_config). Nothing
+    here may set the flag by hand. On the single admitting
+    combination the consumption flag is set: a second call
+    refuses with canary-already-consumed. Full admission is
     never granted here (see msp_worker_capability, still hard
     False).
     """
@@ -3851,8 +5329,11 @@ def msp_worker_capability(handle: str) -> dict:
     a Meta-ready native profile (no offline deny-all policy is
     model-network admission), and contributor/config proof
     (requested flags are not observed enforcement). Session
-    binding is reported, never authority. No caller-supplied
-    verified bool or auth dict can change this verdict.
+    binding is reported, never authority. The contributor_config
+    member reports the observed config identity when
+    msp_worker_settings_read established one on this handle
+    (observed False otherwise). No caller-supplied verified
+    bool or auth dict can change this verdict.
     """
     rec = _worker_record(handle)
     if rec.get("closed"):
@@ -3871,8 +5352,20 @@ def msp_worker_capability(handle: str) -> dict:
     missing.append("metaready-native-profile: unproved (the "
                    "offline deny-all wrapper is session-lifecycle "
                    "capability only, not model-network admission)")
-    missing.append("contributor-config: unproved (requested CLI "
-                   "flags only; effective config unobserved)")
+    ident = rec.get("config_identity")
+    if rec.get("config_established") is True and isinstance(
+            ident, dict):
+        contributor_config = {
+            "observed": True,
+            "provider": ident.get("provider"),
+            "model": ident.get("model"),
+            "pid": ident.get("pid"),
+            "sha256": ident.get("sha256")}
+    else:
+        missing.append("contributor-config: unproved (requested "
+                       "CLI flags only; effective config "
+                       "unobserved)")
+        contributor_config = {"observed": False}
     bound = rec.get("worker_session")
     session_bound = isinstance(bound, dict) and bool(bound.get("id"))
     return {"admitted": False,
@@ -3880,6 +5373,7 @@ def msp_worker_capability(handle: str) -> dict:
             "credential_note": note,
             "session_bound": session_bound,
             "session_status": (bound or {}).get("status"),
+            "contributor_config": contributor_config,
             "missing": missing}
 
 
@@ -3913,6 +5407,230 @@ def msp_worker_turn(handle: str, prompt: str, *,
                    code="capability-unproved")
 
 
+# The canary turn prompt, pinned bytes (E31 shape, pfid
+# "canary"). The single canary turn takes NO prompt argument:
+# this constant is the only prompt it can ever send.
+_MSP_CANARY_PROMPT = (
+    "Owned capability probe (no target data): reply with one "
+    "JSON line {\"probe\": \"preflight\", \"pfid\": "
+    "\"canary\"}. Do not read, write, or describe any "
+    "repository.")
+
+# History-item kinds that may appear during the canary turn.
+# Anything else (tool kinds, unknown, missing, non-string)
+# stops the turn as tool-attempted.
+_MSP_CANARY_MESSAGE_KINDS = frozenset(
+    ["userMessage", "agentMessage", "reasoning"])
+
+# Observed-but-not-message kinds: E33 stopped at item index
+# 1 on reminderChild, a child record for a reminder agent
+# (schema $defs/Item: reminderAgentId, generationId,
+# taskId, childSessionId, blocking holds the turn open).
+# Observed kinds append to item_kinds and fold bounded id
+# metadata without setting tool_hit and without stopping
+# the canary. An observed kind NEVER counts as an agent
+# answer: only agentMessage completes the turn.
+_MSP_CANARY_OBSERVED_KINDS = frozenset(["reminderChild"])
+
+_MSP_CANARY_TEXT_MAX = 4096
+
+
+def _canary_flag_item(item):
+    """(flagged, kind, name) for one raw history item.
+
+    Allowlist: only _MSP_CANARY_MESSAGE_KINDS pass, plus
+    _MSP_CANARY_OBSERVED_KINDS (observed: folded, never
+    flagged). Reads ONLY the "kind" field; the name lookup
+    is metadata for the record, from the schema's per-kind
+    members (tool, commandText, query, url, label, callId).
+    Truncated strings only, never payloads.
+    """
+    if not isinstance(item, dict):
+        return True, "non-dict-item", None
+    kind = item.get("kind")
+    if isinstance(kind, str) and kind in _MSP_CANARY_MESSAGE_KINDS:
+        return False, None, None
+    if isinstance(kind, str) \
+            and kind in _MSP_CANARY_OBSERVED_KINDS:
+        return False, None, None
+    name = None
+    for key in ("tool", "commandText", "query", "url",
+                "label", "callId"):
+        value = item.get(key)
+        if isinstance(value, str) and value:
+            name = value[:80]
+            break
+    if isinstance(kind, str):
+        shown = kind[:80]
+    elif kind is None:
+        shown = "missing-kind"
+    else:
+        shown = "non-string-kind"
+    return True, shown, name
+
+
+def msp_worker_canary_turn(handle: str, *,
+                           timeout: float = 300) -> dict:
+    """Send the single canary turn and watch it to completion.
+
+    Gates (MspError, no wire write): the handle's profile must
+    be a canary profile (canary-profile); a canary
+    admission must already have been consumed on THIS handle
+    by canary_admission (canary-not-admitted); no canary turn
+    may have been sent yet (canary-already-sent; the flag is
+    set BEFORE the wire write, and the transport sets a
+    one-shot wire flag at the write). A bound session is
+    required.
+
+    Sends exactly one turn/start with required params only
+    (commandId + sessionId + one text input carrying the
+    pinned _MSP_CANARY_PROMPT — there is NO prompt argument),
+    validates the ack, then waits on rec["canary_watch"]
+    with NO further wire traffic: the live host refused
+    session/read with -32601 in E32, so polling is gone and
+    the dispatcher folds watched notification members while
+    the handle is armed. The completion must match the
+    ack's turn id. Every watched item passes the ALLOWLIST
+    control: only userMessage/agentMessage/reasoning, plus
+    the OBSERVED kinds (reminderChild: folded id metadata,
+    never an agent answer); the first other item records
+    kind + name only, closes the handle, and returns stop
+    "tool-attempted" without any usage call.
+    turn/foregroundCompleted is explicitly non-terminal per
+    the schema: it folds its blocking agent ids and never
+    ends the wait.
+
+    Stops, no retry anywhere: "tool-attempted" (closes);
+    "completed" (terminal completed + agentMessage seen;
+    left open for usage/read); "completed-no-message"
+    (terminal completed, no agentMessage; left open, said
+    so); "failed" (terminal failed/cancelled/unknown;
+    closes, with the error fields); "error" (closes; host
+    broken or transport/ack failure, with broken_method and
+    the watch so far); "timeout" (closes, with the watch so
+    far). Default timeout is 300 s: retry chains need room.
+
+    Returns {"stop", "ack", "ack_ms", "completion_seen"}
+    plus the watch fields {"item_kinds", "items_capped",
+    "text", "text_bytes", "text_truncated", "token_counts",
+    "model_id", "finish_reason", "retries", "retries_capped",
+    "completion", "tool_hit", "reminders",
+    "reminders_capped", "foreground_seen",
+    "foreground_completed"} and {"ledger_counts", "error"}.
+    Retry entries carry error_kind/http_status/system;
+    completion carries request_denied/quota/duration_ms/
+    ttft_ms/usage_input/usage_output when served.
+    On a closing stop the return additionally carries
+    {"broker_log", "broker_stop"} from the close, but only
+    on a broker handle (non-broker handles omit both).
+    msp_worker_turn keeps refusing and capability stays
+    admitted False regardless of this function's outcome.
+    """
+    rec = _worker_record(handle)
+    if rec.get("closed"):
+        raise MspError("MSP worker handle is closed",
+                       code="unknown-handle")
+    if rec.get("profile") not in _MSP_TURN_PROFILES:
+        raise MspError("canary turn needs a canary "
+                       "profile (subscription-canary or "
+                       "subscription-broker)",
+                       code="canary-profile")
+    if rec.get("worker_canary_consumed") is not True:
+        raise MspError("canary turn needs a prior canary "
+                       "admission on this handle",
+                       code="canary-not-admitted")
+    if rec.get("worker_canary_turn_sent") is True:
+        raise MspError("canary turn already sent on this "
+                       "handle", code="canary-already-sent")
+    bound = rec.get("worker_session")
+    if not isinstance(bound, dict) or not bound.get("id"):
+        raise MspError("canary turn needs a bound session",
+                       code="session-unbound")
+    timeout = _msp_validate_timeout(timeout, "canary turn")
+    out = {"stop": None, "ack": None, "ack_ms": None,
+           "completion_seen": False, "ledger_counts": {},
+           "error": None}
+    out.update(_canary_watch_snapshot(None))
+
+    def _shut(stop, error=None):
+        out["stop"] = stop
+        out["error"] = error
+        out["ledger_counts"] = dict(
+            rec.get("turn_notification_counts") or {})
+        try:
+            closed = msp_worker_close(
+                handle, reason="canary-" + stop)
+        except MspError as close_exc:
+            if out["error"] is None:
+                out["error"] = {"code": close_exc.code,
+                                "message": str(close_exc)}
+        else:
+            # A failed brokered turn is the case we most need
+            # to read: keep the final broker evidence. Only
+            # broker handles carry these keys, so every other
+            # profile keeps today's return shape.
+            if "broker_log" in closed:
+                out["broker_log"] = closed["broker_log"]
+            if "broker_stop" in closed:
+                out["broker_stop"] = closed["broker_stop"]
+        return out
+
+    command_id = _msp_new_command_id()
+    params = {"commandId": command_id,
+              "sessionId": bound["id"],
+              "input": [{"type": "text",
+                         "text": _MSP_CANARY_PROMPT}]}
+    rec["worker_canary_turn_sent"] = True
+    try:
+        ack_raw = _worker_send_request(handle, "turn/start",
+                                       params, timeout)
+    except MspError as exc:
+        return _shut("error", {"code": exc.code,
+                               "message": str(exc)})
+    try:
+        ack = parse_msp_turn_start(ack_raw, command_id)
+    except MspError as exc:
+        return _shut("error", {"code": exc.code,
+                               "message": str(exc)})
+    out["ack"] = {"turn_id": ack["turn_id"],
+                  "disposition": ack["disposition"],
+                  "status": ack["status"],
+                  "started_new_turn":
+                      ack["started_new_turn"]}
+    out["ack_ms"] = int(time.time() * 1000)
+    deadline = time.monotonic() + timeout
+    while True:
+        with rec["break_lock"]:
+            snap = _canary_watch_snapshot(
+                rec.get("canary_watch"))
+            broken = rec.get("broken")
+            broken_method = rec.get("broken_method")
+        out.update(snap)
+        if snap["tool_hit"] is not None:
+            return _shut("tool-attempted")
+        completion = snap["completion"] or {}
+        if completion.get("turn_id") == ack["turn_id"]:
+            out["completion_seen"] = True
+            out["ledger_counts"] = dict(
+                rec.get("turn_notification_counts") or {})
+            if completion.get("terminal") == "completed":
+                if "agentMessage" in snap["item_kinds"]:
+                    out["stop"] = "completed"
+                else:
+                    out["stop"] = "completed-no-message"
+                return out
+            return _shut("failed")
+        if broken is not None:
+            return _shut("error", {"code": broken,
+                                   "broken_method":
+                                       broken_method})
+        if time.monotonic() >= deadline:
+            return _shut("timeout")
+        rest = deadline - time.monotonic()
+        if rest > 0:
+            time.sleep(min(_MSP_CANARY_WATCH_SLEEP_S, rest))
+
+
 def msp_worker_close(handle: str, reason: str = "done") -> dict:
     """Close stdin (EOF), drain both streams, reap the owned child.
 
@@ -3928,9 +5646,22 @@ def msp_worker_close(handle: str, reason: str = "done") -> dict:
     check gates cleanup itself. When even the original binding
     cannot be proved (foreign process, corrupt ref), cleanup
     refuses with the owner-check code after a signal-free
-    release, never entering kill/reap.
+    release, never entering kill/reap. On a broker handle the
+    broker is stopped first (no tunnel outlives the handle)
+    and the return value additionally carries "broker_log"
+    (the final metadata log, read after stop() joined) and
+    "broker_stop" (its stop result); non-broker handles keep
+    today's return shape.
     """
     rec = _worker_record(handle)
+    broker = rec.get("worker_broker")
+    broker_stop = None
+    if broker is not None:
+        try:
+            broker_stop = broker.stop()
+        except Exception:
+            broker_stop = {"joined": 0,
+                           "alive": ["stop-raised"]}
     try:
         try:
             _worker_check_owner(rec)
@@ -3960,10 +5691,40 @@ def msp_worker_close(handle: str, reason: str = "done") -> dict:
                                f"cleanup: {exc.code}",
                                code=exc.code) from exc
             rec["proc"] = ref
-        return _msp_close_rec(rec, reason)
+        closed = _msp_close_rec(rec, reason)
+        if broker is not None:
+            try:
+                closed["broker_log"] = broker.log()
+            except Exception:
+                closed["broker_log"] = []
+            closed["broker_stop"] = broker_stop
+        return closed
     finally:
         rec["closed"] = True
         _MSP_WORKERS.pop(handle, None)
+
+
+def msp_worker_broker_log(handle: str) -> list:
+    """Return a copy of the owned broker's metadata log.
+
+    Read-only: the returned list is a deep copy, so callers
+    (experiments) cannot alter broker state. Only broker
+    handles carry a broker; anything else refuses with
+    bad-input. Call it before msp_worker_close: closing
+    stops the broker and invalidates the handle. Entries
+    carry method/target/decision/byte counts/times/header
+    names only — never header values or tunnel bytes.
+    """
+    rec = _worker_record(handle)
+    if rec.get("closed"):
+        raise MspError("MSP worker handle is closed",
+                       code="unknown-handle")
+    broker = rec.get("worker_broker")
+    if broker is None:
+        raise MspError("broker log needs a "
+                       "subscription-broker handle",
+                       code="bad-input")
+    return broker.log()
 
 
 def _worker_close_no_signal(rec: dict) -> None:
