@@ -778,6 +778,149 @@ def _communicate_bounded(proc, timeout, cancel_event, max_bytes):
             out_cut[0], err_cut[0], joined_ok, reaped_ok)
 
 
+def _halt_exec_broker(broker) -> dict:
+    """Stop a repair broker; always return its final record.
+
+    Returns {"broker_log", "broker_stop"}. Stop runs FIRST
+    and the log is read after: an open tunnel's entry
+    completes only when its handler finishes, so a log
+    read before the stop would show at_close None and
+    zero bytes for the very evidence this exists to
+    collect. Safe on None (never started) and on broker
+    errors: the record says what happened instead of
+    raising.
+    """
+    if broker is None:
+        return {"broker_log": [],
+                "broker_stop": {"stopped": False,
+                                "reason": "not-started"}}
+    try:
+        stop = broker.stop()
+    except Exception as exc:
+        stop = {"stopped": False, "error": "%s" % exc}
+    try:
+        log = broker.log()
+    except Exception:
+        log = []
+    if not isinstance(log, list):
+        log = []
+    if not isinstance(stop, dict):
+        stop = {"stopped": False,
+                "reason": "bad-stop-shape"}
+    return {"broker_log": log, "broker_stop": stop}
+
+
+def _exec_repair_parent(preflight_home) -> str:
+    """<canonical home>/repair-roots, created owned, or MspError.
+
+    Each repair attempt's owned root lives here (never in
+    the system temp dir, which the OS cleaner reaps), so
+    the owned trace stays reviewable after the run. The
+    home is resolved first (production's home is a
+    symlink); the parent is created 0700 and then held to
+    the existing owned-dir discipline. Still no rmtree:
+    roots accumulate until the operator removes them.
+    """
+    from . import ncontain as _ncontain
+    if not isinstance(preflight_home, str) \
+            or not preflight_home:
+        raise MspError("repair needs an app home for its "
+                       "owned root", code="bad-input")
+    try:
+        parent = os.path.join(
+            os.path.realpath(preflight_home), "repair-roots")
+    except OSError as exc:
+        raise MspError("repair app home unresolvable: %s"
+                       % exc, code="unreadable") from exc
+    try:
+        os.mkdir(parent, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise MspError("repair roots unavailable: %s" % exc,
+                       code="unreadable") from exc
+    try:
+        _ncontain._check_owned_dir(parent)
+    except _ncontain.ContainmentError as exc:
+        raise MspError("repair roots refused: %s" % exc,
+                       code="containment") from exc
+    return parent
+
+
+def _prove_exec_attempt(usage: dict, canon: str,
+                        broker_log) -> tuple:
+    """(None, None) when this attempt proves itself, else
+    (error, code).
+
+    A repair attempt is accepted only on its own evidence:
+    contributor applied with the pinned model in its
+    stream (provider_model must equal the pinned id plus
+    "-contributor" exactly, not merely end with it), a
+    meta login credential with no masking in its owned
+    trace, an owned trace with at least one
+    transport=proxy mark and no transport=direct mark,
+    and a broker log of nothing but allowed CONNECT
+    tunnels to api.meta.ai:443.
+    endpoint_transport.resolve api_key_present is
+    unexplained and is never evidence either way.
+    """
+    from . import preflight as _preflight
+    want_model = SOURCE_REPAIR_PROFILE["model"]
+    if usage.get("contributor_applied") is not True \
+            or usage.get("model") != want_model \
+            or usage.get("provider_model") != \
+            want_model + "-contributor":
+        return ("repair attempt unproved: contributor not "
+                "applied with the pinned model (%s)"
+                % want_model,
+                "exec-contributor-unproved")
+    try:
+        cred, cred_reason = \
+            _preflight._read_worker_credential_trace(canon)
+    except Exception as exc:
+        return ("repair attempt unproved: credential read "
+                "failed (%s: %s)"
+                % (type(exc).__name__, exc),
+                "exec-credential-unproved")
+    if cred is None:
+        return ("repair attempt unproved: credential "
+                "unreadable (%s)" % cred_reason,
+                "exec-credential-unproved")
+    if cred.get("source") != "login" \
+            or cred.get("masks_login") != "false":
+        return ("repair attempt unproved: credential is "
+                "not a meta login",
+                "exec-credential-unproved")
+    try:
+        transport, _transport_reason = \
+            _preflight._read_worker_transport_trace(canon)
+    except Exception as exc:
+        return ("repair attempt unproved: transport read "
+                "failed (%s: %s)"
+                % (type(exc).__name__, exc),
+                "exec-transport-unproved")
+    if not isinstance(transport, dict) \
+            or transport.get("proxy", 0) < 1 \
+            or transport.get("direct", 0) > 0:
+        return ("repair attempt unproved: owned trace is "
+                "not all transport=proxy",
+                "exec-transport-unproved")
+    if not isinstance(broker_log, list) or not broker_log:
+        return ("repair attempt unproved: broker recorded "
+                "no tunnel",
+                "exec-broker-unproved")
+    for entry in broker_log:
+        if not isinstance(entry, dict) \
+                or entry.get("decision") != "allowed" \
+                or entry.get("method") != "CONNECT" \
+                or entry.get("target") != "api.meta.ai:443":
+            return ("repair attempt unproved: broker log "
+                    "is not all allowed CONNECT "
+                    "api.meta.ai:443",
+                    "exec-broker-unproved")
+    return None, None
+
+
 def exec_source_repair(prompt: str, workdir, timeout: int = 600,
                        env=None, cancel_event=None, output_schema=None,
                        trace: bool = False, preflight_home=None,
@@ -817,6 +960,20 @@ def exec_source_repair(prompt: str, workdir, timeout: int = 600,
     bytes/SHA travel in `usage`; target jobs refuse trace and their
     stderr is counted, never silently kept. `usage` records the
     requested profile, never an observed enforcement.
+
+    After admission and only then, the child runs wrapped in
+    the repair-broker policy (broker text plus exactly the
+    write rule for the one derived worktree) with egress
+    only to an owned loopback CONNECT broker passed via -c
+    endpoint_transport.proxy. The owned root lives under
+    <home>/repair-roots and is recorded in usage as
+    repair_root. The broker stops on every exit path and
+    its final log and stop result travel in `usage`. A zero
+    exit is accepted only when the attempt
+    proves itself (contributor with the pinned model, meta
+    login credential, proxy transport mark, all-allowed
+    broker log); anything unproved returns nonzero with a
+    named exec-*-unproved code and no trusted output.
     """
     from . import preflight as _preflight
     if admission_kind not in ("stage0", "target"):
@@ -919,40 +1076,171 @@ def exec_source_repair(prompt: str, workdir, timeout: int = 600,
     except ValueError as exc:
         return 125, "", {"error": f"refused: {exc}",
                          "tokens_measurable": False, "tokens": None}
+    # Repair containment (slice 298): after admission and only
+    # then, start the owned loopback broker, build the
+    # repair-broker policy in a fresh owned root, and wrap the
+    # child in it. The broker stops on every exit path below,
+    # and its final log and stop result travel in `usage`.
     try:
-        proc = subprocess.Popen(
-            cmd, cwd=str(workdir),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL, env=base,
-            start_new_session=True,
-        )
-    except (FileNotFoundError, OSError) as exc:
-        return 127, "", {"error": f"pinned muse spawn failed: {exc}",
-                         "tokens_measurable": False, "tokens": None}
+        roots_parent = _exec_repair_parent(preflight_home)
+    except MspError as exc:
+        return 125, "", {"error": f"refused: {exc}",
+                         "code": exc.code or "containment",
+                         "tokens_measurable": False,
+                         "tokens": None}
+    from . import mspbroker as _mspbroker_mod
+    broker = None
     try:
-        out_b, err_b, outcome, out_cut, err_cut, joined_ok, \
-            reaped_ok = _communicate_bounded(
-                proc, timeout, cancel_event,
-                _DEDICATED_STREAM_MAX_BYTES)
-    except Exception as exc:
-        # Bounded cleanup on the exception path too: signal the
-        # owned group, best-effort reap, never propagate with a
-        # live child behind us.
-        _kill_owned_group(proc.pid)
         try:
-            proc.wait(timeout=5)
-        except Exception:
-            pass
-        return 1, "", {"error": "worker capture failed "
-                               f"({type(exc).__name__}); owned group "
-                               "signalled, nothing trusted",
-                       "tokens_measurable": False, "tokens": None}
+            broker_cls = _BROKER_CLASS or \
+                _mspbroker_mod.ConnectBroker
+            broker = broker_cls(
+                allow=_mspbroker_mod.DEFAULT_ALLOW)
+            broker_port = broker.start()
+        except Exception as exc:
+            return 125, "", dict(
+                _halt_exec_broker(broker),
+                error="refused: repair broker unavailable: "
+                      f"{exc}",
+                code="containment",
+                tokens_measurable=False, tokens=None)
+        if tuple(getattr(broker, "_allow", ())) != (
+                ("api.meta.ai", 443),):
+            final = _halt_exec_broker(broker)
+            return 125, "", dict(
+                final,
+                error="refused: repair broker allow list "
+                      "drifted from the default",
+                code="containment",
+                tokens_measurable=False, tokens=None)
+        try:
+            canon = os.path.realpath(
+                tempfile.mkdtemp(prefix="msp-repair-",
+                                 dir=roots_parent))
+        except OSError as exc:
+            final = _halt_exec_broker(broker)
+            return 125, "", dict(
+                final,
+                error="refused: repair owned root unavailable: "
+                      f"{exc}",
+                code="containment",
+                tokens_measurable=False, tokens=None)
+        try:
+            owned = _msp_host_env(canon)
+        except MspError as exc:
+            final = _halt_exec_broker(broker)
+            return 125, "", dict(
+                final,
+                error="refused: repair owned env unavailable: "
+                      f"{exc}",
+                code=exc.code or "containment",
+                repair_root=canon,
+                tokens_measurable=False, tokens=None)
+        try:
+            worker_home = pwd.getpwuid(os.getuid()).pw_dir
+        except KeyError as exc:
+            final = _halt_exec_broker(broker)
+            return 125, "", dict(
+                final,
+                error="refused: worker account home "
+                      f"unresolvable: {exc}",
+                code="unreadable",
+                repair_root=canon,
+                tokens_measurable=False, tokens=None)
+        # E41 environment shape on top of the narrowed env:
+        # account HOME and XDG_CONFIG_HOME for login, with
+        # museHome, cache, and TMPDIR owned.
+        base["HOME"] = worker_home
+        base["XDG_CONFIG_HOME"] = os.path.join(
+            worker_home, ".config")
+        base["XDG_DATA_HOME"] = owned["XDG_DATA_HOME"]
+        base["XDG_CACHE_HOME"] = owned["XDG_CACHE_HOME"]
+        base["TMPDIR"] = owned["TMPDIR"]
+        base["OPENMAINTY_HOME"] = owned["OPENMAINTY_HOME"]
+        try:
+            wrapped = _msp_build_wrapper(
+                canon, snap, profile="repair-broker",
+                home=worker_home, broker_port=broker_port,
+                workdir=str(workdir))
+        except MspError as exc:
+            final = _halt_exec_broker(broker)
+            return 125, "", dict(
+                final,
+                error="refused: repair containment "
+                      f"unavailable: {exc}",
+                code=exc.code or "containment",
+                repair_root=canon,
+                tokens_measurable=False, tokens=None)
+        try:
+            anchor = cmd.index("--contributor-mode")
+        except ValueError:
+            final = _halt_exec_broker(broker)
+            return 125, "", dict(
+                final,
+                error="refused: internal error: repair argv "
+                      "lost its contributor anchor",
+                code="containment",
+                repair_root=canon,
+                tokens_measurable=False, tokens=None)
+        proxy_flag = ["-c", 'endpoint_transport.proxy='
+                      '"http://127.0.0.1:%d"' % broker_port]
+        cmd = list(wrapped["argv"]) + cmd[1:anchor + 2] \
+            + proxy_flag + cmd[anchor + 2:]
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=str(workdir),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL, env=base,
+                start_new_session=True,
+            )
+        except (FileNotFoundError, OSError) as exc:
+            final = _halt_exec_broker(broker)
+            return 127, "", dict(
+                final,
+                error=f"pinned muse spawn failed: {exc}",
+                repair_root=canon,
+                tokens_measurable=False, tokens=None)
+        try:
+            out_b, err_b, outcome, out_cut, err_cut, joined_ok, \
+                reaped_ok = _communicate_bounded(
+                    proc, timeout, cancel_event,
+                    _DEDICATED_STREAM_MAX_BYTES)
+        except Exception as exc:
+            # Bounded cleanup on the exception path too: signal the
+            # owned group, best-effort reap, never propagate with a
+            # live child behind us.
+            _kill_owned_group(proc.pid)
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            final = _halt_exec_broker(broker)
+            return 1, "", dict(
+                final,
+                error="worker capture failed "
+                      f"({type(exc).__name__}); owned group "
+                      "signalled, nothing trusted",
+                repair_root=canon,
+                tokens_measurable=False, tokens=None)
+        final = _halt_exec_broker(broker)
+        broker = None
+    finally:
+        # Named paths halt explicitly above; this
+        # covers only the unexpected: an exception
+        # after broker.start() must never leave a
+        # live listener. A second halt is safe
+        # (stop is idempotent, log-after-stop).
+        if broker is not None:
+            _halt_exec_broker(broker)
     bounded = {"stdout_bytes": len(out_b),
                "stderr_bytes": len(err_b),
                "stdout_truncated": out_cut,
                "stderr_truncated": err_cut,
                "readers_joined": joined_ok,
                "child_reaped": reaped_ok,
+               "broker_log": final["broker_log"],
+               "broker_stop": final["broker_stop"],
+               "repair_root": canon,
                "tokens_measurable": False, "tokens": None}
     if outcome == "ok" and not (joined_ok and reaped_ok):
         # The leader exited but capture is incomplete (a descendant
@@ -1002,6 +1290,9 @@ def exec_source_repair(prompt: str, workdir, timeout: int = 600,
     usage["stderr_truncated"] = err_cut
     usage["readers_joined"] = joined_ok
     usage["child_reaped"] = reaped_ok
+    usage["broker_log"] = final["broker_log"]
+    usage["broker_stop"] = final["broker_stop"]
+    usage["repair_root"] = canon
     if trace:
         trace_path = os.path.join(str(workdir), "transport.trace")
         try:
@@ -1019,6 +1310,17 @@ def exec_source_repair(prompt: str, workdir, timeout: int = 600,
                 "path": "", "bytes": len(err_b), "sha256": "",
                 "note": f"trace pin failed: {exc}",
             }
+    if proc.returncode == 0:
+        # Each attempt proves itself before its output is
+        # trusted; anything unproved keeps the output out
+        # with a named refusal code. A nonzero child exit
+        # passes through unchanged (never a trusted result).
+        proof_error, proof_code = _prove_exec_attempt(
+            usage, canon, final["broker_log"])
+        if proof_code is not None:
+            usage["exit_code"] = 1
+            return 1, "", dict(usage, error=proof_error,
+                               code=proof_code)
     return proc.returncode, out, usage
 
 
@@ -2049,7 +2351,8 @@ def _msp_resolve_snapshot(binary):
 
 def _msp_build_wrapper(root: str, snap: dict, *,
                      profile: str = "product",
-                     home=None, broker_port=None) -> dict:
+                     home=None, broker_port=None,
+                     workdir=None) -> dict:
     """Build the single native wrapper argv (IO boundary for tests).
 
     The production path creates the ncontain offline policy inside
@@ -2069,14 +2372,18 @@ def _msp_build_wrapper(root: str, snap: dict, *,
     (subscription plus exactly the two E31 network lines);
     profile "subscription-broker" builds the broker policy
     (subscription plus exactly the one loopback egress line
-    for broker_port, which is required). anything else
-    refuses. The default keeps existing callers on the
+    for broker_port, which is required). Profile
+    "repair-broker" builds the repair policy (broker text
+    plus exactly the write rule for workdir, which is
+    required); only exec_source_repair uses it. anything
+    else refuses. The default keeps existing callers on the
     product policy.
     """
     from . import ncontain as _ncontain
     if profile not in ("product", "subscription",
                        "subscription-canary",
-                       "subscription-broker"):
+                       "subscription-broker",
+                       "repair-broker"):
         raise MspError(f"unknown worker profile: {profile!r}",
                        code="bad-input")
     try:
@@ -2091,7 +2398,16 @@ def _msp_build_wrapper(root: str, snap: dict, *,
                "mode": oct(stat.S_IMODE(st.st_mode)),
                "offline_only": True, "admits_worker": False}
     try:
-        if profile == "subscription-broker":
+        if profile == "repair-broker":
+            if broker_port is None:
+                raise MspError("repair profile needs a port",
+                               code="bad-input")
+            if workdir is None:
+                raise MspError("repair profile needs a workdir",
+                               code="bad-input")
+            policy = _ncontain.create_repair_broker_policy(
+                root, exe_pin, home, broker_port, workdir)
+        elif profile == "subscription-broker":
             if broker_port is None:
                 raise MspError("broker profile needs a port",
                                code="bad-input")

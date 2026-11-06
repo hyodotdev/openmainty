@@ -718,6 +718,62 @@ def _prove_broker_plus(text: str, sub: str, hole: str) -> None:
             "broker proof: 443 line forbidden")
 
 
+def _check_repair_workdir(workdir, home_real: str) -> str:
+    """Canonical validated repair worktree path, or ContainmentError.
+
+    The derived worktree for one operation only: it must be an
+    existing directory, canonical (realpath equal to the passed
+    path, so no symlink in any component can redirect it
+    outside what the caller passed), never the filesystem
+    root or the account home, and must neither contain nor
+    sit inside the account's ~/.muse, ~/.config/muse or
+    ~/.local/share/muse. Returns the validated path.
+    """
+    if not isinstance(workdir, str) or not workdir:
+        raise ContainmentError("repair workdir must be a path")
+    if "\x00" in workdir:
+        raise ContainmentError("NUL byte in repair workdir")
+    if not os.path.isabs(workdir):
+        raise ContainmentError(
+            "repair workdir must be absolute")
+    try:
+        real = os.path.realpath(workdir)
+    except OSError as exc:
+        raise ContainmentError(
+            "repair workdir unresolvable: %s" % exc)
+    if real != workdir:
+        raise ContainmentError(
+            "repair workdir resolves outside the passed "
+            "path (symlink?): %s" % workdir)
+    try:
+        st = os.lstat(real)
+    except OSError as exc:
+        raise ContainmentError(
+            "repair workdir unavailable: %s" % exc)
+    if not _stat.S_ISDIR(st.st_mode):
+        raise ContainmentError(
+            "repair workdir is not a directory")
+    if real == "/":
+        raise ContainmentError(
+            "repair workdir must not be the filesystem root")
+    if real == home_real:
+        raise ContainmentError(
+            "repair workdir must not be the account home")
+    for leaf in (".muse", ".config/muse",
+                 ".local/share/muse"):
+        guarded = os.path.join(home_real, leaf)
+        if real == guarded or real.startswith(
+                guarded + os.sep):
+            raise ContainmentError(
+                "repair workdir must not sit inside %s"
+                % guarded)
+        if guarded.startswith(real + os.sep):
+            raise ContainmentError(
+                "repair workdir must not contain %s"
+                % guarded)
+    return real
+
+
 def _check_broker_port(port) -> int:
     if isinstance(port, bool) or not isinstance(port, int):
         raise ContainmentError(
@@ -757,6 +813,81 @@ def build_subscription_broker_policy_text(root: str,
             '"localhost:%d"))' % port)
     text = sub + hole + "\n"
     _prove_broker_plus(text, sub, hole)
+    return text
+
+
+def _prove_repair_plus(text: str, sub: str,
+                       extra_lines) -> None:
+    """Prove text is the broker text plus exactly the repair
+    lines — removal style. Each line must be absent from the
+    broker text and present exactly once, appended at the
+    end in order; "(deny network*)" must be kept; "*:443"
+    must be absent; everything else must be identical.
+    """
+    extra_lines = list(extra_lines)
+    if not extra_lines or len(extra_lines) > 2:
+        raise ContainmentError(
+            "repair proof: one or two lines, got %d"
+            % len(extra_lines))
+    for line in extra_lines:
+        if line in sub:
+            raise ContainmentError(
+                "repair proof: line already present")
+    tlines = text.splitlines()
+    slines = sub.splitlines()
+    if tlines != slines + extra_lines:
+        raise ContainmentError("repair proof: extra diff")
+    for line in extra_lines:
+        if tlines.count(line) != 1:
+            raise ContainmentError(
+                "repair proof: line not unique")
+    if "(deny network*)" not in sub:
+        raise ContainmentError(
+            "repair proof: network deny lost")
+    if "*:443" in text:
+        raise ContainmentError(
+            "repair proof: 443 line forbidden")
+
+
+def build_repair_broker_policy_text(root: str,
+                                    exe_path: str,
+                                    home,
+                                    port: int,
+                                    workdir) -> str:
+    """Repair profile: broker text plus exactly the write rule
+    for one derived worktree (gate (2), slice 298).
+
+    The write rule is always added; the read rule only when
+    the base text does not already allow the workdir (i.e.
+    it sits outside the owned root). Both are appended at
+    the END (SBPL last-match-wins) with (deny network*)
+    kept. No other path becomes writable. Proven by
+    removal; anything else raises ContainmentError. The
+    "subscription", "subscription-canary" and
+    "subscription-broker" texts are untouched by this
+    builder.
+    """
+    sub = build_subscription_broker_policy_text(
+        root, exe_path, home, port)
+    home_real = os.path.realpath(
+        _resolve_worker_home(home))
+    work = _check_repair_workdir(workdir, home_real)
+    if not sub.endswith("\n"):
+        raise ContainmentError(
+            "repair proof: base text shape")
+    write_line = ('(allow file-write* (subpath %s))'
+                  % _sb_literal(work))
+    real_root = os.path.realpath(root)
+    if work == real_root or work.startswith(
+            real_root + os.sep):
+        extra = [write_line]
+    else:
+        extra = [write_line,
+                 '(allow file-read* (subpath %s))'
+                 % _sb_literal(work)]
+    text = sub + "".join(
+        ln + "\n" for ln in extra)
+    _prove_repair_plus(text, sub, extra)
     return text
 
 
@@ -1010,6 +1141,64 @@ def create_subscription_broker_policy(root: str, exe_pin: dict,
             "network": "loopback broker only "
                        "(broker, not Meta-ready)",
             "profile": "broker",
+            "offline_only": False, "admits_worker": False}
+
+
+def create_repair_broker_policy(root: str, exe_pin: dict,
+                                home, port: int,
+                                workdir) -> dict:
+    """Write the repair-broker policy into the owned root.
+
+    Same write discipline as
+    create_subscription_broker_policy (re-pinned
+    executable, validated owned root, exclusive create,
+    post-write identity recheck), but the text is
+    build_repair_broker_policy_text: broker text plus
+    exactly the write rule for one derived worktree (and
+    the read rule only when the base text does not
+    already allow it). admits_worker stays False: each
+    repair attempt proves itself in muse.py instead.
+    """
+    _require_darwin()
+    if not isinstance(exe_pin, dict):
+        raise ContainmentError("valid executable pin required")
+    if exe_pin.get("admits_worker"):
+        raise ContainmentError(
+            "a worker-admitting pin is never valid here")
+    fresh_pin = _repinned(exe_pin)
+    st = _check_owned_dir(root)
+    text = build_repair_broker_policy_text(
+        root, fresh_pin["path"], home, port, workdir)
+    raw = text.encode("utf-8")
+    if len(raw) > _MAX_POLICY_BYTES:
+        raise ContainmentError("policy too large")
+    policy_path = os.path.join(root, POLICY_NAME)
+    if os.path.lexists(policy_path):
+        raise ContainmentError(
+            "policy already exists; refusing to overwrite")
+    fd = os.open(policy_path,
+                 os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        if os.write(fd, raw) != len(raw):
+            raise ContainmentError("short write of policy")
+    finally:
+        os.close(fd)
+    digest, pst = _read_identity(policy_path,
+                                _MAX_POLICY_BYTES)
+    if digest != hashlib.sha256(raw).hexdigest():
+        raise ContainmentError("policy changed after write")
+    return {"policy_path": policy_path,
+            "policy_sha256": digest,
+            "policy_size": pst.st_size,
+            "policy_dev": pst.st_dev,
+            "policy_ino": pst.st_ino,
+            "root": root, "root_dev": st.st_dev,
+            "root_ino": st.st_ino,
+            "executable": fresh_pin,
+            "sandbox_exec": SANDBOX_EXEC,
+            "network": "loopback broker only "
+                       "(repair, not Meta-ready)",
+            "profile": "repair-broker",
             "offline_only": False, "admits_worker": False}
 
 

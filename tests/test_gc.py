@@ -3,6 +3,7 @@
 Offline fixture home. Every reclaimable entry is regenerable; receipts,
 logs, diffs, ops, batches and events are never listed. Py3.9 portable.
 """
+import ast
 import json
 import os
 import shutil
@@ -22,6 +23,51 @@ except ImportError:  # discover top-level mode: tests/ is on sys.path
     from _home import use_temp_home  # noqa: E402
 
 HAVE_GIT = shutil.which("git") is not None
+
+
+def _system_tmp_prefixes(source, path="<src>"):
+    """prefix="..." constants from calls that create on system tmp.
+
+    Parses the source with ast and walks Call nodes named
+    mkdtemp or TemporaryDirectory. A call with a dir keyword
+    creates wherever dir points, not on the system tmp, so
+    its prefix is skipped — except dir=None, which is the
+    default temp dir and still counts. A prefix that is not
+    a string constant fails the guard instead of being
+    skipped. Unparseable source raises, never an empty set.
+    """
+    found = set()
+    tree = ast.parse(source, filename=str(path))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            name = func.attr
+        elif isinstance(func, ast.Name):
+            name = func.id
+        else:
+            continue
+        if name not in ("mkdtemp", "TemporaryDirectory"):
+            continue
+        keywords = {}
+        for keyword in node.keywords:
+            if keyword.arg is not None:
+                keywords[keyword.arg] = keyword.value
+        if "prefix" not in keywords:
+            continue
+        if "dir" in keywords and not (
+                isinstance(keywords["dir"], ast.Constant)
+                and keywords["dir"].value is None):
+            continue
+        value = keywords["prefix"]
+        if not isinstance(value, ast.Constant) \
+                or not isinstance(value.value, str):
+            raise AssertionError(
+                "%s:%s: %s prefix is not a string constant"
+                % (path, node.lineno, name))
+        found.add(value.value)
+    return found
 
 
 class GcFixture(unittest.TestCase):
@@ -451,21 +497,22 @@ class ApplyTests(GcFixture):
         # Blocker: OWNED lists ONLY prefixes this repo's own code
         # creates on the system tmp — and every such prefix is
         # listed. A bare "openmainty-" would match the supervision
-        # record; "om66-" is Root's scratch.
-        import re
+        # record; "om66-" is Root's scratch. A prefix whose
+        # mkdtemp call passes an explicit non-tmp dir= (today
+        # msp-repair-, under <home>/repair-roots) is not a temp
+        # prefix and must stay unlisted; the scanner states that
+        # by construction instead of dodging it.
         srcd = (Path(__file__).resolve().parent.parent / "src" /
                 "openmainty")
         created = set()
         for path in sorted(srcd.glob("*.py")):
-            for line in path.read_text(
-                    encoding="utf-8").splitlines():
-                if "mkdtemp" in line or "TemporaryDirectory" in line:
-                    m = re.search(r'prefix\s*=\s*"([^"]+)"', line)
-                    if m:
-                        created.add(m.group(1))
+            created |= _system_tmp_prefixes(
+                path.read_text(encoding="utf-8"), path)
         self.assertEqual(set(gc.OWNED_TMP_PREFIXES), created)
         self.assertNotIn("openmainty-", gc.OWNED_TMP_PREFIXES)
         self.assertNotIn("om66-", gc.OWNED_TMP_PREFIXES)
+        self.assertNotIn("msp-repair-", gc.OWNED_TMP_PREFIXES)
+
 
     def test_supervision_and_foreign_names_never_listed(self):
         for name in ("openmainty-supervision-x", "om66-x",
@@ -580,6 +627,41 @@ class ApplyTests(GcFixture):
         _shutil.rmtree(nm)
         after = _runner.source_snapshot(co)["fingerprint"]
         self.assertEqual(before, after)
+
+
+class TmpPrefixScanTest(unittest.TestCase):
+    """The drift-guard scanner itself, pinned by snippets."""
+
+    def test_same_line_call_collected(self):
+        self.assertEqual(
+            _system_tmp_prefixes(
+                'tmp_home = tempfile.mkdtemp(prefix="x-")\n'),
+            {"x-"})
+
+    def test_multiline_call_collected(self):
+        self.assertEqual(
+            _system_tmp_prefixes(
+                'tmp_home = tempfile.mkdtemp(\n'
+                '    prefix="x-")\n'),
+            {"x-"})
+
+    def test_dir_call_skipped(self):
+        self.assertEqual(
+            _system_tmp_prefixes(
+                'canon = os.path.realpath(\n'
+                '    tempfile.mkdtemp(prefix="msp-repair-",\n'
+                '                     dir=roots_parent))\n'),
+            set())
+        # dir=None is the default temp dir: still collected.
+        self.assertEqual(
+            _system_tmp_prefixes(
+                'tempfile.mkdtemp(prefix="x-", dir=None)\n'),
+            {"x-"})
+
+    def test_non_constant_prefix_fails(self):
+        with self.assertRaises(AssertionError):
+            _system_tmp_prefixes(
+                'tempfile.mkdtemp(prefix=PREFIX)\n')
 
 
 if __name__ == "__main__":

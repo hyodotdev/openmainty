@@ -34,7 +34,9 @@ NEVER = ("receipts (*.json)", "logs (*.log)", "diffs", "ops",
 # in sync by the drift-guard test). Never a bare "openmainty-" (that
 # would match the supervision record) and never "om66-" (Root's
 # scratch). The fastcheck per-op tmp HOME (fc-*) lives under the app
-# home's tmp/, not the system tmp, so it is not listed here.
+# home's tmp/, not the system tmp, so it is not listed here. Same
+# for repair roots (msp-repair-* under <home>/repair-roots):
+# attempt evidence gc must never sweep.
 OWNED_TMP_PREFIXES = ("openmainty-probe-", "openmainty-release-")
 # Hard exclusion (defense in depth): anything with "supervision" in
 # the name is never listed and never deleted, whatever prefix it

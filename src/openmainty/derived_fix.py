@@ -281,6 +281,20 @@ def _expected_work_path(dfix_id: str) -> str:
     return os.path.normpath(str(_home() / "derived" / dfix_id / "work"))
 
 
+def _canonicalise_workdir(path: str) -> str:
+    """Canonical workdir for the repair policy builder.
+
+    The recorded ws path may pass through the symlinked
+    app home (live: ~/.openmainty is a symlink to the
+    owner's SSD store), while the policy check rightly
+    refuses any workdir whose realpath differs. Resolve
+    here, at the caller — never loosen the check. Pure
+    realpath; the builder still refuses anything that is
+    not an existing directory under the canonical home.
+    """
+    return os.path.realpath(path)
+
+
 def _secure_work_chain(dfix_id: str) -> str:
     """Prove the task-owned directory chain from the canonical home.
 
@@ -4198,7 +4212,8 @@ def run_repair_worker(dfix_id: str, attempt_id: str, job_id=None,
         # NOT used here even though it stays byte-identical for the
         # older dependency workers.
         exit_code, raw_stream, _usage = muse.exec_source_repair(
-            prompt, ws["path"], timeout=_WORKER_TIMEOUT_S,
+            prompt, _canonicalise_workdir(ws["path"]),
+            timeout=_WORKER_TIMEOUT_S,
             cancel_event=cancel_event, trace=False,
             preflight_home=home_str, admission_kind="target")
     except Exception as exc:

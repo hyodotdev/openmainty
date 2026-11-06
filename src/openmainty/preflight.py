@@ -1316,19 +1316,12 @@ def _cred_scalar_ok(value):
     return True
 
 
-def _read_worker_credential_trace(root):
-    """Latest meta credential.status from the worker's OWNED trace.
+def _trace_log_files(root):
+    """Sorted owned .log paths under root/data, or (None, reason).
 
-    Returns ({"source", "masks_login"}, None) or (None, reason).
-    Only the two enum scalars are ever kept; raw lines are
-    never retained. Only provider=meta lines count: another
-    provider's line must never decide this worker's result.
-    The newest matching line wins: it names the current
-    credential state, not history, so each file is read from
-    the tail (last _CRED_TRACE_BYTES_MAX bytes, dropping a
-    possibly partial first line). More than
-    _CRED_TRACE_FILES_MAX files refuses with a named reason
-    instead of silently dropping some.
+    Shared enumeration for the owned-trace readers: more
+    than _CRED_TRACE_FILES_MAX files refuses with a named
+    reason instead of silently dropping some.
     """
     if not isinstance(root, str) or not root:
         return None, "trace-root-missing"
@@ -1343,20 +1336,45 @@ def _read_worker_credential_trace(root):
                         return None, "trace-too-many-files"
     except OSError:
         return None, "trace-unreadable"
+    return sorted(found), None
+
+
+def _read_trace_tail_lines(path):
+    """All lines of a log file's tail (last
+    _CRED_TRACE_BYTES_MAX bytes, dropping a possibly
+    partial first line). Raises OSError on failure.
+    """
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        if size > _CRED_TRACE_BYTES_MAX:
+            fh.seek(size - _CRED_TRACE_BYTES_MAX)
+            fh.readline()  # drop a partial first line
+        else:
+            fh.seek(0)
+        blob = fh.read()
+    return blob.decode("utf-8", errors="replace").splitlines()
+
+
+def _read_worker_credential_trace(root):
+    """Latest meta credential.status from the worker's OWNED trace.
+
+    Returns ({"source", "masks_login"}, None) or (None, reason).
+    Only the two enum scalars are ever kept; raw lines are
+    never retained. Only provider=meta lines count: another
+    provider's line must never decide this worker's result.
+    The newest matching line wins: it names the current
+    credential state, not history, so each file is read from
+    the tail. More than _CRED_TRACE_FILES_MAX files refuses
+    with a named reason instead of silently dropping some.
+    """
+    found, reason = _trace_log_files(root)
+    if found is None:
+        return None, reason
     latest = None
     try:
-        for path in sorted(found):
-            with open(path, "rb") as fh:
-                fh.seek(0, os.SEEK_END)
-                size = fh.tell()
-                if size > _CRED_TRACE_BYTES_MAX:
-                    fh.seek(size - _CRED_TRACE_BYTES_MAX)
-                    fh.readline()  # drop a partial first line
-                else:
-                    fh.seek(0)
-                blob = fh.read()
-            text = blob.decode("utf-8", errors="replace")
-            for line in text.splitlines():
+        for path in found:
+            for line in _read_trace_tail_lines(path):
                 if "credential.status" not in line:
                     continue
                 fields = {}
@@ -1382,6 +1400,44 @@ def _read_worker_credential_trace(root):
     if latest is None:
         return None, "credential-status-missing"
     return latest, None
+
+
+def _read_worker_transport_trace(root):
+    """Proxy/direct transport marks from the worker's OWNED trace.
+
+    Returns ({"proxy": n, "direct": m}, None) or (None,
+    reason). Only endpoint_transport.resolve and
+    provider_transport.build lines count, and of each
+    only the exact transport value "proxy" or "direct":
+    counts only, raw lines and every other value are
+    never retained. Zero lines is a zero count, not a
+    missing root: the caller decides what zero proves.
+    """
+    found, reason = _trace_log_files(root)
+    if found is None:
+        return None, reason
+    counts = {"proxy": 0, "direct": 0}
+    try:
+        for path in found:
+            for line in _read_trace_tail_lines(path):
+                if "endpoint_transport.resolve" not in line \
+                        and "provider_transport.build" \
+                        not in line:
+                    continue
+                for token in line.split():
+                    key, sep, value = token.partition("=")
+                    if not sep or key != "transport":
+                        continue
+                    if len(value) >= 2 and value[:1] == '"' \
+                            and value[-1:] == '"':
+                        value = value[1:-1]
+                    if value == "proxy":
+                        counts["proxy"] += 1
+                    elif value == "direct":
+                        counts["direct"] += 1
+    except OSError:
+        return None, "trace-unreadable"
+    return counts, None
 
 
 def _observe_worker_identity(handle):
