@@ -84,6 +84,82 @@ SOURCE_REPAIR_PROFILE = {
     "max_tool_output_bytes": 200000,
 }
 
+# Tool names a repair attempt may use, seen on its own stream.
+# Slice 300: the ONLY name with evidence is write_file (E43b:
+# payload.event.task_kind tool.write_file, both tool_name
+# fields on tool_result; see Muse409-tool-names.md). Shell,
+# web, MCP and agent/sub-task tools are excluded: a
+# provider-served web tool would pass the exec pin, the
+# broker and the kernel rule, so the stream is the only
+# place left to catch it. read_file/edit_file are
+# expected-but-unseen guesses, deliberately NOT listed: a
+# too-narrow list fails a real attempt (recording the true
+# name) rather than passing the wrong one.
+REPAIR_TOOL_ALLOWLIST = frozenset({"write_file"})
+
+# Payload kinds the E43b stream actually carried (closed list:
+# a record with no payload kind refuses, and anything else
+# refuses and names the kind, so a new shape can only widen
+# this on stream evidence). Source for every closed list in
+# this slice: Root-E43b-actual-closed-grammar-evidence.json
+# (36 records, 0 kindless).
+REPAIR_STREAM_KINDS = frozenset({
+    "command_accepted", "run_model_configured",
+    "run_output_delta", "run_started", "run_terminal",
+    "run_usage", "session_run_linked", "task_lifecycle",
+    "task_stream_linked", "tool_result", "turn_input_user",
+})
+
+# Non-tool event.task_kind values E43b carried (closed list:
+# task_kind must be tool.<listed name> or one of these).
+# Same evidence source: only model.meta.response and
+# tool.write_file ever appeared.
+REPAIR_NON_TOOL_TASK_KINDS = frozenset({"model.meta.response"})
+
+# Closed envelope grammar from the same evidence. The actual
+# stream carries all three on every record (record_type str,
+# payload_type str, stream dict with kind), so each is
+# required: missing, null, mistyped or unknown values refuse
+# and name the value. Fixtures carry complete envelopes.
+REPAIR_RECORD_TYPES = frozenset({
+    "event", "reconciliation", "status",
+})
+
+REPAIR_PAYLOAD_TYPES = frozenset({
+    "run.lifecycle.started", "run.model.configured",
+    "run.output.delta", "run.terminal.completed",
+    "run.usage", "runtime.command.accepted",
+    "session.run.linked", "task.lifecycle.accepted",
+    "task.lifecycle.completed", "task.lifecycle.output",
+    "task.lifecycle.proposed", "task.lifecycle.scheduled",
+    "task.lifecycle.side_effect_intent",
+    "task.lifecycle.started", "task.lifecycle.status",
+    "task.stream.linked", "tool.result",
+    "turn.input.user",
+})
+
+# Observed stream kinds. The proved bytes are the exec attempt
+# output, so fixtures use exec.usage; session is the only other
+# observed stream name. The stream object itself is required,
+# as is its kind: missing, mistyped or unknown values refuse
+# and name the value.
+REPAIR_EXEC_STREAM_KINDS = frozenset({"exec.usage", "session"})
+
+# Lifecycle event grammar: every E43b task_lifecycle record
+# carries an event object with one of these kinds; operation,
+# when present on the event (or, unseen, bare on the payload),
+# is one of these. Note the punctuation: task_kind joins with
+# a dot (tool.write_file) while operation joins with a colon
+# (tool:write_file); both forms are observed, neither guessed.
+REPAIR_EVENT_KINDS = frozenset({
+    "accepted", "completed", "output", "proposed",
+    "scheduled", "side_effect_intent", "started", "status",
+})
+
+REPAIR_OPERATIONS = frozenset({
+    "model.meta.response", "tool:write_file",
+})
+
 # Explicit minimal child environment for the dedicated profile (no
 # ambient credential/config inheritance: only PATH/TMPDIR/HOME plus
 # locale/timezone display variables pass through, then the per-run
@@ -850,8 +926,277 @@ def _exec_repair_parent(preflight_home) -> str:
     return parent
 
 
+def _walk_tool_names(rec):
+    """(names, null_hit): every tool_name value in rec, any depth.
+
+    names holds the non-empty string values in walk order.
+    null_hit is True when any tool_name key holds anything
+    else: a shape the check cannot read as a name.
+    """
+    names = []
+    null_hit = False
+    stack = [rec]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            items = node.items()
+        elif isinstance(node, list):
+            items = enumerate(node)
+        else:
+            continue
+        for key, value in items:
+            if key == "tool_name":
+                if isinstance(value, str) and value:
+                    names.append(value)
+                else:
+                    null_hit = True
+            if isinstance(value, (dict, list)):
+                stack.append(value)
+    return names, null_hit
+
+
+def _short_kind(value):
+    """Error-message form of a refused kind value (capped)."""
+    if isinstance(value, str) and len(value) <= 64:
+        return value
+    text = value if isinstance(value, str) else repr(value)
+    if len(text) > 64:
+        return text[:61] + "..."
+    return text
+
+
+def _check_repair_tools(stream) -> tuple:
+    """(used, refused_name, refused_kind, refused_detail).
+
+    used is the sorted names the stream shows inside
+    REPAIR_TOOL_ALLOWLIST. On refusal, refused_detail says
+    why, refused_name carries the first off-list tool name
+    and refused_kind the first off-list kind-like value
+    (record/payload-type, payload, stream, task, event or
+    operation kind; None when that class never appeared),
+    so a real attempt that fails still teaches the true
+    shapes. refused_detail is None on accept.
+
+    Fail closed throughout: the envelope (record_type,
+    payload_type, stream object and stream kind), the payload
+    kind and the lifecycle event grammar are required closed
+    lists from actual E43b evidence
+    (Root-E43b-actual-closed-grammar-evidence.json: 36
+    records, 0 kindless, every record carrying record_type
+    str, payload_type str, stream dict and stream kind, so a
+    payload with no kind refuses); a task_lifecycle record
+    with no event object refuses, as does any present event
+    on any other payload kind (even null or mistyped); an
+    empty tool. suffix refuses no matter what other readable
+    name the record carries. Every tool_name key anywhere in
+    a record counts as a name; a record with no payload, a
+    line that is not a record, and a stream with no records
+    at all each refuse. A turn whose records show no tool use
+    passes with used == [].
+    """
+    if not isinstance(stream, (bytes, bytearray)):
+        return ([], None, None, "no readable stream")
+    used = set()
+    refused_name = None
+    refused_kind = None
+    refused_detail = None
+    records = 0
+    for raw in bytes(stream).split(b"\n"):
+        if not raw.strip():
+            continue
+        try:
+            rec = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            if refused_detail is None:
+                refused_detail = "stream line unparseable"
+            continue
+        if not isinstance(rec, dict):
+            if refused_detail is None:
+                refused_detail = "stream line unparseable"
+            continue
+        records += 1
+        names, null_hit = _walk_tool_names(rec)
+        record_type = rec.get("record_type")
+        if not (isinstance(record_type, str)
+                and record_type in REPAIR_RECORD_TYPES):
+            if refused_kind is None and record_type is not None:
+                refused_kind = record_type
+            if refused_detail is None:
+                if record_type is None:
+                    refused_detail = (
+                        "record with no record type")
+                else:
+                    refused_detail = (
+                        "unknown record type: %s"
+                        % _short_kind(record_type))
+        payload_type = rec.get("payload_type")
+        if not (isinstance(payload_type, str)
+                and payload_type in REPAIR_PAYLOAD_TYPES):
+            if refused_kind is None \
+                    and payload_type is not None:
+                refused_kind = payload_type
+            if refused_detail is None:
+                if payload_type is None:
+                    refused_detail = (
+                        "record with no payload type")
+                else:
+                    refused_detail = (
+                        "unknown payload type: %s"
+                        % _short_kind(payload_type))
+        stream_obj = rec.get("stream")
+        if not isinstance(stream_obj, dict):
+            if refused_detail is None:
+                if "stream" in rec:
+                    refused_detail = (
+                        "record stream is not an object")
+                else:
+                    refused_detail = "record with no stream"
+        else:
+            stream_kind = stream_obj.get("kind")
+            if not (isinstance(stream_kind, str)
+                    and stream_kind in REPAIR_EXEC_STREAM_KINDS):
+                if refused_kind is None \
+                        and stream_kind is not None:
+                    refused_kind = stream_kind
+                if refused_detail is None:
+                    if stream_kind is None:
+                        refused_detail = (
+                            "stream with no kind")
+                    else:
+                        refused_detail = (
+                            "unknown stream kind: %s"
+                            % _short_kind(stream_kind))
+        payload = rec.get("payload")
+        kind = None
+        if not isinstance(payload, dict):
+            if refused_detail is None:
+                refused_detail = "record with no payload"
+            event = None
+        else:
+            if "kind" in payload:
+                kind = payload["kind"]
+            kind_ok = (isinstance(kind, str)
+                       and kind in REPAIR_STREAM_KINDS)
+            if not kind_ok:
+                if kind is not None and refused_kind is None:
+                    refused_kind = kind
+                if refused_detail is None:
+                    if kind is None:
+                        refused_detail = (
+                            "record with no payload kind")
+                    else:
+                        refused_detail = (
+                            "unknown payload kind: %s"
+                            % _short_kind(kind))
+            elif "operation" in payload:
+                # Bare payload operation is unseen (E43b
+                # carries operation only on the event); when
+                # the kind itself failed, that refusal stands
+                # alone instead of cascading here.
+                operation = payload["operation"]
+                if not (isinstance(operation, str)
+                        and operation in REPAIR_OPERATIONS):
+                    if refused_kind is None:
+                        refused_kind = operation
+                    if refused_detail is None:
+                        refused_detail = (
+                            "unknown operation: %s"
+                            % _short_kind(operation))
+            event = payload.get("event")
+        if kind == "task_lifecycle":
+            if not isinstance(event, dict):
+                if refused_detail is None:
+                    refused_detail = (
+                        "task_lifecycle with no event")
+                event = None
+        elif isinstance(payload, dict) and "event" in payload:
+            # Any present event outside lifecycle refuses, even
+            # null or mistyped: only absence passes this leg.
+            if refused_detail is None:
+                refused_detail = (
+                    "unexpected event on %s"
+                    % _short_kind(kind))
+            event = None
+        if isinstance(event, dict):
+            if "kind" in event:
+                event_kind = event["kind"]
+            else:
+                event_kind = None
+            if not (isinstance(event_kind, str)
+                    and event_kind in REPAIR_EVENT_KINDS):
+                if event_kind is not None \
+                        and refused_kind is None:
+                    refused_kind = event_kind
+                if refused_detail is None:
+                    if event_kind is None:
+                        refused_detail = (
+                            "task_lifecycle event with no kind")
+                    else:
+                        refused_detail = (
+                            "unknown event kind: %s"
+                            % _short_kind(event_kind))
+            if "operation" in event:
+                event_operation = event["operation"]
+                if not (isinstance(event_operation, str)
+                        and event_operation in REPAIR_OPERATIONS):
+                    if refused_kind is None:
+                        refused_kind = event_operation
+                    if refused_detail is None:
+                        refused_detail = (
+                            "unknown operation: %s"
+                            % _short_kind(event_operation))
+        stripped = None
+        empty_suffix = False
+        if isinstance(event, dict) and "task_kind" in event:
+            task_kind = event["task_kind"]
+            if isinstance(task_kind, str) \
+                    and task_kind.startswith("tool."):
+                stripped = task_kind[len("tool."):]
+                if stripped:
+                    names.append(stripped)
+                else:
+                    # An empty tool. suffix refuses even when
+                    # the record carries another readable
+                    # name: nothing may borrow past it.
+                    empty_suffix = True
+                    if refused_kind is None:
+                        refused_kind = task_kind
+            elif not isinstance(task_kind, str) \
+                    or task_kind not in \
+                    REPAIR_NON_TOOL_TASK_KINDS:
+                if refused_kind is None:
+                    refused_kind = task_kind
+                if refused_detail is None:
+                    refused_detail = (
+                        "unknown task kind: %s"
+                        % _short_kind(task_kind))
+        examined = (isinstance(payload, dict)
+                    and payload.get("kind") == "tool_result") \
+            or (isinstance(event, dict)
+                and isinstance(event.get("kind"), str)
+                and event["kind"].startswith("tool.")) \
+            or stripped is not None
+        if (null_hit or empty_suffix
+                or (examined and not names)) \
+                and refused_detail is None:
+            refused_detail = ("tool record with no name "
+                              "it can read")
+        for name in names:
+            if name in REPAIR_TOOL_ALLOWLIST:
+                used.add(name)
+            elif refused_name is None:
+                refused_name = name
+                if refused_detail is None:
+                    refused_detail = ("tool outside the repair "
+                                      "allowlist: %s" % name)
+    if records == 0 and refused_detail is None:
+        refused_detail = "stream has no records"
+    return (sorted(used), refused_name, refused_kind,
+            refused_detail)
+
+
 def _prove_exec_attempt(usage: dict, canon: str,
-                        broker_log) -> tuple:
+                        broker_log, stream) -> tuple:
     """(None, None) when this attempt proves itself, else
     (error, code).
 
@@ -862,12 +1207,23 @@ def _prove_exec_attempt(usage: dict, canon: str,
     meta login credential with no masking in its owned
     trace, an owned trace with at least one
     transport=proxy mark and no transport=direct mark,
-    and a broker log of nothing but allowed CONNECT
-    tunnels to api.meta.ai:443.
+    a broker log of nothing but allowed CONNECT
+    tunnels to api.meta.ai:443, and no tool outside
+    REPAIR_TOOL_ALLOWLIST on its own stream. The tool
+    check runs first so usage records repair_tools,
+    refused_tool and refused_kind even when an
+    earlier leg refuses; the tool refusal itself stays
+    last so every code keeps its own tests.
     endpoint_transport.resolve api_key_present is
     unexplained and is never evidence either way.
     """
     from . import preflight as _preflight
+    used, refused_name, refused_kind, refused_detail = \
+        _check_repair_tools(stream)
+    usage["repair_tools"] = used
+    if refused_detail is not None:
+        usage["refused_tool"] = refused_name
+        usage["refused_kind"] = refused_kind
     want_model = SOURCE_REPAIR_PROFILE["model"]
     if usage.get("contributor_applied") is not True \
             or usage.get("model") != want_model \
@@ -921,6 +1277,9 @@ def _prove_exec_attempt(usage: dict, canon: str,
                     "is not all allowed CONNECT "
                     "api.meta.ai:443",
                     "exec-broker-unproved")
+    if refused_detail is not None:
+        return ("repair attempt unproved: %s" % refused_detail,
+                "exec-tool-unproved")
     return None, None
 
 
@@ -1318,8 +1677,12 @@ def exec_source_repair(prompt: str, workdir, timeout: int = 600,
         # trusted; anything unproved keeps the output out
         # with a named refusal code. A nonzero child exit
         # passes through unchanged (never a trusted result).
+        # The proof reads the raw bounded bytes: the decoded
+        # text form would fail the readable-stream leg and
+        # refuse every real attempt, and re-encoding text
+        # could mask malformed bytes the guard must see.
         proof_error, proof_code = _prove_exec_attempt(
-            usage, canon, final["broker_log"])
+            usage, canon, final["broker_log"], out_b)
         if proof_code is not None:
             usage["exit_code"] = 1
             return 1, "", dict(usage, error=proof_error,

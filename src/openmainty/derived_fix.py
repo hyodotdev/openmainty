@@ -3996,6 +3996,15 @@ def _pre_transport_proof(rec: dict, ws: dict) -> dict:
     pins. The recorded candidate checkout is the read-only command
     cwd (same common repo as base, proved at prepare time). Returns
     the repo dir and the fresh origin proof for the prompt build."""
+    # Slice 300: a broker attempt on a workspace with no git
+    # record would silently run unbound (m27/m29), so it
+    # refuses here, before any spawn. A legacy record still
+    # validates; only a new attempt on it refuses.
+    if not isinstance(ws.get("git"), dict):
+        raise DerivedFixError("workspace has no git record; "
+                              "broker attempt refused before "
+                              "spawn",
+                              status=409, code="repair-no-git-record")
     cur = _reprove_origin(rec)
     _reprove_work_chain(rec["op_id"])
     _verify_prep_identity(rec)

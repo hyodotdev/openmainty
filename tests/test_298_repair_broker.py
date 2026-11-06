@@ -89,14 +89,52 @@ class _FakeProc(object):
 
 
 def _usage_stream(model_id=PINNED_MODEL, provider_model=None):
-    lines = [json.dumps(
-        {"payload": {"kind": "run_model_configured",
-                      "model_id": model_id}})]
+    # Grammar-valid exec stdout: the configured-model record on
+    # the observed exec.usage stream. parse_usage reads the
+    # contributor model off payload details facets on any
+    # record; no E43b record carries facets (36 records, 0
+    # kindless, no details key observed), so the facet rides
+    # this record to drive the real parser through a valid
+    # shape instead of a kindless object. No product guard
+    # exception exists for fixtures.
+    payload = {"kind": "run_model_configured",
+               "model_id": model_id}
     if provider_model is not None:
-        lines.append(json.dumps(
-            {"payload": {"details": {"facets": [
-                {"detail": {"model": provider_model}}]}}}))
-    return ("\n".join(lines) + "\n").encode("utf-8")
+        payload["details"] = {"facets": [
+            {"detail": {"model": provider_model}}]}
+    return (json.dumps(
+        {"record_type": "event",
+         "payload_type": "run.model.configured",
+         "payload": payload,
+         "stream": {"kind": "exec.usage"}}) + "\n").encode("utf-8")
+
+
+def _proved_stream():
+    # Grammar-valid exec stdout carrying the one observed
+    # tool: configured model plus a write_file tool_result.
+    # Succeeds end to end only when the raw child bytes reach
+    # the proof (a decoded-text handoff refuses every stream).
+    return ("\n".join([
+        json.dumps(
+            {"record_type": "event",
+             "payload_type": "run.model.configured",
+             "payload": {"kind": "run_model_configured",
+                         "model_id": PINNED_MODEL,
+                         "details": {"facets": [{"detail": {
+                             "model": (
+                                 "muse-spark-1.3-contributor")}}]}},
+             "stream": {"kind": "exec.usage"}}),
+        json.dumps(
+            {"record_type": "event",
+             "payload_type": "tool.result",
+             "payload": {"kind": "tool_result",
+                         "correlation_facts": {
+                             "outcome": "success",
+                             "tool_name": "write_file"},
+                         "edit_facts": {"added": 1,
+                                        "tool_name": "write_file"}},
+             "stream": {"kind": "exec.usage"}}),
+    ]) + "\n").encode("utf-8")
 
 
 def _allowed_entry(target="api.meta.ai:443"):
@@ -669,6 +707,66 @@ class ExecSelfProofCase(ExecBrokerLifecycleCase):
         self.assertEqual(out, "")
         self.assertEqual(usage.get("code"),
                          "exec-broker-unproved")
+
+    def test_proof_reads_child_bytes_not_text(self):
+        # Source-aligned seam pin: grammar-valid child bytes
+        # through the real exec_source_repair path succeed
+        # with every independent leg proven. A decoded-text
+        # handoff to the proof would refuse "no readable
+        # stream" here instead.
+        self._admitted(
+            self._ok_capture(_proved_stream()),
+            broker_log=[_allowed_entry()])
+        code, out, usage = self._proof_call()
+        self.assertEqual(code, 0)
+        self.assertEqual(usage.get("repair_tools"),
+                         ["write_file"])
+
+    def test_kindless_facets_stream_refused(self):
+        # The legacy kindless facets object still drives
+        # parse_usage to contributor-True, so this pins the
+        # tool leg refusing it end to end before any later
+        # leg can pass: E43b carries 36 records, 0 kindless.
+        first = {
+            "record_type": "event",
+            "payload_type": "run.model.configured",
+            "payload": {"kind": "run_model_configured",
+                        "model_id": PINNED_MODEL},
+            "stream": {"kind": "exec.usage"}}
+        second = {
+            "record_type": "event",
+            "payload_type": "run.usage",
+            "payload": {"details": {"facets": [
+                {"detail": {"model":
+                            "muse-spark-1.3-contributor"}}]}},
+            "stream": {"kind": "exec.usage"}}
+        stream = ("\n".join([json.dumps(first),
+                             json.dumps(second)])
+                  + "\n").encode("utf-8")
+        self._admitted(
+            self._ok_capture(stream),
+            broker_log=[_allowed_entry()])
+        code, out, usage = self._proof_call()
+        self.assertNotEqual(code, 0)
+        self.assertEqual(out, "")
+        self.assertEqual(usage.get("code"),
+                         "exec-tool-unproved")
+
+    def test_malformed_child_bytes_refused(self):
+        # Bytes the guard cannot parse refuse end to end even
+        # though the contributor leg parses: fail closed on
+        # the raw bytes, not on decoded text.
+        stream = _usage_stream(
+            provider_model=(
+                "muse-spark-1.3-contributor")) + b"\xff\xfe\n"
+        self._admitted(
+            self._ok_capture(stream),
+            broker_log=[_allowed_entry()])
+        code, out, usage = self._proof_call()
+        self.assertNotEqual(code, 0)
+        self.assertEqual(out, "")
+        self.assertEqual(usage.get("code"),
+                         "exec-tool-unproved")
 
 
 class _CompletesOnStop(object):
