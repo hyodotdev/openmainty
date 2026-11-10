@@ -84,6 +84,16 @@ def move_into_run_dir(root, state, work):
     return dest
 
 
+def record_work_git(state, work):
+    """301: model-tree reads bind to the prep record. Tests record
+    after the fixture plants its hooks (and re-record after any
+    later hook neutralization, which is an operator-equivalent
+    fixture action, not model output)."""
+    state["workGit"] = runner.record_git_pointer(work)
+    store.save(state)
+    return state
+
+
 class CommitSubjectTests(unittest.TestCase):
     def test_conventional_title_used_verbatim_run_id_in_body_only(self):
         state = {"id": "run-test-aaa", "title": "chore(deps): bump pkg to 2.0.0"}
@@ -123,7 +133,7 @@ class CommitThroughHookTests(unittest.TestCase):
             '{"name": "t", "devDependencies": {"@scope/pkg": "^1.0.1"}}\n')
         (work / "yarn.lock").write_text("# yarn lockfile v1\n# @scope/pkg 1.0.1\n")
         state["baseCommit"] = base
-        store.save(state)
+        record_work_git(state, work)
         return state, work, base
 
     def test_real_candidate_gets_committed(self):
@@ -489,6 +499,7 @@ class CommitBlockedPipelineTests(unittest.TestCase):
         # Discard the failed candidate, then commit unrelated metadata.
         hook = work / ".git" / "hooks" / "commit-msg"
         hook.write_text("#!/bin/sh\nexit 0\n")
+        record_work_git(store.load(run_id), work)
         for name in ("package.json", "yarn.lock"):
             code, raw, _ = run_cmd(
                 ["git", "-C", str(work), "show", "HEAD:" + name])
@@ -534,6 +545,7 @@ class CommitBlockedPipelineTests(unittest.TestCase):
             "not part of the rejected candidate\n")
         hook = work / ".git" / "hooks" / "commit-msg"
         hook.write_text("#!/bin/sh\nexit 0\n")
+        record_work_git(store.load(run_id), work)
         ex2 = runner.FakeExecutor()
         self.assertFalse(
             runner.execute(store.load(run_id), PROFILE, ex2, work))
@@ -601,6 +613,7 @@ class CommitBlockedPipelineTests(unittest.TestCase):
         hook = work / ".git" / "hooks" / "commit-msg"
         hook.write_text(HOOK)
         hook.chmod(hook.stat().st_mode | stat.S_IXUSR)
+        record_work_git(store.load(run_id), work)
         code, _, err = run_cmd(
             ["git", "-C", str(work), "-c", "user.name=t",
              "-c", "user.email=t@t", "commit", "-qm",
@@ -640,6 +653,7 @@ class CommitBlockedPipelineTests(unittest.TestCase):
         store.save(legacy)
         hook = work / ".git" / "hooks" / "commit-msg"
         hook.write_text("#!/bin/sh\nexit 0\n")
+        record_work_git(store.load(run_id), work)
         ex2 = runner.FakeExecutor()
         self.assertFalse(
             runner.execute(store.load(run_id), PROFILE, ex2, work))
@@ -705,7 +719,7 @@ class HookFreeWorkerCommitTests(unittest.TestCase):
         (work / "package.json").write_text(
             '{"name": "t", "devDependencies": {"@scope/pkg": "^1.0.1"}}\n')
         state["baseCommit"] = base
-        store.save(state)
+        record_work_git(state, work)
         got = runner.maybe_commit_worktree(state, work, "fix")
         self.assertTrue(got.get("committed"), got)
         self.assertFalse(sentinel.exists())
@@ -731,7 +745,7 @@ class HookFreeWorkerCommitTests(unittest.TestCase):
         (work / "package.json").write_text(
             '{"name": "t", "devDependencies": {"@scope/pkg": "^1.0.1"}}\n')
         state["baseCommit"] = base
-        store.save(state)
+        record_work_git(state, work)
         got = runner.maybe_commit_worktree(state, work, "fix")
         self.assertTrue(got.get("committed"), got)
         self.assertFalse(sentinel.exists())

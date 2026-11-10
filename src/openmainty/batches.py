@@ -1029,15 +1029,48 @@ def _snapshot(worktree: str, *, git_bound=None) -> dict | None:
             "clean": _source_clean(worktree, git_bound=git_bound)}
 
 
-def _git_text(args, cwd) -> str | None:
-    argv = ["git"] + list(args)
+def _git_text(args, cwd, *, git_bound=None) -> str | None:
+    """Read-only git text, stripped. Bound (worker-touched tree):
+    re-prove the .git pointer and run over the hardened path;
+    unbound (owner checkouts): the same hardened flags + scrubbed
+    env over -C. Either way no hook, fsmonitor, driver, or
+    system/global config can run. Returns None on any failure.
+    301b: index-refreshing verbs (diff, status) run against a
+    private per-call index copy (M2.21b), bound and unbound alike,
+    so reads never write the owner's index. When the copy cannot
+    be made the read keeps the env rule only — never a refusal.
+    """
+    if git_bound is not None:
+        try:
+            paths = runner.reprove_git_pointer(cwd, git_bound)
+        except runner.SourceUnreadable:
+            return None
+        argv = runner.hardened_git_argv(
+            list(args), gitdir=paths["gitdir"],
+            worktree=paths["worktree"])
+        try:
+            with git_readonly_child_env(
+                    argv, runner.hardened_git_env(),
+                    cwd=None) as env:
+                out = subprocess.run(
+                    argv, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, timeout=60, text=True,
+                    env=env)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if out.returncode != 0:
+            return None
+        return out.stdout.strip()
+    argv = runner.hardened_git_argv(["-C", str(cwd)] + list(args))
     try:
-        with git_readonly_child_env(argv, cwd=cwd) as child_env:
+        with git_readonly_child_env(
+                argv, runner.hardened_git_env(),
+                cwd=str(cwd)) as env:
             out = subprocess.run(argv, cwd=str(cwd),
                                  stdout=subprocess.PIPE,
                                  stderr=subprocess.DEVNULL,
                                  timeout=60, text=True,
-                                 env=child_env)
+                                 env=env)
     except (OSError, subprocess.SubprocessError):
         return None
     if out.returncode != 0:
@@ -1052,6 +1085,12 @@ def _git_lines(args, cwd, *, git_bound=None) -> list | None:
     porcelain columns (" M file" -> "M file"); status parsing must use
     these raw lines instead. Bound (worker-touched tree):
     re-prove the .git pointer and run over the hardened path.
+    Unbound (owner checkouts): the same hardened flags + scrubbed
+    env over -C. Either way no hook, fsmonitor, driver, or
+    system/global config can run. 301b: index-refreshing verbs
+    (diff, status) additionally run against a private per-call
+    index copy (M2.21b), bound and unbound alike; copy failure
+    keeps the env rule only, never a refusal.
     """
     if git_bound is not None:
         try:
@@ -1062,23 +1101,28 @@ def _git_lines(args, cwd, *, git_bound=None) -> list | None:
             list(args), gitdir=paths["gitdir"],
             worktree=paths["worktree"])
         try:
-            out = subprocess.run(
-                argv, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, timeout=60, text=True,
-                env=runner.hardened_git_env())
+            with git_readonly_child_env(
+                    argv, runner.hardened_git_env(),
+                    cwd=None) as env:
+                out = subprocess.run(
+                    argv, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, timeout=60,
+                    text=True, env=env)
         except (OSError, subprocess.SubprocessError):
             return None
         if out.returncode != 0:
             return None
         return out.stdout.rstrip("\n").splitlines()
-    argv = ["git"] + list(args)
+    argv = runner.hardened_git_argv(["-C", str(cwd)] + list(args))
     try:
-        with git_readonly_child_env(argv, cwd=cwd) as child_env:
+        with git_readonly_child_env(
+                argv, runner.hardened_git_env(),
+                cwd=str(cwd)) as env:
             out = subprocess.run(argv, cwd=str(cwd),
                                  stdout=subprocess.PIPE,
                                  stderr=subprocess.DEVNULL,
                                  timeout=60, text=True,
-                                 env=child_env)
+                                 env=env)
     except (OSError, subprocess.SubprocessError):
         return None
     if out.returncode != 0:
@@ -1109,7 +1153,7 @@ def _source_clean_diag(worktree: str, *,
             if runner._noise_rel(rel):
                 continue
             if _git_text(["check-ignore", "-q", "--", rel],
-                         worktree) is not None:
+                         worktree, git_bound=git_bound) is not None:
                 continue
             return False, True, rel[:_DIAG_PATH_CHARS]
         if " -> " in rel:
@@ -2060,7 +2104,8 @@ def closure(batch_list: list) -> list:
     return out
 
 
-def _read_wt_cand(worktree: str, kind: str) -> tuple:
+def _read_wt_cand(worktree: str, kind: str, *,
+                  git_bound=None) -> tuple:
     """One worktree read for the live map: (snap_or_None, diag_or_None).
 
     snap matches _snapshot() exactly (including the clean flag: live
@@ -2068,14 +2113,18 @@ def _read_wt_cand(worktree: str, kind: str) -> tuple:
     failure with kind/worktree/category/op/rc plus the cleanliness
     offender path, and on success carries only kind/worktree plus the
     bounded untracked sample from the same snapshot. No source is read
-    twice.
+    twice. 301: bound to the prep record when the caller has one
+    (re-proved before any spawn); otherwise the hardened
+    flags + scrubbed env over -C.
     """
-    core, category, op, rc = _snapshot_status(worktree)
+    core, category, op, rc = _snapshot_status(worktree,
+                                              git_bound=git_bound)
     if core is None:
         return None, {"kind": kind, "worktree": worktree,
                       "category": category, "op": op, "rc": rc,
                       "offender": "", "status_ok": False}
-    clean, status_ok, offender = _source_clean_diag(worktree)
+    clean, status_ok, offender = _source_clean_diag(worktree,
+                                                    git_bound=git_bound)
     snap = {"head": core["head"], "fingerprint": core["fingerprint"],
             "clean": clean}
     # The untracked sample rides the SAME already-read snapshot (names
@@ -2095,7 +2144,8 @@ def _read_wt_cand(worktree: str, kind: str) -> tuple:
                   "status_ok": status_ok, "untracked_sample": sample}
 
 
-def live_map_with_diag(batch_list: list) -> tuple:
+def live_map_with_diag(batch_list: list, *,
+                       git_bounds: dict | None = None) -> tuple:
     """(live, diag): live matches live_map() exactly; diag holds per-key
     read context from the same single read pass (failure diagnostics on
     failed keys; kind/worktree plus the bounded untracked sample on
@@ -2107,17 +2157,29 @@ def live_map_with_diag(batch_list: list) -> tuple:
 
     Iterates read_keys(batch_list): the gate key and the read set are one
     derivation, so they can never drift.
+
+    301: git_bounds optionally maps "wt:<worktree>"/"cand:<worktree>"
+    keys (or bare worktree paths) to prep records; bound reads
+    re-prove the pointer before any spawn. Unmapped trees read over
+    the hardened flags + scrubbed env.
     """
+    bounds = git_bounds if isinstance(git_bounds, dict) else {}
     live: dict = {}
     diag: dict = {}
     for key in read_keys(batch_list):
         if key.startswith("wt:"):
-            snap, err = _read_wt_cand(key[len("wt:"):], "wt")
+            wt = key[len("wt:"):]
+            snap, err = _read_wt_cand(
+                wt, "wt",
+                git_bound=bounds.get(key, bounds.get(wt)))
             live[key] = snap
             if err is not None:
                 diag[key] = err
         elif key.startswith("cand:"):
-            snap, err = _read_wt_cand(key[len("cand:"):], "cand")
+            wt = key[len("cand:"):]
+            snap, err = _read_wt_cand(
+                wt, "cand",
+                git_bound=bounds.get(key, bounds.get(wt)))
             live[key] = snap
             if err is not None:
                 diag[key] = err
@@ -2134,14 +2196,15 @@ def live_map_with_diag(batch_list: list) -> tuple:
     return live, diag
 
 
-def live_map(batch_list: list) -> dict:
+def live_map(batch_list: list, *,
+             git_bounds: dict | None = None) -> dict:
     """Fresh source states keyed by worktree (never lane names).
 
     Keys: "wt:<worktree>" integration snapshots, "cand:<worktree>"
     candidate snapshots, base keys via _base_key(checkout, branch).
     Missing entries mean unreadable, never matching.
     """
-    live, _ = live_map_with_diag(batch_list)
+    live, _ = live_map_with_diag(batch_list, git_bounds=git_bounds)
     return live
 
 
@@ -14645,7 +14708,11 @@ def _pr_norm_target(value) -> str:
 
 
 def _pr_run_diffstat(run: dict) -> str:
-    """The run's work tree vs its base, one read-only git call."""
+    """The run's work tree vs its base, one read-only git call.
+
+    301: bound to the run's prep record when one is present — a
+    rewritten pointer reads as failure, never a forged stat.
+    """
     from . import prs as _prs
     rid = str((run or {}).get("id") or "")
     if not rid:
@@ -14654,8 +14721,12 @@ def _pr_run_diffstat(run: dict) -> str:
         ward = store.run_dir(rid) / "work"
     except (Exception, SystemExit):  # noqa: BLE001 - no dir, no stat
         return "실행 내역 읽기 실패"
+    rec = (run or {}).get("workGit")
+    bound = rec if isinstance(rec, dict) and rec.get("kind") in (
+        "file", "dir") else None
     return _prs.work_diffstat(str(ward), str((run or {}).get("baseCommit")
-                                             or ""))
+                                             or ""),
+                              git_bound=bound)
 
 
 def _pr_scan_diffstat(pr: dict) -> str:

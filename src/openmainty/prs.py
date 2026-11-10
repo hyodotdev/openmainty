@@ -7,8 +7,9 @@ issue deferred to an external PR, dependabot bumps matching our
 queue). Nothing here posts, comments, reviews, merges, closes,
 checks out PR refs, or pushes. The only processes ever started
 are `gh pr list` (exact argv in PR_LIST_ARGV) and a read-only
-`git diff --stat` inside a run work dir (exact argv in
-GIT_DIFFSTAT_ARGV); see test_prs.TestPrArgvAllowList.
+`git diff --stat` inside a run work dir (hardened argv built via
+runner.hardened_git_argv, pinned when a prep record is passed);
+see test_prs.TestPrArgvAllowList.
 """
 from __future__ import annotations
 
@@ -17,7 +18,9 @@ import subprocess
 
 # Exact argv shapes the PR code may run. Tests pin these.
 PR_LIST_ARGV = ["gh", "pr", "list"]
-GIT_DIFFSTAT_ARGV = ["git", "--no-optional-locks", "diff", "--stat"]
+# 301: work_diffstat builds its git argv via
+# runner.hardened_git_argv (pinned by test_prs); no bare git argv
+# lives here anymore.
 
 PR_LIST_FIELDS = ("number,title,author,isDraft,headRefName,createdAt,"
                   "updatedAt,closingIssuesReferences,additions,"
@@ -192,19 +195,49 @@ def _safe_ref(base: str) -> str:
     return "HEAD"
 
 
-def work_diffstat(workdir: str, base: str = "") -> str:
+def work_diffstat(workdir: str, base: str = "", *,
+                  git_bound=None) -> str:
     """One read-only `git diff --stat` inside a run work dir.
 
     Compares the work tree against base (a commit sha) or HEAD when
     no base is given. Output is capped; failures read as a plain
-    note, never an exception. Only the pinned argv ever runs.
+    note, never an exception. 301: runs over the hardened path
+    (fsmonitor/hooks/drivers off, system/global config off),
+    pinned to the prep record when one is passed — a rewritten
+    pointer reads as failure, never a forged stat.
+    301b: the diff runs against a private per-call index copy
+    (M2.21b), bound and unbound alike, so the read never writes
+    the worktree's index. When the copy cannot be made the read
+    keeps the env rule only — never a refusal for that.
     """
     try:
+        from . import runner as _runner
+        from .util import git_readonly_child_env as _ro_env
         ref = _safe_ref(base)
-        proc = subprocess.run(
-            GIT_DIFFSTAT_ARGV + [ref], cwd=str(workdir),
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            timeout=60, text=True)
+        if git_bound is not None:
+            try:
+                paths = _runner.reprove_git_pointer(workdir, git_bound)
+            except Exception:  # noqa: BLE001 - fail closed
+                return "실행 내역 읽기 실패"
+            argv = _runner.hardened_git_argv(
+                ["diff", "--stat", ref, "--", "."],
+                gitdir=paths["gitdir"],
+                worktree=paths["worktree"])
+            with _ro_env(argv, _runner.hardened_git_env(),
+                         cwd=None) as env:
+                proc = subprocess.run(
+                    argv, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=60, text=True, env=env)
+        else:
+            argv = _runner.hardened_git_argv(
+                ["-C", str(workdir), "diff", "--stat", ref, "--", "."])
+            with _ro_env(argv, _runner.hardened_git_env(),
+                         cwd=str(workdir)) as env:
+                proc = subprocess.run(
+                    argv, cwd=str(workdir),
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    timeout=60, text=True, env=env)
     except (OSError, subprocess.SubprocessError):
         return "실행 내역 읽기 실패"
     if proc.returncode != 0 or not (proc.stdout or "").strip():

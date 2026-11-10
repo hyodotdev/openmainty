@@ -268,6 +268,10 @@ def ensure_branch_workdir(state: dict, checkout: Path, base_branch: str,
     work = store.run_dir(state["id"]) / "work"
     if work.exists():
         _isolate_node_modules(work)
+        # A pre-existing tree keeps its prep record when one is
+        # present; a git tree with no record stays record-less so
+        # every later bound read fails closed (never a fresh trust
+        # of a tree a model may already have touched).
         return work
     # `.git` is a FILE inside linked worktrees — `.is_dir()` would miss
     # them and silently copy the checkout without git metadata. `.exists()`
@@ -312,14 +316,18 @@ def ensure_branch_workdir(state: dict, checkout: Path, base_branch: str,
                                            "--detach", str(work), base])
             if code == 0:
                 _isolate_node_modules(work)
+                _record_work_git(state, work)
                 return work
             state.setdefault("interventions", []).append(
                 {"at": utcnow(), "kind": "worktree-fallback",
                  "detail": err.strip()[-300:]})
         _isolate_node_modules(work)
+        _record_work_git(state, work)
         return work
     shutil.copytree(checkout, work, ignore=shutil.ignore_patterns(".git"))
     _isolate_node_modules(work)
+    state.pop("workGit", None)
+    store.save(state)
     return work
 
 
@@ -374,10 +382,19 @@ def git_rev_strict(path: Path, ref: str):
 
 def work_commit(work: Path, state: dict) -> str:
     """HEAD only. It CANNOT identify dirty-tree content: an edited worktree
-    keeps the same HEAD, so callers must also bind `source_snapshot`."""
-    code, out, _ = run_cmd(["git", "-C", str(work), "rev-parse", "HEAD"])
+    keeps the same HEAD, so callers must also bind `source_snapshot`.
+
+    Bound to the prep record on git trees: a rewritten pointer
+    raises SourceUnreadable instead of answering a forged HEAD.
+    """
+    bound = _work_git_bound(state, work)
+    code, out, _ = _hgit_run(work, ["rev-parse", "HEAD"],
+                             git_bound=bound,
+                             timeout=_GIT_PROBE_TIMEOUT)
     if code == 0 and out.strip():
         return out.strip()
+    if bound is not None:
+        raise SourceUnreadable("head")
     return f"copyseq-{state.get('workSeq', 0)}"
 
 
@@ -673,6 +690,74 @@ def reprove_git_pointer(work, record: dict) -> dict:
              "worktree": os.path.realpath(str(work))}
     refuse_nested_git(paths["worktree"])
     return paths
+
+
+_WORK_GIT_KEYS = frozenset({"kind", "gitdir", "pointer_hex",
+                            "config_sha256", "hooks"})
+
+
+def _record_work_git(state: dict, work) -> None:
+    """Store this run's prep-time .git identity (301, M2 run trees).
+
+    Runs at the point the app creates the tree, before any model
+    step writes to it. Non-git fixtures carry no record. A record
+    failure leaves no record: the first bound read then fails
+    closed instead of trusting a model-touched tree.
+    """
+    try:
+        if not _git_present(Path(work)):
+            state.pop("workGit", None)
+            store.save(state)
+            return
+        state["workGit"] = record_git_pointer(work)
+        store.save(state)
+    except SourceUnreadable:
+        state.pop("workGit", None)
+        store.save(state)
+    except (OSError, ValueError):
+        state.pop("workGit", None)
+        try:
+            store.save(state)
+        except (OSError, ValueError):
+            pass
+
+
+def _work_git_bound(state, work):
+    """Prep record for this run's worktree, or None (non-git fixture).
+
+    Raises SourceUnreadable("git-pointer") when the tree is git but
+    the prep record is missing or malformed: closers (commit, proof
+    binding, scope) fail closed instead of trusting a model-touched
+    tree. Read-only census paths that must keep serving legacy or
+    display reads use _work_git_bound_or_none instead.
+    """
+    if not _git_present(Path(work)):
+        return None
+    rec = (state or {}).get("workGit") if isinstance(state, dict) \
+        else None
+    if not isinstance(rec, dict) or set(rec.keys()) != _WORK_GIT_KEYS:
+        raise SourceUnreadable("git-pointer")
+    if rec.get("kind") not in ("file", "dir"):
+        raise SourceUnreadable("git-pointer")
+    if not isinstance(rec.get("gitdir"), str) or \
+            not os.path.isabs(rec["gitdir"]):
+        raise SourceUnreadable("git-pointer")
+    return rec
+
+
+def _work_git_bound_or_none(state, work):
+    """Prep record, or None when the tree must read unbound.
+
+    Non-git fixtures and git trees with a missing/unprovable
+    record read over the unbound hardened path (exec-safe: hooks,
+    fsmonitor, drivers, and system/global config stay off).
+    Closing actions must NOT use this helper — they take
+    _work_git_bound and refuse without a record.
+    """
+    try:
+        return _work_git_bound(state, work)
+    except SourceUnreadable:
+        return None
 
 
 def _hgit_run(work, args: list, *, git_bound=None,
@@ -1732,8 +1817,12 @@ def _refresh_source(state: dict, work: Path) -> dict:
 
     Raises `SourceUnreadable` without touching stored proofs when the
     live source cannot be read: callers stop retryably and keep history.
+
+    301: comparison/display only — bound when the prep record is
+    present, unbound-hardened otherwise (exec-safe either way).
     """
-    snap = source_snapshot(work)
+    snap = source_snapshot(
+        work, git_bound=_work_git_bound_or_none(state, work))
     state["workTreeFingerprint"] = snap["fingerprint"]
     state["sourceKind"] = snap["kind"]
     if (state.get("workCommit") in (None, "unknown") and snap["kind"] == "git"
@@ -1765,6 +1854,11 @@ def fresh_snapshot(state: dict) -> dict | None:
     twice for one request. Returns None when the run worktree is missing
     or unreadable — callers must report unknown/unverified, never green.
     Never saves, never writes, never modifies user files.
+
+    301: bound when the prep record is present, unbound-hardened
+    otherwise (exec-safe either way). Green still requires a stored
+    proof match downstream, so an unidentified tree can only ever
+    read as stale, never current.
     """
     try:
         work = store.run_dir(state["id"]) / "work"
@@ -1773,7 +1867,8 @@ def fresh_snapshot(state: dict) -> dict | None:
     try:
         if not work.is_dir():
             return None
-        return source_snapshot(work)
+        return source_snapshot(
+            work, git_bound=_work_git_bound_or_none(state, work))
     except Exception:  # noqa: BLE001
         return None
 
@@ -1790,7 +1885,7 @@ def _bind_verification(state: dict, work: Path, step: str) -> None:
     source cannot be read: a passed worker output with an unbindable
     proof is a retryable failure, never a false green.
     """
-    snap = source_snapshot(work)
+    snap = source_snapshot(work, git_bound=_work_git_bound(state, work))
     state["workTreeFingerprint"] = snap["fingerprint"]
     state["sourceKind"] = snap["kind"]
     if snap["kind"] == "git" and snap.get("head") not in (None, "", "unknown"):
@@ -1806,7 +1901,7 @@ def _bind_verification(state: dict, work: Path, step: str) -> None:
 _PATH_CAP = 256
 
 
-def _candidate_path_set(work: Path, base) -> tuple:
+def _candidate_path_set(work: Path, base, *, git_bound=None) -> tuple:
     """Full changed path set: tracked diff vs base + relevant untracked.
 
     Returns (tracked_names, untracked_names). The untracked half reuses
@@ -1819,12 +1914,16 @@ def _candidate_path_set(work: Path, base) -> tuple:
     known-base diff or a failed cached/work diff read is unknown, not
     an empty set. Callers degrade to incomplete/unknown candidates and
     stay blocked; nothing auto-commits from a partial set.
+
+    Bound to the prep record on model-written trees: the pointer is
+    re-proved before any spawn.
     """
     work = Path(work)
     tracked: list = []
     if base not in (None, "", "unknown"):
-        code, out, _ = run_cmd(
-            ["git", "-C", str(work), "diff", "--name-only", str(base), "--"])
+        code, out, _ = _hgit_run(
+            work, ["diff", "--name-only", str(base), "--"],
+            git_bound=git_bound, timeout=_GIT_PROBE_TIMEOUT)
         if code != 0:
             raise SourceUnreadable("candidate-list", rc=code)
         tracked = [ln.strip() for ln in (out or "").splitlines()
@@ -1832,7 +1931,8 @@ def _candidate_path_set(work: Path, base) -> tuple:
     if not tracked:
         for args in (["diff", "--cached", "--name-only"],
                      ["diff", "--name-only"]):
-            code, out, _ = run_cmd(["git", "-C", str(work)] + args)
+            code, out, _ = _hgit_run(work, args, git_bound=git_bound,
+                                     timeout=_GIT_PROBE_TIMEOUT)
             if code != 0:
                 raise SourceUnreadable("candidate-list", rc=code)
             for ln in (out or "").splitlines():
@@ -1840,7 +1940,7 @@ def _candidate_path_set(work: Path, base) -> tuple:
                     tracked.append(ln.strip())
     untracked: list = []
     try:
-        snap = source_snapshot(work)
+        snap = source_snapshot(work, git_bound=git_bound)
     except SourceUnreadable:
         # A failed source read is unknown, never an empty untracked
         # list: propagate so candidate capture degrades to the
@@ -1869,7 +1969,8 @@ def _blocked_candidate_snapshot(state: dict, work: Path) -> dict:
     """
     work = Path(work)
     base = state.get("baseCommit")
-    tracked, untracked = _candidate_path_set(work, base)
+    tracked, untracked = _candidate_path_set(
+        work, base, git_bound=_work_git_bound(state, work))
     names = tracked + [u for u in untracked if u not in tracked]
     complete = len(names) <= _PATH_CAP
     files = {}
@@ -1980,13 +2081,15 @@ def maybe_commit_worktree(state: dict, work: Path, step: str) -> dict:
     inside this run's own worktree (never the user's checkout, never
     old/manual checkouts or legacy runs), and only tracked edits plus
     relevant untracked source (never bulk junk like node_modules).
-    Hooks stay OFF (`core.hooksPath=/dev/null` on every git call in
-    this path): the subject is repo-conforming by construction (run
-    id in the body, never ahead of the type), and a commit failure
-    is recorded as an explicit blocked-commit outcome — staged
-    files preserved, never a silent success and never no-code. The
-    helper is idempotent, so the same run can retry the commit alone
-    without rerunning the fix model.
+    Every git call runs bound to the prep record over the hardened
+    path (fsmonitor/hooks/drivers off, system/global config off,
+    --git-dir/--work-tree pinned, nested .git refused), so hooks
+    stay off by construction, and a commit failure is recorded as
+    an explicit blocked-commit outcome — staged files preserved,
+    never a silent success and never no-code. The helper is
+    idempotent, so the same run can retry the commit alone without
+    rerunning the fix model. A missing prep record refuses before
+    any spawn.
     """
     work = Path(work)
     branch = state.get("branch")
@@ -2005,11 +2108,16 @@ def maybe_commit_worktree(state: dict, work: Path, step: str) -> dict:
         # .git presence itself is unknowable; only a truly missing
         # .git is a non-git fixture.
         return {"committed": False, "reason": "non-git fixture workdir"}
-    if not _worktree_changed(work):
+    # Bound to the prep record: a missing record or a rewritten
+    # pointer raises SourceUnreadable before any spawn (callers
+    # record the block with provenance).
+    bound = _work_git_bound(state, work)
+    if not _worktree_changed(work, git_bound=bound):
         return {"committed": False, "reason": "clean tree"}
-    snap = source_snapshot(work)
-    code, add_out, add_err = run_cmd(
-        ["git"] + _GIT_NO_HOOKS + ["-C", str(work), "add", "-u"])
+    snap = source_snapshot(work, git_bound=bound)
+    code, add_out, add_err = _hgit_run(
+        work, ["add", "-u"], git_bound=bound,
+        timeout=_GIT_PROBE_TIMEOUT)
     if code != 0:
         # A stage failure for a required run-owned commit is an
         # operational block, not an optional skip: record it explicitly
@@ -2020,24 +2128,24 @@ def maybe_commit_worktree(state: dict, work: Path, step: str) -> dict:
         return _record_commit_blocked(
             state, work, step, "add-tracked", code, add_out, add_err)
     if snap.get("untracked"):
-        code, add_out, add_err = run_cmd(
-            ["git"] + _GIT_NO_HOOKS + ["-C", str(work), "add", "--"]
-            + snap["untracked"])
+        code, add_out, add_err = _hgit_run(
+            work, ["add", "--"] + snap["untracked"], git_bound=bound,
+            timeout=_GIT_PROBE_TIMEOUT)
         if code != 0:
             return _record_commit_blocked(
                 state, work, step, "add-untracked", code, add_out, add_err)
-    code, _, _ = run_cmd(
-        ["git"] + _GIT_NO_HOOKS + ["-C", str(work), "diff", "--cached",
-                                   "--quiet"])
+    code, _, _ = _hgit_run(
+        work, ["diff", "--cached", "--quiet"], git_bound=bound,
+        timeout=_GIT_PROBE_TIMEOUT)
     if code == 0:
         return {"committed": False,
                 "reason": "nothing stageable after filtering noise"}
     subject, body = commit_subject_for(state, step)
-    code, _, err = run_cmd(
-        ["git"] + _GIT_NO_HOOKS + ["-C", str(work),
-                                   "-c", "user.name=openmainty",
-                                   "-c", "user.email=openmainty@localhost",
-                                   "commit", "-m", subject, "-m", body])
+    code, _, err = _hgit_run(
+        work, ["-c", "user.name=openmainty",
+               "-c", "user.email=openmainty@localhost",
+               "commit", "-m", subject, "-m", body],
+        git_bound=bound, timeout=_GIT_PROBE_TIMEOUT)
     if code != 0:
         # Explicit blocked-commit outcome (hooks can no longer cause
         # this — only other commit failures, e.g. nothing staged or
@@ -2074,18 +2182,22 @@ def _candidate_bytes_match(recorded: dict, current: dict) -> bool:
     return True
 
 
-def _head_file_hashes(work: Path, names) -> dict:
+def _head_file_hashes(work: Path, names, *, git_bound=None) -> dict:
     """sha256 of committed HEAD bytes for the given repo paths.
 
     A path absent from HEAD records DELETED under the same rule as the
     worktree side, so a committed deletion proves exactly like
     committed bytes (and a missing path never silently drops out).
+
+    Bound to the prep record on model-written trees: the pointer is
+    re-proved before any spawn.
     """
     import hashlib as _hashlib
     hashes = {}
     for name in list(names or [])[:_PATH_CAP]:
-        code, out, _ = run_cmd(
-            ["git", "-C", str(work), "show", f"HEAD:{name}"])
+        code, out, _ = _hgit_run(
+            work, ["show", f"HEAD:{name}"], git_bound=git_bound,
+            timeout=_GIT_PROBE_TIMEOUT)
         if code != 0:
             hashes[name] = "DELETED"
             continue
@@ -2107,7 +2219,8 @@ def _recover_set_matches(work: Path, state: dict, candidate: dict) -> bool:
         return False
     try:
         tracked, untracked = _candidate_path_set(
-            work, state.get("baseCommit"))
+            work, state.get("baseCommit"),
+            git_bound=_work_git_bound(state, work))
         current_paths = set(tracked + [u for u in untracked
                                        if u not in tracked])
         if current_paths != recorded_paths:
@@ -2151,17 +2264,25 @@ def _candidate_already_committed(state: dict, work: Path) -> bool:
     # Clean means no RELEVANT changes: run-owned private caches
     # (muse.CACHE_DIR_NAME, via _worktree_changed noise rules) must not
     # keep an exact manually-committed candidate blocked. A status
-    # failure still refuses proof, as before.
+    # failure still refuses proof, as before. Bound to the prep
+    # record: a rewritten pointer stays blocked before any spawn.
     try:
-        if _worktree_changed(work):
+        bound = _work_git_bound(state, work)
+    except Exception:  # noqa: BLE001 - unprovable stays blocked
+        return False
+    try:
+        if _worktree_changed(work, git_bound=bound):
             return False
     except Exception:  # noqa: BLE001 - unprovable stays blocked
         return False
-    code, head, _ = run_cmd(["git", "-C", str(work), "rev-parse", "HEAD"])
+    code, head, _ = _hgit_run(work, ["rev-parse", "HEAD"],
+                              git_bound=bound,
+                              timeout=_GIT_PROBE_TIMEOUT)
     if code != 0 or not (head or "").strip() or head.strip() == base:
         return False
     try:
-        committed = _head_file_hashes(work, candidate.get("files"))
+        committed = _head_file_hashes(work, candidate.get("files"),
+                                      git_bound=bound)
     except Exception:  # noqa: BLE001 - unprovable stays blocked
         return False
     return _candidate_bytes_match(candidate, committed)
@@ -2254,7 +2375,8 @@ def _recover_commit_blocked(state: dict, work: Path) -> str:
         # waits for explicit manual reconciliation, preserving the tree.
         try:
             tracked, untracked = _candidate_path_set(
-                work, state.get("baseCommit"))
+                work, state.get("baseCommit"),
+                git_bound=_work_git_bound(state, work))
         except SourceUnreadable as exc:
             # Current path set unprovable: neither divergence nor
             # sameness can be shown — stay blocked, never commit.
@@ -2343,21 +2465,33 @@ def _apply_commit_retry_result(state: dict, work: Path, step: str,
 
 
 def snapshot_diff(work: Path, run_dir: Path, name: str,
-                base_commit: str | None = None) -> str | None:
+                base_commit: str | None = None, *,
+                git_bound=None) -> str | None:
     """Changed-files record anchored at the run base when known.
 
     Committed work changes vanish from a bare `git diff`, so prefer
     `git diff <base> -- .` (committed + dirty vs the run base); fall back to
     the legacy worktree diff when the base is unknown or not a git workdir.
+
+    Bound to the prep record on model-written trees: a missing
+    record or a rewritten pointer refuses the artifact (None)
+    before any spawn.
     """
-    if (work / ".git").exists() and base_commit not in (None, "", "unknown"):
-        code, out, _ = run_cmd(
-            ["git", "-C", str(work), "diff", "--stat", base_commit, "--"])
-        if code == 0 and out.strip():
-            dest = run_dir / f"{name}.diffstat.txt"
-            dest.write_text(out, encoding="utf-8")
-            return dest.name
-    code, out, _ = run_cmd(["git", "-C", str(work), "diff", "--stat"])
+    try:
+        if (work / ".git").exists() and base_commit not in (
+                None, "", "unknown"):
+            code, out, _ = _hgit_run(
+                work, ["diff", "--stat", base_commit, "--"],
+                git_bound=git_bound, timeout=_GIT_PROBE_TIMEOUT)
+            if code == 0 and out.strip():
+                dest = run_dir / f"{name}.diffstat.txt"
+                dest.write_text(out, encoding="utf-8")
+                return dest.name
+        code, out, _ = _hgit_run(
+            work, ["diff", "--stat"], git_bound=git_bound,
+            timeout=_GIT_PROBE_TIMEOUT)
+    except SourceUnreadable:
+        return None
     if code != 0:
         return None
     dest = run_dir / f"{name}.diffstat.txt"
@@ -2386,9 +2520,17 @@ _NOISE_PATHS = ("node_modules", ".pnp.cjs", ".pnp.loader.mjs", ".yarn/",
                 ".expo/", "Pods/", muse.CACHE_DIR_NAME + "/")
 
 
-def _worktree_changed(work: Path) -> bool:
-    """True when the fix step left real file changes (noise ignored)."""
-    code, out, _ = run_cmd(["git", "-C", str(work), "status", "--porcelain"])
+def _worktree_changed(work: Path, *, git_bound=None) -> bool:
+    """True when the fix step left real file changes (noise ignored).
+
+    Bound to the prep record on model-written trees: a missing
+    record or a rewritten pointer raises SourceUnreadable before
+    any spawn (callers without state treat it as changed; state
+    callers block with provenance).
+    """
+    code, out, _ = _hgit_run(work, ["status", "--porcelain"],
+                             git_bound=git_bound,
+                             timeout=_GIT_PROBE_TIMEOUT)
     if code != 0:
         return True
     for line in out.splitlines():
@@ -2790,7 +2932,9 @@ def settle_fix_watch_if_declared(state: dict, work, readable: str) -> bool:
     if fix.get("exit_code") != 0:
         return False
     try:
-        if _worktree_changed(Path(work)):
+        if _worktree_changed(
+                Path(work),
+                git_bound=_work_git_bound_or_none(state, work)):
             return False
     except Exception:  # noqa: BLE001 - unprovable change is not a settlement
         return False
@@ -2838,11 +2982,15 @@ def review_scope_artifact(state: dict, work: Path) -> dict:
     fingerprint, base..head stat+diff, and the dirty/untracked remainder
     with real paths. Saved as `review.scope.json` + `review.diff.txt` and
     returned (also recorded on the review step as evidence).
+
+    Bound to the prep record: a missing record or a rewritten
+    pointer raises SourceUnreadable before any spawn (the review
+    step then fails closed instead of scoping poisoned bytes).
     """
-    from .util import run_cmd as _run
     rdir = store.run_dir(state["id"])
     work = Path(work)
     base = state.get("baseCommit") or ""
+    bound = _work_git_bound(state, work)
     scope = {
         "base_commit": base,
         "base_ref": state.get("base_branch") or "",
@@ -2855,15 +3003,19 @@ def review_scope_artifact(state: dict, work: Path) -> dict:
         "dirty_status": "",
         "diff_capped": False,
     }
-    code0, out0, _ = _run(["git", "-C", str(work), "diff", "--stat"])
+    code0, out0, _ = _hgit_run(work, ["diff", "--stat"],
+                               git_bound=bound,
+                               timeout=_GIT_PROBE_TIMEOUT)
     scope["bare_git_diff_empty"] = (code0 == 0 and not out0.strip())
     if (work / ".git").exists() and base not in (None, "", "unknown"):
-        code, out, _ = _run(["git", "-C", str(work), "diff", "--stat",
-                             f"{base}..HEAD", "--"])
+        code, out, _ = _hgit_run(
+            work, ["diff", "--stat", f"{base}..HEAD", "--"],
+            git_bound=bound, timeout=_GIT_PROBE_TIMEOUT)
         if code == 0:
             scope["base_stat"] = out[-6000:]
-        code, out, _ = _run(["git", "-C", str(work), "diff",
-                             f"{base}..HEAD", "--"])
+        code, out, _ = _hgit_run(
+            work, ["diff", f"{base}..HEAD", "--"],
+            git_bound=bound, timeout=_GIT_PROBE_TIMEOUT)
         if code == 0:
             scope["base_diff"] = out[-30000:]
             scope["diff_capped"] = len(out) > 30000
@@ -2871,9 +3023,12 @@ def review_scope_artifact(state: dict, work: Path) -> dict:
             scope["base_diff"] = ""
     else:
         scope["base_diff"] = ""
-    code, out, _ = _run(["git", "-C", str(work), "status", "--porcelain"])
+    code, out, _ = _hgit_run(work, ["status", "--porcelain"],
+                             git_bound=bound,
+                             timeout=_GIT_PROBE_TIMEOUT)
     scope["dirty_status"] = out[-6000:] if code == 0 else ""
-    code, out, _ = _run(["git", "-C", str(work), "diff"])
+    code, out, _ = _hgit_run(work, ["diff"], git_bound=bound,
+                             timeout=_GIT_PROBE_TIMEOUT)
     scope["dirty_diff"] = out[-20000:] if code == 0 else ""
     try:
         (rdir / "review.scope.json").write_text(
@@ -2982,7 +3137,14 @@ def run_worker_step(state, profile, step, executor, work, body, context=""):
             ok = False
             out = out + "\n[openmainty] step output lacked expected markers; marking failed."
     fail_note = None
-    if ok and step == "fix" and is_live and not _worktree_changed(work):
+    try:
+        _fix_changed = _worktree_changed(
+            work, git_bound=_work_git_bound_or_none(state, work))
+    except SourceUnreadable:
+        # Unprovable is not "no change": fail closed toward changed
+        # so the read below refuses instead of certifying no-change.
+        _fix_changed = True
+    if ok and step == "fix" and is_live and not _fix_changed:
         ok = False
         fail_note = "fix step changed no files"
         out = out + "\n[openmainty] fix step changed no files; marking failed."
@@ -3072,7 +3234,8 @@ def run_worker_step(state, profile, step, executor, work, body, context=""):
                 f"(exit {commit.get('exit')}); work preserved uncommitted — "
                 "same-run commit-only recovery available")[:500]
             try:
-                snap = source_snapshot(work)
+                snap = source_snapshot(
+                    work, git_bound=_work_git_bound(state, work))
             except SourceUnreadable:
                 snap = None
             if snap is not None:
@@ -3081,7 +3244,8 @@ def run_worker_step(state, profile, step, executor, work, body, context=""):
             store.save(state)
             return False
         try:
-            snap = source_snapshot(work)
+            snap = source_snapshot(
+                work, git_bound=_work_git_bound(state, work))
         except SourceUnreadable as exc:
             state["waitReason"] = (
                 f"source-unreadable at fix refresh ({exc.op}): retry the "
@@ -3354,7 +3518,18 @@ def run_review(state, profile, executor, work, body) -> bool:
     rdir = store.run_dir(state["id"])
     store.mark(state, "review", "running",
                command=["muse", "exec", "(reviewer session)", "muse", "exec", "(apply session)"])
-    scope = review_scope_artifact(state, work)
+    try:
+        scope = review_scope_artifact(state, work)
+    except SourceUnreadable as exc:
+        store.mark(state, "review", "failed",
+                   evidence=[], usage={},
+                   note=(f"scope unreadable: source unreadable "
+                         f"({exc.op}) — retryable, prior proofs preserved"))
+        _note_wait_reason(
+            state, f"source-unreadable at review scope ({exc.op}): "
+            "retry the same run — stored proofs preserved")
+        store.save(state)
+        return False
     evidence = review_evidence_text(scope)
     try:
         code1, review_out, usage1 = executor.muse_step(
@@ -3420,7 +3595,8 @@ def run_review(state, profile, executor, work, body) -> bool:
                    note=note)
         return False
     try:
-        pre_apply_fp = source_snapshot(work)["fingerprint"]
+        pre_apply_fp = source_snapshot(
+            work, git_bound=_work_git_bound(state, work))["fingerprint"]
     except Exception:  # noqa: BLE001 - post-apply compare degrades to text-only
         pre_apply_fp = None
     try:
@@ -3438,7 +3614,8 @@ def run_review(state, profile, executor, work, body) -> bool:
         # (APPLIED:/SKIPPED: lines). An exit-0 no-op with actionable
         # findings remaining stays failed and never binds review green.
         try:
-            post_apply_fp = source_snapshot(work)["fingerprint"]
+            post_apply_fp = source_snapshot(
+                work, git_bound=_work_git_bound(state, work))["fingerprint"]
         except Exception:  # noqa: BLE001 - text evidence decides alone
             post_apply_fp = pre_apply_fp
         changed = (pre_apply_fp is not None and post_apply_fp is not None
@@ -3520,7 +3697,8 @@ def run_review(state, profile, executor, work, body) -> bool:
         # invalidate them against the new content instead of silently
         # blessing modified source with former checks.
         try:
-            fresh = source_snapshot(work)["fingerprint"]
+            fresh = source_snapshot(
+                work, git_bound=_work_git_bound(state, work))["fingerprint"]
             state["workTreeFingerprint"] = fresh
             store.save(state)
             reset = store.invalidate_stale_verifications(
@@ -3656,11 +3834,13 @@ def _draft_context(state: dict, work) -> str:
     """
     parts = []
     try:
+        bound = _work_git_bound(state, work)
         base = state.get("baseCommit") or ""
-        code, out, _ = run_cmd(
-            ["git", "-C", str(work), "diff", "--stat", base, "--"]
+        code, out, _ = _hgit_run(
+            work, ["diff", "--stat", base, "--"]
             if base not in (None, "", "unknown")
-            else ["git", "-C", str(work), "diff", "--stat"])
+            else ["diff", "--stat"],
+            git_bound=bound, timeout=_GIT_PROBE_TIMEOUT)
         if code == 0 and out.strip():
             parts.append("current diff (base..HEAD):\n" + out.strip())
     except Exception:  # noqa: BLE001 - context is best-effort
@@ -3911,13 +4091,29 @@ def _execute_inner(state, profile, executor, checkout, body="", only=None, write
                         pass
                     return False
                 return False
+            try:
+                bound = _work_git_bound(state, work)
+            except SourceUnreadable as exc:
+                state["waitReason"] = (
+                    f"source-unreadable at fix diff ({exc.op}): retry the "
+                    f"same run — stored proofs preserved")[:500]
+                store.save(state)
+                return False
             snapshot_diff(work, store.run_dir(state["id"]), "fix",
-                          state.get("baseCommit"))
+                          state.get("baseCommit"), git_bound=bound)
         elif step == "review":
             if not run_review(state, profile, executor, work, body):
                 return False
+            try:
+                bound = _work_git_bound(state, work)
+            except SourceUnreadable as exc:
+                state["waitReason"] = (
+                    f"source-unreadable at review diff ({exc.op}): retry "
+                    f"the same run — stored proofs preserved")[:500]
+                store.save(state)
+                return False
             snapshot_diff(work, store.run_dir(state["id"]), "review",
-                          state.get("baseCommit"))
+                          state.get("baseCommit"), git_bound=bound)
         elif step == "e2e":
             from . import pcconfig
             caps = pcconfig.load().get("capabilities", {})

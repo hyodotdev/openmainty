@@ -275,9 +275,17 @@ class PrArgvAllowListTests(unittest.TestCase):
              "--limit", "30", "--json", prs.PR_LIST_FIELDS])
 
     def test_diffstat_argv_exact(self):
-        self.assertEqual(
-            prs.GIT_DIFFSTAT_ARGV,
-            ["git", "--no-optional-locks", "diff", "--stat"])
+        # 301: no bare git argv constant remains; the diff argv is
+        # built via runner.hardened_git_argv (fsmonitor/hooks/
+        # drivers off, system/global config off, pointer pinned
+        # when bound).
+        import pathlib
+        self.assertFalse(hasattr(prs, "GIT_DIFFSTAT_ARGV"))
+        prs_src = (pathlib.Path(__file__).resolve().parent.parent
+                   / "src" / "openmainty" / "prs.py").read_text(
+                       encoding="utf-8")
+        self.assertIn("hardened_git_argv", prs_src)
+        self.assertIn("hardened_git_env", prs_src)
 
     def test_docstring_leads_future_import(self):
         src = (Path(__file__).resolve().parent.parent / "src"
@@ -298,7 +306,9 @@ class PrArgvAllowListTests(unittest.TestCase):
                 hits.append(path.name + ":pull/")
         self.assertEqual(hits, ["prs.py"])
         prs_src = (src / "prs.py").read_text(encoding="utf-8")
-        self.assertEqual(prs_src.count("subprocess.run"), 1)
+        # 301: exactly two spawns — the bound and the unbound
+        # hardened shapes of the same read-only diff.
+        self.assertEqual(prs_src.count("subprocess.run"), 2)
         cli_src = (src / "cli.py").read_text(encoding="utf-8")
         self.assertIn("prs.pr_list_argv", cli_src)
 
@@ -324,6 +334,7 @@ class DiffstatRefGuardTests(unittest.TestCase):
             seen["argv"] = kwargs.get("args", args[0] if args
                                       else None)
             seen["cwd"] = kwargs.get("cwd")
+            seen["env"] = kwargs.get("env")
             proc = mock.Mock()
             proc.returncode = 0
             proc.stdout = " f.txt | 2 +-\n"
@@ -333,8 +344,16 @@ class DiffstatRefGuardTests(unittest.TestCase):
                         side_effect=_fake_run):
             out = prs.work_diffstat("/tmp/om66-ward", "evil-branch")
         self.assertIn("f.txt", out)
-        self.assertEqual(seen["argv"], prs.GIT_DIFFSTAT_ARGV
-                         + ["HEAD"])
+        # 301: the argv is the hardened shape (no bare git spawn):
+        # pinned -c overrides, the safe ref, and a scrubbed env.
+        self.assertEqual(seen["argv"][0], "git")
+        self.assertIn("HEAD", seen["argv"])
+        self.assertIn("core.fsmonitor=false", seen["argv"])
+        self.assertIn("core.hooksPath=/dev/null", seen["argv"])
+        self.assertNotIn("evil-branch", seen["argv"])
+        self.assertEqual(seen["env"].get("GIT_CONFIG_GLOBAL"),
+                         "/dev/null")
+        self.assertEqual(seen["env"].get("GIT_CONFIG_NOSYSTEM"), "1")
 
     def test_good_sha_passes_through(self):
         seen = {}
@@ -350,8 +369,10 @@ class DiffstatRefGuardTests(unittest.TestCase):
         with mock.patch("openmainty.prs.subprocess.run",
                         side_effect=_fake_run):
             prs.work_diffstat("/tmp/om66-ward", "abc1234")
-        self.assertEqual(seen["argv"], prs.GIT_DIFFSTAT_ARGV
-                         + ["abc1234"])
+        self.assertEqual(seen["argv"][0], "git")
+        self.assertIn("abc1234", seen["argv"])
+        self.assertIn("core.fsmonitor=false", seen["argv"])
+        self.assertIn("core.hooksPath=/dev/null", seen["argv"])
 
 
 if __name__ == "__main__":

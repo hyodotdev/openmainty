@@ -661,13 +661,13 @@ _BUILDERS = ("hardened_git_argv",)
 
 # (file, qualname) allowed to spawn git outside the hardened path.
 # Owner checkouts and driver flows only; every worker-touched tree
-# (derived repair worktree) must route via hardened_git_argv, which
-# the scanner treats as clean. M2/batch/fastcheck run-tree sites
-# are marked FOLLOWUP: model-touched trees, out of 299b scope.
+# (derived repair worktree, M2 run tree, prepared op tree) must
+# route via hardened_git_argv, which the scanner treats as clean.
+# 301 hardened every remaining model-tree site, so the FOLLOWUP
+# entries are gone: membership now means owner-only (or
+# driver-owned), and any bare spawn outside it fails the gate.
 _GIT_SPAWN_ALLOW = frozenset({
     ("batches.py", "_git_head_diag"),
-    ("batches.py", "_git_text"),
-    ("batches.py", "_git_lines"),
     ("batches.py", "_run_git"),
     ("batches.py", "_qa_git"),
     ("batches.py", "_qa_archive"),
@@ -680,28 +680,15 @@ _GIT_SPAWN_ALLOW = frozenset({
     ("branches.py", "maybe_fast_forward_next"),
     ("chat.py", "delete"),
     ("chat.py", "ensure_workdir"),
-    ("fastcheck.py", "_git_tracked_files"),  # FOLLOWUP correction 4
-    ("fastcheck.py", "_podfile_pins_by_file"),  # FOLLOWUP
-    ("fastcheck.py", "_git_dirs"),  # FOLLOWUP correction 4
     ("gc.py", "_git_rev_parse"),
     ("graph.py", "_local_ref_branches"),
     ("issue_recovery.py", "_git"),
     ("manifests.py", "lock_provenance"),
-    ("prs.py", "work_diffstat"),  # FOLLOWUP: M2 run workdir
     ("repos.py", "_pub_lock_state._git_ok"),
     ("runner.py", "ensure_branch_workdir"),
     ("runner.py", "git_rev"),
     ("runner.py", "git_rev_strict"),
-    ("runner.py", "work_commit"),
     ("runner.py", "_git_config_origins"),
-    ("runner.py", "_candidate_path_set"),
-    ("runner.py", "maybe_commit_worktree"),  # FOLLOWUP: M2 tree
-    ("runner.py", "_head_file_hashes"),
-    ("runner.py", "_candidate_already_committed"),
-    ("runner.py", "snapshot_diff"),
-    ("runner.py", "_worktree_changed"),
-    ("runner.py", "review_scope_artifact"),
-    ("runner.py", "_draft_context"),
     ("sched.py", "_strict_rev_parse"),
     ("sched.py", "_fetch_remote_refs"),
     ("sched.py", "_resolve_main_base"),
@@ -710,9 +697,18 @@ _GIT_SPAWN_ALLOW = frozenset({
     ("sched.py", "_dep_diff_evidence"),
     ("serve.py", "_git"),
     ("serve.py", "_clone_repo"),
-    ("serve.py", "_git_text"),
     ("serve.py", "_git_run"),
     ("util.py", "_private_index_copy"),
+    # 301 hardened (bound, pinned, scrubbed) — intentionally NOT
+    # allowlisted, so the gate fails if a bare spawn returns:
+    # batches._git_text, batches._git_lines,
+    # fastcheck._git_tracked_files, fastcheck._podfile_pins_by_file,
+    # fastcheck._git_dirs, prs.work_diffstat, serve._git_text,
+    # runner.work_commit, runner._candidate_path_set,
+    # runner.maybe_commit_worktree, runner._head_file_hashes,
+    # runner._candidate_already_committed, runner.snapshot_diff,
+    # runner._worktree_changed, runner.review_scope_artifact,
+    # runner._draft_context.
 })
 
 

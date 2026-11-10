@@ -1968,26 +1968,81 @@ _UNTRACKED_READ_LIMIT = 100 * 1024
 _REQUEST_GIT_TIMEOUT_S = 8
 
 
-def _git_text(work, args: list):
+def _serve_git_bound(state: dict):
+    """(bound_or_None, refused) for this run's live worktree.
+
+    Bound is the prep record from the run state (recorded when the
+    app created the tree, before any model step). refused is True
+    when the tree is git but the record is missing or unprovable:
+    live views then fail closed (stored/historical payload, never
+    live bytes from a model-touched tree).
+    """
+    from . import runner as _runner
+    try:
+        work = store.run_dir(state.get("id")) / "work"
+    except Exception:  # noqa: BLE001 - no provable tree, no refusal
+        return None, False
+    try:
+        if not _runner._git_present(work):
+            return None, False
+    except Exception:  # noqa: BLE001 - unprovable presence refuses
+        return None, True
+    rec = state.get("workGit")
+    if not isinstance(rec, dict) or not rec:
+        return None, True
+    return rec, False
+
+
+def _git_text(work, args: list, *, git_bound=None):
     """(code, stdout, stderr) for a read-only git command; never raises.
 
     Code 124 means the probe timed out: the live state is UNKNOWN, never
     clean and never "no changes". Callers must not present a timeout as a
-    verified result."""
-    from .util import run_cmd as _run
+    verified result. 301: bound to the prep record on model-written
+    trees (pinned gitdir, scrubbed env, nested .git refused);
+    unbound reads use the same hardened flags + scrubbed env.
+    A refused pointer reads as code 128 with no output.
+    301b: index-refreshing verbs (diff, status) run against a
+    private per-call index copy (M2.21b), bound and unbound alike,
+    so a dashboard GET never writes the worktree's index while a
+    worker may hold it. When the copy cannot be made the read
+    keeps the env rule only — never a refusal for that."""
+    from . import runner as _runner
+    from .util import git_readonly_child_env as _ro_env
     try:
-        code, out, err = _run(["git", "-C", str(work)] + args,
-                               timeout=_REQUEST_GIT_TIMEOUT_S)
+        if git_bound is not None:
+            try:
+                paths = _runner.reprove_git_pointer(work, git_bound)
+            except Exception as exc:  # noqa: BLE001 - fail closed
+                return 128, "", str(exc)[:200]
+            argv = _runner.hardened_git_argv(
+                list(args), gitdir=paths["gitdir"],
+                worktree=paths["worktree"])
+        else:
+            argv = _runner.hardened_git_argv(
+                ["-C", str(work)] + list(args))
+        try:
+            with _ro_env(argv, _runner.hardened_git_env(),
+                         cwd=None) as env:
+                proc = subprocess.run(
+                    argv, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=_REQUEST_GIT_TIMEOUT_S, text=True,
+                    env=env)
+        except subprocess.TimeoutExpired:
+            return 124, "", "timed out"
     except Exception as exc:  # noqa: BLE001
         return 128, "", str(exc)[:200]
-    return code, out or "", err or ""
+    return (proc.returncode, proc.stdout or "",
+            (proc.stderr or "")[:200])
 
 
-def _relevant_untracked(work, rels: list) -> tuple:
+def _relevant_untracked(work, rels: list, *, git_bound=None) -> tuple:
     """Split `??` relpaths into relevant source vs skipped noise/ignored.
 
     Generated, cache, and git-ignored paths never count as source
     changes; only real source files get content attached.
+    301: the ignore probe runs bound to the prep record.
     """
     from . import runner as _runner
     relevant, skipped = [], 0
@@ -2000,7 +2055,8 @@ def _relevant_untracked(work, rels: list) -> tuple:
         # itself is screened like any other generated/cache dir.
         probe = rel + "/x" if rel.endswith("/") else rel
         try:
-            if _runner._noise_rel(probe) or _runner._is_ignored(work, rel):
+            if _runner._noise_rel(probe) or _runner._is_ignored(
+                    work, rel, git_bound=git_bound):
                 skipped += 1
                 continue
         except Exception:  # noqa: BLE001 - unreadable tree: keep it visible
@@ -2108,8 +2164,15 @@ def _source_changes(state: dict) -> dict:
     base = state.get("baseCommit")
     recorded = state.get("workCommit")
     git_ok = work.is_dir() and (work / ".git").exists()
+    # 301: live reads need the prep record. A git tree with a
+    # missing/unprovable record fails closed to the stored path
+    # below (never live bytes from a model-touched tree).
+    bound, refused = _serve_git_bound(state) if git_ok else (None, False)
+    if refused:
+        git_ok = False
     if git_ok:
-        code, out, _ = _git_text(work, ["rev-parse", "HEAD"])
+        code, out, _ = _git_text(work, ["rev-parse", "HEAD"],
+                                 git_bound=bound)
         # A timed-out probe (124) is not a missing worktree: the live state
         # is UNKNOWN, and the stored path below must say so.
         rev_timed_out = (code == 124)
@@ -2117,8 +2180,10 @@ def _source_changes(state: dict) -> dict:
     else:
         rev_timed_out = False
         live_head = None
+        bound = None
     if git_ok and live_head:
-        return _live_source_changes(state, work, base, recorded, live_head)
+        return _live_source_changes(state, work, base, recorded, live_head,
+                                    git_bound=bound)
     if _run_never_started(state) and not _has_stored_artifacts(rdir):
         return _planned_source_changes(state, base, recorded,
                                        work_available=work.is_dir())
@@ -2194,8 +2259,11 @@ def _planned_source_changes(state: dict, base, recorded,
             "note": "no changes yet: planned state, no diff link"}
 
 
-def _live_source_changes(state: dict, work, base, recorded, live_head) -> dict:
-    """sourceChanges from the live isolated worktree (availability live)."""
+def _live_source_changes(state: dict, work, base, recorded, live_head,
+                         *, git_bound=None) -> dict:
+    """sourceChanges from the live isolated worktree (availability live).
+
+    301: every git read below runs bound to the prep record."""
     sections = []
     provenance = []
     committed_stat_files: list = []
@@ -2203,41 +2271,49 @@ def _live_source_changes(state: dict, work, base, recorded, live_head) -> dict:
         # numstat: full relative paths + real add/delete counts (the
         # abbreviated `--stat` display truncated deep paths with `...`
         # and its bar chars miscounted large changes).
-        code, out, _ = _git_text(work, ["diff", "--numstat", f"{base}..HEAD", "--"])
+        code, out, _ = _git_text(
+            work, ["diff", "--numstat", f"{base}..HEAD", "--"],
+            git_bound=git_bound)
         if code == 0 and out.strip():
             committed_stat_files = _parse_numstat_text(out)
             sections.append((committed_stat_files, "committed"))
             provenance.append("committed(base..HEAD)")
         code, committed_diff, _ = _git_text(
-            work, ["diff", f"{base}..HEAD", "--"])
+            work, ["diff", f"{base}..HEAD", "--"],
+            git_bound=git_bound)
         committed_diff = committed_diff if code == 0 else ""
     else:
         committed_diff = ""
-    code, out, _ = _git_text(work, ["diff", "--cached", "--numstat", "--"])
+    code, out, _ = _git_text(work, ["diff", "--cached", "--numstat", "--"],
+                             git_bound=git_bound)
     staged_stat_files: list = []
     if code == 0 and out.strip():
         staged_stat_files = _parse_numstat_text(out)
         sections.append((staged_stat_files, "staged"))
         provenance.append("staged")
-    code, staged_diff, _ = _git_text(work, ["diff", "--cached", "--"])
+    code, staged_diff, _ = _git_text(work, ["diff", "--cached", "--"],
+                                    git_bound=git_bound)
     staged_diff = staged_diff if code == 0 else ""
-    code, out, _ = _git_text(work, ["diff", "--numstat", "--"])
+    code, out, _ = _git_text(work, ["diff", "--numstat", "--"],
+                             git_bound=git_bound)
     unstaged_stat_files: list = []
     if code == 0 and out.strip():
         unstaged_stat_files = _parse_numstat_text(out)
         sections.append((unstaged_stat_files, "unstaged"))
         provenance.append("unstaged")
-    code, unstaged_diff, _ = _git_text(work, ["diff", "--"])
+    code, unstaged_diff, _ = _git_text(work, ["diff", "--"],
+                                       git_bound=git_bound)
     unstaged_diff = unstaged_diff if code == 0 else ""
     code, status_out, status_err = _git_text(
-        work, ["status", "--porcelain"])
+        work, ["status", "--porcelain"], git_bound=git_bound)
     dirty_status = status_out[:6000] if code == 0 else ""
     raw_untracked = []
     if code == 0:
         for line in status_out.splitlines():
             if line.startswith("??"):
                 raw_untracked.append(line[3:].strip().strip('"'))
-    relevant, skipped = _relevant_untracked(work, raw_untracked)
+    relevant, skipped = _relevant_untracked(work, raw_untracked,
+                                            git_bound=git_bound)
     untracked = relevant[:_UNTRACKED_LIST_CAP]
     if len(relevant) > _UNTRACKED_LIST_CAP:
         provenance.append(f"untracked-list-capped({len(relevant)})")
@@ -2557,20 +2633,24 @@ def _single_untracked_entry(work, rel: str):
     return entry
 
 
-def _live_file_patch(work, base, rel: str, untracked_relevant: set) -> dict:
+def _live_file_patch(work, base, rel: str, untracked_relevant: set,
+                     *, git_bound=None) -> dict:
     """Exact per-file live patch: committed + staged + unstaged + untracked.
 
     Safe git arg lists only (`-- <path>`); never falls back to another
     file or the repo-wide diff. Each section is bounded and `capped`
-    says so explicitly.
+    says so explicitly. 301: bound to the prep record.
     """
     committed = staged = unstaged = ""
     if base not in (None, "", "unknown"):
-        code, out, _ = _git_text(work, ["diff", f"{base}..HEAD", "--", rel])
+        code, out, _ = _git_text(work, ["diff", f"{base}..HEAD", "--", rel],
+                                 git_bound=git_bound)
         committed = out if code == 0 else ""
-    code, out, _ = _git_text(work, ["diff", "--cached", "--", rel])
+    code, out, _ = _git_text(work, ["diff", "--cached", "--", rel],
+                             git_bound=git_bound)
     staged = out if code == 0 else ""
-    code, out, _ = _git_text(work, ["diff", "--", rel])
+    code, out, _ = _git_text(work, ["diff", "--", rel],
+                             git_bound=git_bound)
     unstaged = out if code == 0 else ""
     capped = False
 
@@ -2659,6 +2739,12 @@ def _file_patch(state: dict, sc: dict, rel: str) -> dict:
     rdir = store.run_dir(state["id"])
     work = rdir / "work"
     git_ok = work.is_dir() and (work / ".git").exists()
+    # 301: per-file live patch needs the prep record too; without
+    # it the request falls through to the historical section below
+    # (explicit unavailable, never live bytes).
+    bound, refused = _serve_git_bound(state) if git_ok else (None, False)
+    if refused:
+        git_ok = False
     if sc.get("availability") == "live" and git_ok:
         allowed = ({f["path"] for f in sc.get("fileDiffs", [])}
                    | set(sc.get("untracked", [])))
@@ -2677,14 +2763,17 @@ def _file_patch(state: dict, sc: dict, rel: str) -> dict:
                 (work / rel).resolve().relative_to(work.resolve())
             except ValueError:
                 raise ApiError(400, f"path escapes the run worktree: {rel}")
-        code, status_out, _ = _git_text(work, ["status", "--porcelain"])
+        code, status_out, _ = _git_text(work, ["status", "--porcelain"],
+                                        git_bound=bound)
         relevant: set = set()
         if code == 0:
             raw = [ln[3:].strip().strip('"')
                    for ln in status_out.splitlines() if ln.startswith("??")]
-            relevant_set, _ = _relevant_untracked(work, raw)
+            relevant_set, _ = _relevant_untracked(work, raw,
+                                                  git_bound=bound)
             relevant = set(relevant_set)
-        return _live_file_patch(work, state.get("baseCommit"), rel, relevant)
+        return _live_file_patch(work, state.get("baseCommit"), rel, relevant,
+                                git_bound=bound)
     # No live worktree: the exact historical section, or explicit per-file
     # unavailable. `planned` is never claimed here.
     allowed = ({f["path"] for f in sc.get("fileDiffs", [])})

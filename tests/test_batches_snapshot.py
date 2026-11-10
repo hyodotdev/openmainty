@@ -222,10 +222,10 @@ class ConcurrentRefreshTests(unittest.TestCase):
         self.before = self.batch_path.read_bytes()
         orig = batches._snapshot_status
 
-        def fault(worktree):
+        def fault(worktree, **kw):
             if str(self.wt) in (worktree or ""):
                 return None, "source_unreadable", "tracked-list", 124
-            return orig(worktree)
+            return orig(worktree, **kw)
 
         batches._snapshot_status = fault
         self.addCleanup(setattr, batches, "_snapshot_status", orig)

@@ -784,11 +784,21 @@ class TrackedFilesNoHelperTests(unittest.TestCase):
 
         def fake_run(argv, **kw):
             seen["argv"] = list(argv)
-            return real_run(
-                [a for a in argv if a not in (
-                    "-c", "core.fsmonitor=false",
-                    "core.hooksPath=/dev/null")],
-                **kw)
+            # 301: the hardened shape carries several -c K=V pairs
+            # (fsmonitor/hooks off plus driver/pager/ssh pins);
+            # strip every pair to prove the bare command underneath
+            # still lists the tree.
+            rest = []
+            skip = False
+            for a in argv:
+                if skip:
+                    skip = False
+                    continue
+                if a == "-c":
+                    skip = True
+                    continue
+                rest.append(a)
+            return real_run(rest, **kw)
 
         tmp = TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

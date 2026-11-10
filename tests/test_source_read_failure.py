@@ -80,30 +80,34 @@ def make_git_repo(path: Path) -> Path:
 def fail_z_lists(real_run_cmd):
     """Inject rc=128 for NUL-separated git list reads only; pass through."""
 
-    def router(cmd, cwd=None, timeout=600, cancel_event=None):
+    def router(cmd, cwd=None, timeout=600, cancel_event=None, **kw):
         argv = list(cmd)
         if "-z" in argv:
             return 128, "", "injected read failure"
         return real_run_cmd(cmd, cwd=cwd, timeout=timeout,
-                            cancel_event=cancel_event)
+                            cancel_event=cancel_event, **kw)
 
     return router
 
 
 def git_operation(argv):
-    """Git subcommand for ['git', '-C', <path>, <op>, ...] style argv.
+    """Git subcommand for hardened ['git', -c ..., (--git-dir X
+    --work-tree Y | -C <path>), <op>, ...] style argv.
 
-    Skips the global `-C <path>` and `-c <k=v>` prefixes so the real
-    verb is inspected — a filename argument is never mistaken for one.
+    Skips the `-c <k=v>` overrides and the pinned `-C <path>` or
+    `--git-dir/--work-tree` location pair so the real verb is
+    inspected — a filename argument is never mistaken for one.
     """
     argv = list(argv)
     if len(argv) < 2 or argv[0] != "git":
         return None
     i = 1
-    if i < len(argv) and argv[i] == "-C":
-        i += 2
     while i < len(argv) and argv[i] == "-c":
         i += 2
+    if i < len(argv) and argv[i] == "-C":
+        i += 2
+    elif i < len(argv) and argv[i] == "--git-dir":
+        i += 4
     return argv[i] if i < len(argv) else None
 
 
@@ -126,7 +130,7 @@ class ReadFailureTests(unittest.TestCase):
     def test_git_probe_timeout_degrades_fast(self):
         seen = {}
 
-        def router(cmd, cwd=None, timeout=600, cancel_event=None):
+        def router(cmd, cwd=None, timeout=600, cancel_event=None, **kw):
             seen.setdefault("timeout", timeout)
             return 124, "", "timed out"
 
@@ -139,12 +143,12 @@ class ReadFailureTests(unittest.TestCase):
     def test_git_status_only_failure_still_unavailable(self):
         real = runner.run_cmd
 
-        def router(cmd, cwd=None, timeout=600, cancel_event=None):
+        def router(cmd, cwd=None, timeout=600, cancel_event=None, **kw):
             argv = list(cmd)
             if "status" in argv and "-z" in argv:
                 return 128, "", "injected status failure"
             return real(cmd, cwd=cwd, timeout=timeout,
-                        cancel_event=cancel_event)
+                        cancel_event=cancel_event, **kw)
 
         with mock.patch.object(runner, "run_cmd", side_effect=router):
             with self.assertRaises(runner.SourceUnreadable):
@@ -154,12 +158,12 @@ class ReadFailureTests(unittest.TestCase):
     def test_head_read_failure_is_unavailable_not_unknown_head(self):
         real = runner.run_cmd
 
-        def router(cmd, cwd=None, timeout=600, cancel_event=None):
+        def router(cmd, cwd=None, timeout=600, cancel_event=None, **kw):
             argv = list(cmd)
             if "rev-parse" in argv:
                 return 128, "", "injected head failure"
             return real(cmd, cwd=cwd, timeout=timeout,
-                        cancel_event=cancel_event)
+                        cancel_event=cancel_event, **kw)
 
         with mock.patch.object(runner, "run_cmd", side_effect=router):
             with self.assertRaises(runner.SourceUnreadable) as ctx:
@@ -170,12 +174,12 @@ class ReadFailureTests(unittest.TestCase):
     def test_empty_head_output_is_unavailable(self):
         real = runner.run_cmd
 
-        def router(cmd, cwd=None, timeout=600, cancel_event=None):
+        def router(cmd, cwd=None, timeout=600, cancel_event=None, **kw):
             argv = list(cmd)
             if "rev-parse" in argv:
                 return 0, "\n", ""
             return real(cmd, cwd=cwd, timeout=timeout,
-                        cancel_event=cancel_event)
+                        cancel_event=cancel_event, **kw)
 
         with mock.patch.object(runner, "run_cmd", side_effect=router):
             with self.assertRaises(runner.SourceUnreadable):
@@ -346,6 +350,8 @@ class StoreBackedTests(unittest.TestCase):
         work = store.run_dir(state["id"]) / "work"
         make_git_repo(work)
         state["branch"] = "codex/test-read-failure"
+        # 301: model-tree reads bind to the prep record.
+        state["workGit"] = runner.record_git_pointer(work)
         store.save(state)
         return state, work
 
@@ -406,13 +412,13 @@ class StoreBackedTests(unittest.TestCase):
         orig_maybe = runner.maybe_commit_worktree
 
         def fail_at_fix_commit(cmd, cwd=None, timeout=600,
-                               cancel_event=None):
+                               cancel_event=None, **kw):
             argv = list(cmd)
             if "-z" in argv and in_commit:
                 injected[0] += 1
                 return 128, "", "injected read failure"
             return real(cmd, cwd=cwd, timeout=timeout,
-                        cancel_event=cancel_event)
+                        cancel_event=cancel_event, **kw)
 
         def counting_maybe(state, work, step):
             in_commit.append(step)
@@ -448,10 +454,10 @@ class StoreBackedTests(unittest.TestCase):
         before_proofs = dict(state.get("verifiedFingerprints") or {})
         recorded = []
 
-        def recording(cmd, cwd=None, timeout=600, cancel_event=None):
+        def recording(cmd, cwd=None, timeout=600, cancel_event=None, **kw):
             recorded.append(list(cmd))
             return real(cmd, cwd=cwd, timeout=timeout,
-                        cancel_event=cancel_event)
+                        cancel_event=cancel_event, **kw)
 
         with mock.patch.object(runner, "run_cmd", side_effect=recording):
             second = runner._execute_inner(state, dict(PROFILE), ex,
@@ -492,7 +498,7 @@ class StoreBackedTests(unittest.TestCase):
         (work / "a.txt").write_text("dirty\n", encoding="utf-8")
         head = git("rev-parse", "HEAD", cwd=work).strip()
         candidate = runner._blocked_candidate_snapshot(
-            {"baseCommit": head}, work)
+            {**state, "baseCommit": head}, work)
         self.assertTrue(candidate["complete"])
         orig_read = Path.read_bytes
 
@@ -529,11 +535,11 @@ class StoreBackedTests(unittest.TestCase):
 
         real = runner.run_cmd
 
-        def fail_commit(cmd, cwd=None, timeout=600, cancel_event=None):
+        def fail_commit(cmd, cwd=None, timeout=600, cancel_event=None, **kw):
             if "commit" in list(cmd):
                 return (1, "", "fatal: forced git error")
             return real(cmd, cwd=cwd, timeout=timeout,
-                        cancel_event=cancel_event)
+                        cancel_event=cancel_event, **kw)
 
         with mock.patch.object(Path, "read_bytes", denied_read), \
                 mock.patch.object(runner, "run_cmd",
@@ -558,10 +564,10 @@ class StoreBackedTests(unittest.TestCase):
         real = runner.run_cmd
         recorded = []
 
-        def recording(cmd, cwd=None, timeout=600, cancel_event=None):
+        def recording(cmd, cwd=None, timeout=600, cancel_event=None, **kw):
             recorded.append(list(cmd))
             return real(cmd, cwd=cwd, timeout=timeout,
-                        cancel_event=cancel_event)
+                        cancel_event=cancel_event, **kw)
 
         with mock.patch.object(runner, "run_cmd", side_effect=recording):
             outcome = runner._recover_commit_blocked(state, work)
@@ -588,13 +594,13 @@ class StoreBackedTests(unittest.TestCase):
         (work / "new.py").write_text("print('new')\n", encoding="utf-8")
         real = runner.run_cmd
 
-        def fail_names(cmd, cwd=None, timeout=600, cancel_event=None):
+        def fail_names(cmd, cwd=None, timeout=600, cancel_event=None, **kw):
             if "--name-only" in list(cmd):
                 return 128, "", "injected list failure"
             if "commit" in list(cmd):
                 return (1, "", "fatal: forced git error")
             return real(cmd, cwd=cwd, timeout=timeout,
-                        cancel_event=cancel_event)
+                        cancel_event=cancel_event, **kw)
 
         with mock.patch.object(runner, "run_cmd", side_effect=fail_names):
             with self.assertRaises(runner.SourceUnreadable):
@@ -614,10 +620,10 @@ class StoreBackedTests(unittest.TestCase):
                          own_head)
         recorded = []
 
-        def recording(cmd, cwd=None, timeout=600, cancel_event=None):
+        def recording(cmd, cwd=None, timeout=600, cancel_event=None, **kw):
             recorded.append(list(cmd))
             return real(cmd, cwd=cwd, timeout=timeout,
-                        cancel_event=cancel_event)
+                        cancel_event=cancel_event, **kw)
 
         with mock.patch.object(runner, "run_cmd", side_effect=recording):
             outcome = runner._recover_commit_blocked(state, work)

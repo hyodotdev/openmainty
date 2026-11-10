@@ -152,15 +152,16 @@ _GIT_READONLY = frozenset({
 
 
 def _git_subcommand(argv):
-    """(subcommand, rest) for a git argv, skipping -C/-c pairs and
-    bare flags. Returns (None, []) when there is no subcommand."""
+    """(subcommand, rest) for a git argv, skipping -C/-c pairs,
+    --git-dir/--work-tree pins and bare flags. Returns (None, [])
+    when there is no subcommand."""
     args = [str(a) for a in (argv or [])]
     if not args or args[0] != "git":
         return None, []
     i = 1
     while i < len(args):
         tok = args[i]
-        if tok in ("-C", "-c"):
+        if tok in ("-C", "-c", "--git-dir", "--work-tree"):
             i += 2
             continue
         if tok.startswith("-"):
@@ -203,7 +204,9 @@ _GIT_INDEX_REFRESH = frozenset({"diff", "status"})
 
 
 def _git_workdir(argv, cwd=None):
-    """Worktree path for a git argv: the last -C value, else cwd."""
+    """Worktree path for a git argv: the last -C value, else the
+    pinned --work-tree value, else cwd. Never rely on parsing -C:
+    bound (pinned) argv carries no -C."""
     args = [str(a) for a in (argv or [])]
     found = None
     i = 1 if args and args[0] == "git" else 0
@@ -213,7 +216,11 @@ def _git_workdir(argv, cwd=None):
             found = args[i + 1]
             i += 2
             continue
-        if tok in ("-C", "-c"):
+        if tok == "--work-tree" and i + 1 < len(args):
+            found = args[i + 1]
+            i += 2
+            continue
+        if tok in ("-C", "-c", "--git-dir"):
             i += 2
             continue
         if tok.startswith("-"):
@@ -225,22 +232,75 @@ def _git_workdir(argv, cwd=None):
     return cwd
 
 
-def _private_index_copy(workdir):
-    """Per-call temp copy of workdir's index; path or None.
+# 301c: hardened flags for the unpinned index probe, kept as
+# a literal duplicate of runner._HARDENED_GIT_CONFIG so util
+# stays import-cycle free (runner imports util). A pin test in
+# test_301b_private_index asserts the two lists stay equal.
+_HARDENED_PROBE_CONFIG = (
+    ("core.fsmonitor", "false"),
+    ("core.hooksPath", "/dev/null"),
+    ("core.sshCommand", ""),
+    ("core.attributesFile", "/dev/null"),
+)
 
-    Resolves the index with a read-only `rev-parse --git-path
-    index` (optional locks on, GIT_INDEX_FILE scrubbed so a
-    caller-set copy never resolves to itself), then copies the
-    bytes to a product-owned temp file. Any failure (unresolvable,
-    missing index, copy error) returns None: the caller falls back
-    to today's behaviour plus the env rule. Never raises.
+
+def _pinned_gitdir(argv):
+    """The pinned --git-dir of a hardened bound argv, or None.
+
+    Never raises; unrecognized shapes read as unpinned."""
+    try:
+        args = [str(a) for a in (argv or [])]
+        i = 1 if args and args[0] == "git" else 0
+        while i < len(args):
+            tok = args[i]
+            if tok == "--git-dir" and i + 1 < len(args):
+                return args[i + 1]
+            if tok.startswith("--git-dir="):
+                return tok[len("--git-dir="):]
+            if tok in ("-C", "-c", "--work-tree"):
+                i += 2
+                continue
+            i += 1
+    except Exception:
+        pass
+    return None
+
+
+def _private_index_copy(workdir, argv=None, env=None):
+    """Per-call temp copy of the index; path or None.
+
+    Pinned argv (a bound call carrying --git-dir): the index is
+    <pinned gitdir>/index, taken directly with no spawn and no
+    discovery — a rewritten worktree .git pointer cannot divert
+    the copy. Missing file reads as None (fallback, as before).
+
+    Unpinned argv: resolves the index with a read-only
+    `rev-parse --git-path index` run through the same hardened
+    -c set as the call itself (fsmonitor/hooks off), with the
+    caller's env (GIT_INDEX_FILE popped so a caller-set copy
+    never resolves to itself) — never os.environ. env=None
+    keeps the old os.environ-based base plus the hardened flags.
+
+    Either way the bytes go to a product-owned temp file. Any
+    failure (unresolvable, missing index, copy error) returns
+    None: the caller falls back to today's behaviour plus the
+    env rule, never a refusal. Never raises.
     """
     try:
+        pinned = _pinned_gitdir(argv)
+        if pinned is not None:
+            index = Path(pinned) / "index"
+            if not index.is_file():
+                return None
+            return _copy_index_file(index)
         if not workdir:
             return None
-        probe = ["git", "-C", str(workdir), "rev-parse",
-                 "--git-path", "index"]
-        base = dict(os.environ)
+        probe = ["git"]
+        for key, value in _HARDENED_PROBE_CONFIG:
+            probe += ["-c", "%s=%s" % (key, value)]
+        probe += ["-C", str(workdir), "rev-parse",
+                  "--git-path", "index"]
+        base = dict(env) if env is not None else dict(os.environ)
         base.pop("GIT_INDEX_FILE", None)
         base["GIT_OPTIONAL_LOCKS"] = "0"
         out = subprocess.run(probe, stdout=subprocess.PIPE,
@@ -257,6 +317,14 @@ def _private_index_copy(workdir):
             index = Path(str(workdir)) / index
         if not index.is_file():
             return None
+        return _copy_index_file(index)
+    except Exception:
+        return None
+
+
+def _copy_index_file(index):
+    """Copy an index file to a product-owned temp path; path or None."""
+    try:
         fd, tmp = tempfile.mkstemp(prefix="om-index-")
         os.close(fd)
         # M2.22b: keep the index file's mtime on the copy.
@@ -278,8 +346,10 @@ def git_readonly_child_env(argv, env=None, cwd=None):
     Same env rule as git_env_for_readonly (GIT_OPTIONAL_LOCKS=0
     for read-only subcommands), plus for index-refreshing
     subcommands (diff, status) GIT_INDEX_FILE points at a private
-    per-call copy of the repo's index. The copy is removed on
-    exit (best effort). Fallback without a copy never raises.
+    per-call copy of the repo's index: <pinned gitdir>/index for
+    a bound argv (no discovery spawn), else a hardened probe with
+    the caller's env. The copy is removed on exit (best effort).
+    Fallback without a copy never raises.
     """
     child = git_env_for_readonly(argv, env)
     tmp = None
@@ -291,7 +361,7 @@ def git_readonly_child_env(argv, env=None, cwd=None):
                 sub = None
             if sub in _GIT_INDEX_REFRESH:
                 tmp = _private_index_copy(
-                    _git_workdir(argv, cwd))
+                    _git_workdir(argv, cwd), argv, child)
                 if tmp is not None:
                     child = dict(child)
                     child["GIT_INDEX_FILE"] = tmp

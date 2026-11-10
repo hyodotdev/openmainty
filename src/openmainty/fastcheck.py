@@ -22,9 +22,10 @@ recorded per step:
   Gradle) are found by worktree/HOME argv or cwd, confirmed per-PID
   via lsof, and killed by explicit PID only — never by pattern.
 - File writes are denied by default under sandbox-exec; ONLY the
-  op worktree, its own git admin dir, the per-op temp HOME/TMPDIR,
-  the app cache dirs (yarn / corepack / pub) and /dev may be
-  written. The allowlist is recorded per step as `write_allow`.
+  op worktree, the per-op temp HOME/TMPDIR, the app cache dirs
+  (yarn / corepack / pub) and /dev may be written — never the
+  worktree's git admin dir. The allowlist is recorded per step
+  as `write_allow`.
 - One fastcheck at a time (slot flock); the op exclusion lock is held
   for the whole run and the global lease is never taken while
   holding it, so a concurrent prepare-retry/reresolve on the same op
@@ -49,7 +50,7 @@ import time
 from pathlib import Path
 
 from . import paths
-from .util import git_env_for_readonly as _git_env, utcnow, write_json
+from .util import utcnow, write_json
 
 MIN_DISK_BYTES = 30 * 1024 ** 3
 LOG_CAP_BYTES = 2 * 1024 * 1024
@@ -304,7 +305,8 @@ def _dep_bin_names(worktree: str, dep: str) -> list | None:
     return None
 
 
-def check_exercised(worktree: str, dep, steps) -> dict:
+def check_exercised(worktree: str, dep, steps, *,
+                    git_bound=None) -> dict:
     """M2.5a/d: did any gate step execute the bumped dep?
 
     Pure read-only census over the worktree: which package.json(s)
@@ -314,12 +316,14 @@ def check_exercised(worktree: str, dep, steps) -> dict:
     ("via-tool", with the gate recorded — a guess, said as one).
     "not-run" names the consumer scripts; "unknown" means anything
     unreadable. Never raises, never blocks — a plain read the
-    timeline wording uses honestly."""
+    timeline wording uses honestly. 301: the tracked-file census
+    is bound to the prep record."""
     out = {"dep": dep, "status": "unknown", "declared_in": [],
            "direct_steps": [], "via": {}, "consumer_scripts": [],
            "ci_consumers": [], "reason": ""}
     try:
-        return _check_exercised_inner(str(worktree), dep, steps, out)
+        return _check_exercised_inner(str(worktree), dep, steps, out,
+                                      git_bound=git_bound)
     except Exception:  # noqa: BLE001 - unknown, never an error
         out["reason"] = "읽기 실패"
         return out
@@ -335,27 +339,80 @@ _TOOL_CONFIG_FILES = ("turbo.json",)
 _COMMENT_RE = re.compile(r"(^|\s)#.*$")
 
 
-def _git_tracked_files(worktree: str):
+def _fc_bound(worktree: str, git_bound):
+    """Prep record for this worktree read, or None (fail-open shape).
+
+    A passed record is used as-is (re-proved before every spawn).
+    Otherwise the record is taken at entry: app-side reads before
+    any step runs, so no model plant is trusted. Post-step callers
+    must pass the pre-step record (run() returns it as
+    summary["git"]) instead of recording fresh. Non-git fixtures
+    yield None (callers fall back to on-disk).
+    """
+    if git_bound is not None:
+        return git_bound
+    try:
+        from . import runner as _runner
+        return _runner.record_git_pointer(worktree)
+    except Exception:
+        return None
+
+
+def _fc_run(worktree: str, args: list, git_bound=None,
+            timeout: int = 30):
+    """Hardened git read: pinned + scrubbed when bound, hardened
+    flags + scrubbed env otherwise. (None, False) on any failure,
+    including a refused pointer — never a partial answer.
+    301b: index-refreshing verbs (diff, status) run against a
+    private per-call index copy (M2.21b), bound and unbound alike.
+    When the copy cannot be made the read keeps the env rule
+    only — never a refusal for that."""
+    try:
+        from . import runner as _runner
+        from .util import git_readonly_child_env as _ro_env
+        if git_bound is not None:
+            try:
+                paths = _runner.reprove_git_pointer(
+                    worktree, git_bound)
+            except Exception:
+                return None, False
+            argv = _runner.hardened_git_argv(
+                list(args), gitdir=paths["gitdir"],
+                worktree=paths["worktree"])
+            cwd = None
+        else:
+            argv = _runner.hardened_git_argv(
+                ["-C", str(worktree)] + list(args))
+            cwd = None
+        with _ro_env(argv, _runner.hardened_git_env(),
+                     cwd=cwd) as env:
+            proc = subprocess.run(
+                argv, cwd=cwd,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                timeout=timeout, check=False, env=env)
+    except Exception:
+        return None, False
+    if proc.returncode != 0 or proc.stdout is None:
+        return None, False
+    try:
+        text = proc.stdout.decode("utf-8", "replace")
+    except Exception:
+        return None, False
+    return text, True
+
+
+def _git_tracked_files(worktree: str, *, git_bound=None):
     """Tracked paths relative to the worktree, or None when git
     cannot answer (non-git fixture trees fall back to on-disk).
 
     M2.8b2: no configured helper program may run — fsmonitor and
-    hooks stay off on every call."""
-    try:
-        argv = ["git", "-c", "core.fsmonitor=false",
-                "-c", "core.hooksPath=/dev/null",
-                "-C", str(worktree), "ls-files", "-z"]
-        proc = subprocess.run(
-            argv,
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            timeout=30, check=False, env=_git_env(argv))
-    except Exception:
-        return None
-    if proc.returncode != 0 or proc.stdout is None:
-        return None
-    try:
-        text = proc.stdout.decode("utf-8", "replace")
-    except Exception:
+    hooks stay off on every call. 301: bound to the prep record
+    (pinned gitdir, scrubbed env, nested .git refused); a refused
+    pointer reads as None, never a forged file list."""
+    text, ok = _fc_run(worktree, ["ls-files", "-z"],
+                       git_bound=_fc_bound(worktree, git_bound))
+    if not ok:
         return None
     return {p for p in text.split("\0") if p}
 
@@ -371,25 +428,28 @@ def _strip_yaml_comments(text: str) -> str:
     return "\n".join(kept)
 
 
-def _ci_consumers(worktree: str, names: list) -> list:
+def _ci_consumers(worktree: str, names: list, *,
+                  git_bound=None) -> list:
     """M2.8a1: CI-side consumers of the dep (read-only, never
     blocks). Tracked workflow files mentioning the dep or a bin as
     an exact token, plus allowlisted root tool configs whose stem
     IS the dep/bin. Sorted basenames, deduplicated. The status
     stays not-run — no local step ran it; this only says where CI
-    runs it instead."""
+    runs it instead. 301: bound to the prep record."""
     names = [str(n or "") for n in (names or []) if n]
     if not names:
         return []
     try:
-        return _ci_consumers_inner(str(worktree), names)
+        return _ci_consumers_inner(str(worktree), names,
+                                   git_bound=git_bound)
     except Exception:
         return []
 
 
-def _ci_consumers_inner(worktree: str, names: list) -> list:
+def _ci_consumers_inner(worktree: str, names: list, *,
+                        git_bound=None) -> list:
     found = []
-    tracked = _git_tracked_files(worktree)
+    tracked = _git_tracked_files(worktree, git_bound=git_bound)
     wf_dir = Path(worktree) / _CI_WORKFLOW_DIR
     try:
         entries = sorted(wf_dir.iterdir())
@@ -421,7 +481,8 @@ def _ci_consumers_inner(worktree: str, names: list) -> list:
     return sorted(found)
 
 
-def _check_exercised_inner(worktree: str, dep, steps, out: dict) -> dict:
+def _check_exercised_inner(worktree: str, dep, steps, out: dict, *,
+                           git_bound=None) -> dict:
     dep = str(dep or "")
     if not dep:
         out["reason"] = "dep 없음"
@@ -447,7 +508,8 @@ def _check_exercised_inner(worktree: str, dep, steps, out: dict) -> dict:
     # M2.8a1: CI-side consumers are independent of the install
     # record — workflows and root tool configs name the dep even
     # when no local step ran it. The status below is unchanged.
-    out["ci_consumers"] = _ci_consumers(worktree, names)
+    out["ci_consumers"] = _ci_consumers(worktree, names,
+                                          git_bound=git_bound)
     if bins is None:
         # Without the install record the entry points are unknown,
         # so no honest claim either way (spec: missing
@@ -902,15 +964,19 @@ def clone_tree(src: str, dst: str) -> str:
     return ""
 
 
-def tree_identity(worktree: str) -> tuple:
+def tree_identity(worktree: str, *, git_bound=None) -> tuple:
     """(head, fingerprint) of a worktree (M2.15, read-only).
 
     ("", "") when unreadable — the caller fails closed instead of
-    claiming an unchanged tree it could not read.
+    claiming an unchanged tree it could not read. 301: bound to
+    the prep record when passed (re-proved before any spawn).
     """
     try:
         from . import runner as _runner
-        snap = _runner.source_snapshot(Path(worktree))
+        bound = git_bound if git_bound is not None else _fc_bound(
+            str(worktree), None)
+        snap = _runner.source_snapshot(Path(worktree),
+                                       git_bound=bound)
     except Exception:  # noqa: BLE001 - unreadable, never an error
         return ("", "")
     if not isinstance(snap, dict):
@@ -1520,23 +1586,24 @@ def _podspec_name(pkgdir) -> str:
     return ""
 
 
-def _podfile_pins_by_file(worktree: str) -> list:
+def _podfile_pins_by_file(worktree: str, *, git_bound=None) -> list:
     """[(rel, {pod: version})] per Podfile.lock, discovery order.
 
     Same discovery as the merged map below (`git ls-files`
     tracked truth, else the conventional spots), capped and
     best-effort — unreadable files are skipped, never raised.
     The rel path names the lock's directory for owner
-    commands (`example/ios/Podfile.lock` -> `example/ios`)."""
+    commands (`example/ios/Podfile.lock` -> `example/ios`).
+    301: the ls-files discovery runs over the hardened path
+    bound to the prep record; a refused pointer falls back to
+    the conventional spots, never a forged file list."""
     files = []
     try:
-        proc = subprocess.run(
-            ["git", "-C", str(worktree), "ls-files", "-z", "--",
-             "*Podfile.lock"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            timeout=30)
-        files = [f for f in proc.stdout.decode("utf-8", "ignore")
-                 .split("\0") if f]
+        text, ok = _fc_run(
+            worktree, ["ls-files", "-z", "--", "*Podfile.lock"],
+            git_bound=_fc_bound(worktree, git_bound))
+        if ok:
+            files = [f for f in text.split("\0") if f]
     except (OSError, ValueError):
         files = []
     if not files:
@@ -1569,16 +1636,17 @@ def _podfile_pins_by_file(worktree: str) -> list:
     return out
 
 
-def _podfile_pins(worktree: str) -> dict:
+def _podfile_pins(worktree: str, *, git_bound=None) -> dict:
     """{pod: version} from tracked Podfile.locks (read-only).
 
     Prefers `git ls-files` (tracked truth); falls back to the
     conventional spots when git cannot answer. Capped and
-    best-effort — an empty map never blocks."""
+    best-effort — an empty map never blocks. 301: bound to the
+    prep record."""
     pins = {}
     try:
         for _rel, _file_pins in _podfile_pins_by_file(
-                str(worktree or "")):
+                str(worktree or ""), git_bound=git_bound):
             for _name, _ver in _file_pins.items():
                 pins.setdefault(_name, _ver)
     except Exception:  # noqa: BLE001 - unknown, never an error
@@ -1590,7 +1658,7 @@ _PREBUILT_PODS = ("ReactNativeDependencies", "React-Core-prebuilt",
                   "hermes-engine")
 
 
-def prebuilt_pod_update(worktree) -> str:
+def prebuilt_pod_update(worktree, *, git_bound=None) -> str:
     """M2.16e: the exact owner `pod update` command for an RN tree.
 
     Read-only over the worktree's Podfile.lock PODS sections:
@@ -1611,7 +1679,7 @@ def prebuilt_pod_update(worktree) -> str:
     mismatch first."""
     try:
         for rel, pins in _podfile_pins_by_file(
-                str(worktree or "")):
+                str(worktree or ""), git_bound=git_bound):
             pods = [p for p in _PREBUILT_PODS if p in pins]
             if not pods:
                 continue
@@ -1695,7 +1763,7 @@ def tree_react_native_version(worktree) -> str:
         return ""
 
 
-def rollup_pod_command(worktree) -> str:
+def rollup_pod_command(worktree, *, git_bound=None) -> str:
     """M2.16e2: owner pod command for a rollup tree, drift-gated.
 
     Reads the tree's declared react-native version and reuses
@@ -1712,7 +1780,8 @@ def rollup_pod_command(worktree) -> str:
                     "ReactNativeDependencies"):
             try:
                 drift = check_pod_drift(worktree, "react-native",
-                                        rn_ver, fallback_pod=pod)
+                                        rn_ver, fallback_pod=pod,
+                                        git_bound=git_bound)
             except (Exception, SystemExit):  # noqa: BLE001 -
                 # unknown, never fatal
                 drift = None
@@ -1725,7 +1794,8 @@ def rollup_pod_command(worktree) -> str:
 
 
 def check_pod_drift(worktree: str, dep, target,
-                    fallback_pod: str = "") -> dict | None:
+                    fallback_pod: str = "", *,
+                    git_bound=None) -> dict | None:
     """M2.5c native lock drift (read-only, no network, never blocks).
 
     When the bumped dep ships a podspec and a tracked Podfile.lock
@@ -1742,12 +1812,14 @@ def check_pod_drift(worktree: str, dep, target,
     command}."""
     try:
         return _check_pod_drift_inner(str(worktree), dep, target,
-                                      fallback_pod)
+                                      fallback_pod,
+                                      git_bound=git_bound)
     except Exception:  # noqa: BLE001 - unknown, never an error
         return None
 
 
-def _podfile_spot_for_pod(worktree: str, pod: str) -> str:
+def _podfile_spot_for_pod(worktree: str, pod: str, *,
+                              git_bound=None) -> str:
     """Dir of the Podfile.lock pinning pod ("" = tree root).
 
     First lock (discovery order) whose PODS section pins pod —
@@ -1756,7 +1828,7 @@ def _podfile_spot_for_pod(worktree: str, pod: str) -> str:
 
     try:
         for rel, pins in _podfile_pins_by_file(
-                str(worktree or "")):
+                str(worktree or ""), git_bound=git_bound):
             if pod in (pins or {}):
                 return str(rel or "").rpartition("/")[0]
     except Exception:  # noqa: BLE001 - unknown, never an error
@@ -1764,7 +1836,8 @@ def _podfile_spot_for_pod(worktree: str, pod: str) -> str:
     return ""
 
 
-def _mixed_pod_command(worktree: str, pod: str) -> str:
+def _mixed_pod_command(worktree: str, pod: str, *,
+                           git_bound=None) -> str:
     """One update command for non-prebuilt drift on an RN tree.
 
     Verdict-only RN check: the tree's declared react-native
@@ -1786,11 +1859,13 @@ def _mixed_pod_command(worktree: str, pod: str) -> str:
         rn_ver = tree_react_native_version(str(worktree or ""))
         if not rn_ver:
             return ""
-        pins = _podfile_pins(str(worktree or ""))
+        pins = _podfile_pins(str(worktree or ""),
+                           git_bound=git_bound)
         if not any(pb in pins and pins[pb] != rn_ver
                    for pb in _RN_PREBUILT_PAIR):
             return ""
-        cmd = prebuilt_pod_update(str(worktree or ""))
+        cmd = prebuilt_pod_update(str(worktree or ""),
+                                git_bound=git_bound)
         if not cmd:
             return ""
         # prebuilt_pod_update format (single source): "<cd … &&
@@ -1802,7 +1877,8 @@ def _mixed_pod_command(worktree: str, pod: str) -> str:
 
 
 def _check_pod_drift_inner(worktree: str, dep, target,
-                           fallback_pod: str) -> dict | None:
+                           fallback_pod: str, *,
+                           git_bound=None) -> dict | None:
     dep = str(dep or "")
     target = str(target or "")
     if not (dep and target):
@@ -1827,7 +1903,7 @@ def _check_pod_drift_inner(worktree: str, dep, target,
         pod = str(fallback_pod or "")
     if not pod:
         return None
-    pins = _podfile_pins(worktree)
+    pins = _podfile_pins(worktree, git_bound=git_bound)
     if pod not in pins:
         return None
     pinned = str(pins[pod] or "")
@@ -1841,7 +1917,7 @@ def _check_pod_drift_inner(worktree: str, dep, target,
     # prebuilt drift, one command names the prebuilt pods first,
     # then this pod (failure claim kept).
     if pod in _PREBUILT_PODS:
-        command = prebuilt_pod_update(worktree)
+        command = prebuilt_pod_update(worktree, git_bound=git_bound)
         if command:
             label = ("iOS Podfile.lock 갱신 필요 — `" + command +
                      "` (pod install만으로는 실패)")
@@ -1849,14 +1925,14 @@ def _check_pod_drift_inner(worktree: str, dep, target,
                     "target": target, "label": label,
                     "command": command}
     else:
-        mixed = _mixed_pod_command(worktree, pod)
+        mixed = _mixed_pod_command(worktree, pod, git_bound=git_bound)
         if mixed:
             label = ("iOS Podfile.lock 갱신 필요 — `" + mixed +
                      "` (pod install만으로는 실패)")
             return {"dep": dep, "pod": pod, "pinned": pinned,
                     "target": target, "label": label,
                     "command": mixed}
-    spot = _podfile_spot_for_pod(worktree, pod)
+    spot = _podfile_spot_for_pod(worktree, pod, git_bound=git_bound)
     base = f"cd {spot} && " if spot else ""
     command = f"{base}pod update {pod} --no-repo-update"
     label = f"iOS Podfile.lock 갱신 필요 — `{command}`"
@@ -1905,7 +1981,8 @@ def _family_member_targets(op_rec, base) -> list:
     return out
 
 
-def member_pod_drifts(worktree, op_rec, base=None) -> list:
+def member_pod_drifts(worktree, op_rec, base=None, *,
+                      git_bound=None) -> list:
     """M2.22: pod drift for every member of a joint/family record.
 
     Runs check_pod_drift for the op's own dep/target, every
@@ -1934,7 +2011,8 @@ def member_pod_drifts(worktree, op_rec, base=None) -> list:
             pairs.append((cand.get("dep"), cand.get("target")))
     pairs.extend(_family_member_targets(rec, base))
     for dep, target in pairs:
-        _take(check_pod_drift(str(worktree or ""), dep, target))
+        _take(check_pod_drift(str(worktree or ""), dep, target,
+                              git_bound=git_bound))
     try:
         rn_ver = tree_react_native_version(str(worktree or ""))
     except (Exception, SystemExit):  # noqa: BLE001 - unknown
@@ -1943,7 +2021,8 @@ def member_pod_drifts(worktree, op_rec, base=None) -> list:
         for pod in ("React-Core-prebuilt",
                     "ReactNativeDependencies"):
             _take(check_pod_drift(str(worktree or ""), "react-native",
-                                  rn_ver, fallback_pod=pod))
+                                  rn_ver, fallback_pod=pod,
+                                  git_bound=git_bound))
     return drifts
 
 
@@ -2353,27 +2432,26 @@ def _sbq(path: str) -> str:
     return '"' + path.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _git_dirs(worktree: str) -> tuple:
+def _git_dirs(worktree: str, *, git_bound=None) -> tuple:
     """(common_dir, git_dir), resolved absolute; ("", "") when unknown.
 
-    Read-only `git rev-parse` calls; never sandboxed (they only read).
-    Prepared worktrees are linked checkouts of the owner's repo, so
-    the common dir is the owner's .git and git_dir is this worktree's
-    own admin dir under <common>/worktrees/<name>."""
+    Read-only `git rev-parse` calls over the hardened path, bound to
+    the prep record when one is passed (re-proved before any
+    spawn); never sandboxed (they only read). Prepared worktrees
+    are linked checkouts of the owner's repo, so the common dir is
+    the owner's .git and git_dir is this worktree's own admin dir
+    under <common>/worktrees/<name>. 301: kept for diagnostics
+    only — the step sandbox no longer admits the gitdir for
+    writing, so this result never widens a write allowlist."""
     out = []
+    bound = _fc_bound(worktree, git_bound)
     for flag in ("--git-common-dir", "--git-dir"):
-        try:
-            argv = ["git", "rev-parse", flag]
-            proc = subprocess.run(
-                argv, cwd=str(worktree),
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL, timeout=30, text=True,
-                env=_git_env(argv))
-        except (OSError, subprocess.SubprocessError):
+        text, ok = _fc_run(worktree, ["rev-parse", flag],
+                           git_bound=bound)
+        if not ok:
             return ("", "")
-        if proc.returncode != 0:
-            return ("", "")
-        val = (proc.stdout or "").strip()
+        val = (text or "").strip().splitlines()
+        val = val[0].strip() if val else ""
         if not val:
             return ("", "")
         if not os.path.isabs(val):
@@ -2383,13 +2461,19 @@ def _git_dirs(worktree: str) -> tuple:
 
 
 def _write_allowlist(worktree: str, env: dict,
-                     toolchain=()) -> tuple:
+                     toolchain=(), *, git_bound=None) -> tuple:
     """(rules, note, paths): deny-all file-write* plus an explicit
-    allowlist (M2.7-SEC F2). ONLY the op worktree, its own git admin
-    dir, the step's HOME/TMPDIR, the app cache dirs named in env
+    allowlist (M2.7-SEC F2). ONLY the op worktree, the step's
+    HOME/TMPDIR, the app cache dirs named in env
     (yarn / corepack / pub), and /dev may be written — never the
-    owner's checkout, the shared .git common dir, or the real HOME.
-    Later rules win, so the deny comes first and the allows after.
+    owner's checkout, the shared .git common dir, the worktree's
+    own git admin dir, or the real HOME.
+    301: the gitdir is NOT writable. Profile steps (install /
+    typecheck / lint / unit) never need git writes — git reads
+    need no write allow — and a writable gitdir let a
+    model-written step plant hooks/config/fsmonitor that the
+    app's own later git calls would obey. Later rules win, so the
+    deny comes first and the allows after.
     ([], reason, []) when the worktree is unresolvable — the caller
     then refuses rather than running uncontained.
     M2.7-SEC2: a toolchain entry that is a Flutter SDK bin dir (an
@@ -2404,10 +2488,6 @@ def _write_allowlist(worktree: str, env: dict,
         return ([], "작업실 확인 불가 — 격리 없이 실행하지 않습니다",
                 [])
     paths = [tree]
-    _common, gitdir = _git_dirs(tree)
-    if gitdir and os.path.isdir(gitdir) and gitdir != tree \
-            and not gitdir.startswith(tree + os.sep):
-        paths.append(gitdir)
     env = env if isinstance(env, dict) else {}
     for key in ("HOME", "TMPDIR", "YARN_CACHE_FOLDER",
                 "COREPACK_HOME", "PUB_CACHE"):
@@ -2440,9 +2520,7 @@ def _write_allowlist(worktree: str, env: dict,
     for path in paths:
         rules.append("(allow file-write* (subpath %s))" % _sbq(path))
     rules.append("(allow file-write* (subpath \"/dev\"))")
-    note = ("쓰기 허용 %d곳(작업실%s)" % (
-        len(paths),
-        " · 자체 git 관리 포함" if len(paths) > 1 and gitdir else ""))
+    note = "쓰기 허용 %d곳(작업실)" % len(paths)
     if sdk_caches:
         note += " · 공유 Flutter SDK 캐시 쓰기 허용"
     return (rules, note, paths)
@@ -2452,14 +2530,17 @@ def run_step(argv: list, worktree: str, env: dict, timeout_s: int,
              install: bool, log_path: Path,
              sandbox_exec: str = SANDBOX_EXEC,
              loopback: bool = False, toolchain=(),
-             cwd: str = "") -> dict:
+             cwd: str = "", git_bound=None) -> dict:
     """Run one profile step. Returns the step receipt (never raises
     for step outcomes; spawn failures raise FastcheckBlocked).
 
     Every step runs under sandbox-exec with deny-all file-write*
     plus an explicit allowlist (M2.7-SEC F2): only the op worktree,
-    its own git admin dir, the step HOME/TMPDIR, the app cache dirs
-    and /dev may be written. Install steps keep the network allowed
+    the step HOME/TMPDIR, the app cache dirs and /dev may be
+    written — never the worktree's own git admin dir (301:
+    model-written steps must not be able to plant hooks/config/
+    fsmonitor the app's later git calls would obey). Install steps
+    keep the network allowed
     so the registry fetch works; other steps add the network deny
     (unix-domain IPC allowed, TCP/DNS denied), except a
     `flutter test` step with loopback=True, which gets the
@@ -2474,7 +2555,7 @@ def run_step(argv: list, worktree: str, env: dict, timeout_s: int,
         raise FastcheckSkip("sandbox-exec 없음 — 격리 없이 "
                             "실행하지 않습니다")
     file_rules, file_note, allow_paths = _write_allowlist(
-        worktree, env, toolchain)
+        worktree, env, toolchain, git_bound=git_bound)
     if not file_rules:
         raise FastcheckBlocked(file_note)
     loop = bool(loopback) and not install and _allows_loopback(argv)
@@ -2637,7 +2718,8 @@ def _update_op_gate(home: Path, op_id: str, ok: bool, note: str,
 
 def run(op_id: str, worktree: str, profile: dict, head: str = "",
         fingerprint: str = "", home=None, _disk_avail=None,
-        _sandbox_exec: str = SANDBOX_EXEC, origin=None) -> dict:
+        _sandbox_exec: str = SANDBOX_EXEC, origin=None,
+        git_bound=None) -> dict:
     """Run the profile's fastcheck steps in the op worktree.
 
     Holds the slot and the op exclusion lock for the whole run; never
@@ -2648,7 +2730,11 @@ def run(op_id: str, worktree: str, profile: dict, head: str = "",
     the op's fastchecks gate, then removes only node_modules and the
     per-op temp HOME. `origin` stamps who started it ("ui" for the
     owner button); the driver passes nothing. Never root_attested —
-    a worker receipt stays worker-attested until Root QA lands."""
+    a worker receipt stays worker-attested until Root QA lands.
+    301: the prep record is taken at entry (before any step runs
+    model-written code) and every step + internal git read is bound
+    to it; it is returned as summary["git"] so post-step callers
+    reuse the pre-step record instead of recording fresh."""
     from . import m2 as _m2
     if os.name != "posix":
         raise FastcheckBlocked("빠른 검사는 POSIX에서만 실행됩니다")
@@ -2683,10 +2769,14 @@ def run(op_id: str, worktree: str, profile: dict, head: str = "",
         raise FastcheckBlocked(
             f"임시 작업실을 만들 수 없음: {exc}") from exc
     env = scrub_env(toolchain, str(tmp_home), str(cache_root))
+    # 301: prep record before any step runs model-written code on
+    # this tree; every step sandbox + internal git read below is
+    # bound to it.
+    bound = _fc_bound(str(worktree), git_bound)
     node_v = _tool_version("node", env, str(worktree))
     manager_v = ""
     summary = {"op": safe_op, "ok": True, "steps": [], "failed": None,
-               "origin": origin,
+               "origin": origin, "git": bound,
                "disk_avail_gb": round(disk_avail / 1024 ** 3, 1),
                "disk_measure": "statvfs f_bavail (conservative)",
                "cache": {"root": str(cache_root),
@@ -2716,7 +2806,7 @@ def run(op_id: str, worktree: str, profile: dict, head: str = "",
                     argv, worktree, env, timeout, install, log_path,
                     sandbox_exec=_sandbox_exec,
                     loopback=(step.get("sandbox") == "loopback"),
-                    toolchain=toolchain)
+                    toolchain=toolchain, git_bound=bound)
                 # M2.5d: a step reads as its gate key + script
                 # ("unit (test: jest)"), never bare argv ("yarn").
                 receipt["gate"] = str(step.get("gate") or "")
