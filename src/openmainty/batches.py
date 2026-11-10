@@ -1039,6 +1039,11 @@ def _git_text(args, cwd, *, git_bound=None) -> str | None:
     private per-call index copy (M2.21b), bound and unbound alike,
     so reads never write the owner's index. When the copy cannot
     be made the read keeps the env rule only — never a refusal.
+    302: reads ignore in-tree .gitattributes (--attr-source); a git
+    too old for the flag fails closed (SourceUnreadable when
+    bound, None here when unbound).
+    302c: a hung probe surfaces as this read's own failure
+    (None), never as a cached refusal.
     """
     if git_bound is not None:
         try:
@@ -1061,6 +1066,14 @@ def _git_text(args, cwd, *, git_bound=None) -> str | None:
         if out.returncode != 0:
             return None
         return out.stdout.strip()
+    try:
+        supported = runner.attr_source_supported()
+    except subprocess.TimeoutExpired:
+        # 302c: hung probe — this read's own failure (None),
+        # never a cached refusal.
+        return None
+    if not supported:
+        return None
     argv = runner.hardened_git_argv(["-C", str(cwd)] + list(args))
     try:
         with git_readonly_child_env(
@@ -1091,6 +1104,11 @@ def _git_lines(args, cwd, *, git_bound=None) -> list | None:
     (diff, status) additionally run against a private per-call
     index copy (M2.21b), bound and unbound alike; copy failure
     keeps the env rule only, never a refusal.
+    302: reads ignore in-tree .gitattributes (--attr-source); a git
+    too old for the flag fails closed (SourceUnreadable when
+    bound, None here when unbound).
+    302c: a hung probe surfaces as this read's own failure
+    (None), never as a cached refusal.
     """
     if git_bound is not None:
         try:
@@ -1113,6 +1131,14 @@ def _git_lines(args, cwd, *, git_bound=None) -> list | None:
         if out.returncode != 0:
             return None
         return out.stdout.rstrip("\n").splitlines()
+    try:
+        supported = runner.attr_source_supported()
+    except subprocess.TimeoutExpired:
+        # 302c: hung probe — this read's own failure (None),
+        # never a cached refusal.
+        return None
+    if not supported:
+        return None
     argv = runner.hardened_git_argv(["-C", str(cwd)] + list(args))
     try:
         with git_readonly_child_env(

@@ -688,6 +688,7 @@ _GIT_SPAWN_ALLOW = frozenset({
     ("runner.py", "ensure_branch_workdir"),
     ("runner.py", "git_rev"),
     ("runner.py", "git_rev_strict"),
+    ("runner.py", "attr_source_supported"),
     ("runner.py", "_git_config_origins"),
     ("sched.py", "_strict_rev_parse"),
     ("sched.py", "_fetch_remote_refs"),
@@ -709,6 +710,9 @@ _GIT_SPAWN_ALLOW = frozenset({
     # runner._candidate_already_committed, runner.snapshot_diff,
     # runner._worktree_changed, runner.review_scope_artifact,
     # runner._draft_context.
+    # 302 adds runner.attr_source_supported: a --version-only
+    # capability probe (no driver-capable verb); allowlisted so
+    # the gate stays green.
 })
 
 

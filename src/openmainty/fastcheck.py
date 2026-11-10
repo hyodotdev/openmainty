@@ -366,11 +366,26 @@ def _fc_run(worktree: str, args: list, git_bound=None,
     301b: index-refreshing verbs (diff, status) run against a
     private per-call index copy (M2.21b), bound and unbound alike.
     When the copy cannot be made the read keeps the env rule
-    only — never a refusal for that."""
+    only — never a refusal for that.
+    302: reads ignore in-tree .gitattributes (--attr-source), so
+    no planted filter/diff driver runs. A git too old for the
+    flag fails closed: SourceUnreadable when bound, (None, False)
+    here when unbound.
+    302c: a hung probe surfaces as this call's own failure —
+    SourceUnreadable when bound, (None, False) here when
+    unbound — never as a cached refusal, so one transient stall
+    cannot brick later reads."""
     try:
         from . import runner as _runner
         from .util import git_readonly_child_env as _ro_env
         if git_bound is not None:
+            try:
+                supported = _runner.attr_source_supported()
+            except subprocess.TimeoutExpired as exc:
+                raise _runner.SourceUnreadable(
+                    "attr-source") from exc
+            if not supported:
+                raise _runner.SourceUnreadable("attr-source")
             try:
                 paths = _runner.reprove_git_pointer(
                     worktree, git_bound)
@@ -381,6 +396,12 @@ def _fc_run(worktree: str, args: list, git_bound=None,
                 worktree=paths["worktree"])
             cwd = None
         else:
+            try:
+                supported = _runner.attr_source_supported()
+            except subprocess.TimeoutExpired:
+                return None, False
+            if not supported:
+                return None, False
             argv = _runner.hardened_git_argv(
                 ["-C", str(worktree)] + list(args))
             cwd = None
@@ -391,7 +412,11 @@ def _fc_run(worktree: str, args: list, git_bound=None,
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL,
                 timeout=timeout, check=False, env=env)
-    except Exception:
+    except Exception as exc:
+        # 302: an attr-source refusal fails closed as a raise when
+        # bound; every other failure keeps the (None, False) shape.
+        if getattr(exc, "op", None) == "attr-source":
+            raise
         return None, False
     if proc.returncode != 0 or proc.stdout is None:
         return None, False

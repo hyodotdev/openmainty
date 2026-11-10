@@ -2163,24 +2163,35 @@ def _git(repo_dir: str, args: list, timeout: int = _GIT_TIMEOUT_S,
     git-pointer-changed before any spawn. Because global config
     is off everywhere here, `git worktree add` no longer sees a
     global LFS filter.
+    302d: argv construction runs inside the typed handling, so a
+    probe refusal (SourceUnreadable) or a hung probe
+    (TimeoutExpired) surfaces as the typed 502 "unreadable",
+    never raw. Pointer refusal stays git-pointer-changed.
     """
     if git_bound is None:
-        argv = _runner.hardened_git_argv(
-            ["-C", str(repo_dir)] + list(args))
+        bound_paths = None
     else:
         try:
-            paths = _runner.reprove_git_pointer(repo_dir, git_bound)
+            bound_paths = _runner.reprove_git_pointer(
+                repo_dir, git_bound)
         except _runner.SourceUnreadable as exc:
             raise DerivedFixError(
                 "worktree git identity changed since prepare",
                 status=502, code="git-pointer-changed") from exc
-        argv = _runner.hardened_git_argv(
-            list(args), gitdir=paths["gitdir"],
-            worktree=paths["worktree"])
     try:
+        if bound_paths is None:
+            argv = _runner.hardened_git_argv(
+                ["-C", str(repo_dir)] + list(args))
+        else:
+            argv = _runner.hardened_git_argv(
+                list(args), gitdir=bound_paths["gitdir"],
+                worktree=bound_paths["worktree"])
         proc = subprocess.run(
             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=timeout, env=_runner.hardened_git_env())
+    except _runner.SourceUnreadable as exc:
+        raise DerivedFixError(f"git unreadable: {exc}",
+                              status=502, code="unreadable") from exc
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise DerivedFixError(f"git unavailable: {exc}",
                               status=502, code="unreadable") from exc

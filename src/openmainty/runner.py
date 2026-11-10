@@ -497,30 +497,103 @@ _HARDENED_GIT_CONFIG = (
 _GIT_KEEP_ENV = ("GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL",
                  "GIT_OPTIONAL_LOCKS")
 
+# 302: read verbs that must ignore in-tree .gitattributes.
+# core.attributesFile=/dev/null only drops the GLOBAL file; a model
+# can still add `* filter=x` / `* diff=y` to the tree with the driver
+# defined in the repo's own config, and diff/status would then run
+# the planted commands. Reads carry --attr-source=<empty tree> so
+# no in-tree attribute (and no driver) is consulted. Writers (add,
+# commit, worktree add, apply, write-tree, ...) are NOT listed:
+# staging and committing must apply the tree's real clean filters
+# to store canonical bytes, and those paths run only through the
+# existing commit gates on run-owned trees — never as blind reads.
+_HARDENED_READ_VERBS = frozenset({
+    "diff", "status", "ls-files", "show", "log", "rev-parse",
+    "rev-list", "merge-base", "check-ignore", "show-ref",
+    "cat-file", "for-each-ref", "describe", "symbolic-ref",
+    "ls-tree",
+})
+_ATTR_SOURCE_EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+# 302c: the probe must never out-wait the read it guards. The
+# smallest caller bound is serve's 8 s request timeout (with a
+# reap margin on top in run_cmd paths), so 3 s keeps the probe a
+# fraction of every bound while a healthy git answers in ms.
+_ATTR_SOURCE_PROBE_TIMEOUT = 3
+
+_ATTR_SOURCE_OK = None
+
+
+def attr_source_supported() -> bool:
+    """Whether this git accepts --attr-source.
+
+    A `--version` probe carrying the flag: exit 0 means
+    supported (cached True), any other exit means rejected
+    (cached False). Runs with the scrubbed env and no repo, so
+    no planted config, driver, or GIT_DIR can affect the answer.
+    Only `--version` ever spawns here — no driver-capable verb.
+    302c: only a definitive answer (git ran and exited) is
+    cached. A hung probe raises TimeoutExpired uncached — the
+    caller surfaces it as its own timeout, never as
+    "unsupported", so one transient stall cannot brick later
+    reads. Any other spawn failure (missing git, sandbox
+    denial) is not an answer either: it proceeds optimistically
+    and uncached, and the read itself governs (failing its own
+    way, exactly as without this machinery).
+    """
+    global _ATTR_SOURCE_OK
+    if _ATTR_SOURCE_OK is not None:
+        return _ATTR_SOURCE_OK
+    try:
+        proc = subprocess.run(
+            ["git",
+             "--attr-source=" + _ATTR_SOURCE_EMPTY_TREE,
+             "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            timeout=_ATTR_SOURCE_PROBE_TIMEOUT,
+            env=hardened_git_env(),
+            check=False)
+    except subprocess.TimeoutExpired:
+        raise
+    except Exception:
+        return True
+    _ATTR_SOURCE_OK = proc.returncode == 0
+    return _ATTR_SOURCE_OK
+
 
 def hardened_git_argv(args: list, *, gitdir=None,
                       worktree=None) -> list:
     """Argv for one hardened git call. Bound (gitdir given) pins
-    --git-dir/--work-tree before the verb, inserts
-    --ignore-submodules=all after the verb of diff/status so
-    no child gitdir is consulted, and --no-ext-diff/
-    --no-textconv after the verb of diff so no driver runs.
-    Insertion sits right after the verb: appended flags
+    --git-dir/--work-tree before the verb. Read verbs (diff,
+    status, ls-files, show, log, rev-parse, ...) carry
+    --attr-source=<empty tree> before the verb so in-tree
+    .gitattributes (and any filter/diff driver they name) are
+    ignored; when this git rejects the flag the call fails
+    closed here (SourceUnreadable) instead of silently dropping
+    it. --ignore-submodules=all is inserted after the verb of
+    bound diff/status so no child gitdir is consulted, and
+    --no-ext-diff/--no-textconv after the verb of every diff
+    (bound and unbound alike) so no external driver or textconv
+    runs. Insertion sits right after the verb: appended flags
     would land past a "--" separator and be read as paths.
     Unbound keeps the caller's -C, but the -c overrides above
     still apply: fsmonitor, hooks and the global attributes
-    file stay off, so this is not a bare git call."""
+    file stay off, so this is not a bare git call. Writing
+    calls (add, commit, ...) keep today's behaviour: see
+    _HARDENED_READ_VERBS for why attributes still apply there.
+    Raises SourceUnreadable("attr-source") for a read the
+    installed git cannot run attribute-free; a hung probe does
+    NOT read as unsupported — its TimeoutExpired propagates raw
+    so each caller surfaces it as its own timeout (302c);
+    ValueError for a bound call carrying -C."""
     argv = ["git"]
     for key, value in _HARDENED_GIT_CONFIG:
         argv += ["-c", "%s=%s" % (key, value)]
     rest = list(args)
     if "-C" in rest and gitdir is not None:
         raise ValueError("bound call must not carry -C")
-    if gitdir is not None:
-        argv += ["--git-dir", str(gitdir),
-                "--work-tree", str(worktree)]
-    base = len(argv)
-    argv += rest
     idx = 0
     while idx < len(rest):
         if rest[idx] in ("-C", "-c"):
@@ -528,14 +601,24 @@ def hardened_git_argv(args: list, *, gitdir=None,
         else:
             break
     verb = rest[idx] if idx < len(rest) else ""
+    if verb in _HARDENED_READ_VERBS:
+        if not attr_source_supported():
+            raise SourceUnreadable("attr-source")
+        argv += ["--attr-source=" + _ATTR_SOURCE_EMPTY_TREE]
+    if gitdir is not None:
+        argv += ["--git-dir", str(gitdir),
+                "--work-tree", str(worktree)]
+    base = len(argv)
+    argv += rest
     extra = []
     if gitdir is not None and verb in ("diff", "status"):
         extra.append("--ignore-submodules=all")
-    if gitdir is not None and verb == "diff":
-        # No external diff drivers or textconv on a worker tree:
-        # a planted .gitattributes could otherwise name a driver
-        # the recorded config defines. --raw/--numstat/--cached
-        # output is unaffected.
+    if verb == "diff":
+        # No external diff drivers or textconv on worker-touched
+        # AND owner trees: a planted .gitattributes could
+        # otherwise name a driver the recorded config defines
+        # (302: unbound `git diff` ran diff.external).
+        # --raw/--numstat/--cached output is unaffected.
         extra += ["--no-ext-diff", "--no-textconv"]
     if extra:
         argv[base + idx + 1:base + idx + 1] = extra
@@ -769,14 +852,26 @@ def _hgit_run(work, args: list, *, git_bound=None,
     tree): the same -c flags over -C with the inherited env.
     The -c flags still turn off fsmonitor, hooks and the global
     attributes file, so hook/filter behavior differs from a bare
-    call; excludes still apply and global config is still read."""
-    if git_bound is None:
-        argv = hardened_git_argv(["-C", str(work)] + list(args))
-        return run_cmd(argv, timeout=timeout)
-    paths = reprove_git_pointer(work, git_bound)
-    argv = hardened_git_argv(list(args), gitdir=paths["gitdir"],
-                            worktree=paths["worktree"])
-    return run_cmd(argv, timeout=timeout, env=hardened_git_env())
+    call; excludes still apply and global config is still read.
+    302: reads ignore in-tree .gitattributes (--attr-source); a git
+    too old for the flag fails closed — SourceUnreadable when
+    bound, a nonzero code here when unbound.
+    302c: a hung probe surfaces as this call's own timeout
+    (124), never as "unsupported": the probe raises
+    TimeoutExpired uncached and this wrapper maps it below, so
+    one transient stall cannot brick later reads."""
+    try:
+        if git_bound is None:
+            if not attr_source_supported():
+                return 1, "", "attr-source unsupported"
+            argv = hardened_git_argv(["-C", str(work)] + list(args))
+            return run_cmd(argv, timeout=timeout)
+        paths = reprove_git_pointer(work, git_bound)
+        argv = hardened_git_argv(list(args), gitdir=paths["gitdir"],
+                                worktree=paths["worktree"])
+        return run_cmd(argv, timeout=timeout, env=hardened_git_env())
+    except subprocess.TimeoutExpired:
+        return 124, "", "timed out"
 
 
 def _git_z(work: Path, args: list, op: str,

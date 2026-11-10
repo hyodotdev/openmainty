@@ -209,6 +209,13 @@ def work_diffstat(workdir: str, base: str = "", *,
     (M2.21b), bound and unbound alike, so the read never writes
     the worktree's index. When the copy cannot be made the read
     keeps the env rule only — never a refusal for that.
+    302: the diff ignores in-tree .gitattributes (--attr-source)
+    plus unbound --no-ext-diff/--no-textconv, so no planted
+    filter/diff driver runs. A git too old for the flag fails
+    closed: SourceUnreadable propagates when bound, the failure
+    note below when unbound.
+    302c: a hung probe surfaces as this read's own failure (the
+    note), never as a cached refusal.
     """
     try:
         from . import runner as _runner
@@ -230,6 +237,14 @@ def work_diffstat(workdir: str, base: str = "", *,
                     stderr=subprocess.DEVNULL,
                     timeout=60, text=True, env=env)
         else:
+            try:
+                supported = _runner.attr_source_supported()
+            except subprocess.TimeoutExpired:
+                # 302c: hung probe — this read's own failure
+                # (the note), never a cached refusal.
+                return "실행 내역 읽기 실패"
+            if not supported:
+                return "실행 내역 읽기 실패"
             argv = _runner.hardened_git_argv(
                 ["-C", str(workdir), "diff", "--stat", ref, "--", "."])
             with _ro_env(argv, _runner.hardened_git_env(),

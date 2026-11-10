@@ -2006,7 +2006,15 @@ def _git_text(work, args: list, *, git_bound=None):
     private per-call index copy (M2.21b), bound and unbound alike,
     so a dashboard GET never writes the worktree's index while a
     worker may hold it. When the copy cannot be made the read
-    keeps the env rule only — never a refusal for that."""
+    keeps the env rule only — never a refusal for that.
+    302: reads ignore in-tree .gitattributes (--attr-source), so
+    no planted filter/diff driver runs. A git too old for the
+    flag fails closed through the 128 path below, bound and
+    unbound alike (this probe never raises by contract).
+    302c: a hung probe surfaces as this call's own timeout
+    (124), never as "unsupported": the probe raises
+    TimeoutExpired uncached and the outer handler below maps it
+    to 124, so one transient stall cannot brick later reads."""
     from . import runner as _runner
     from .util import git_readonly_child_env as _ro_env
     try:
@@ -2031,6 +2039,10 @@ def _git_text(work, args: list, *, git_bound=None):
                     env=env)
         except subprocess.TimeoutExpired:
             return 124, "", "timed out"
+    except subprocess.TimeoutExpired:
+        # 302c: hung attr-source probe — this call's own timeout,
+        # never a refusal.
+        return 124, "", "timed out"
     except Exception as exc:  # noqa: BLE001
         return 128, "", str(exc)[:200]
     return (proc.returncode, proc.stdout or "",
