@@ -409,6 +409,16 @@ class ExecBrokerLifecycleCase(unittest.TestCase):
                 ("containment", mock.patch.object(
                     pf, "native_containment",
                     return_value=None)),
+                # Slice 303: the self-test hook is unconditional in
+                # the product, so these broker-lifecycle fixtures
+                # route it through its own seam with a passing
+                # record; the self-test itself is covered by
+                # test_303_native_selftest. Assertions unchanged.
+                ("selftest", mock.patch.object(
+                    muse_mod, "_native_selftest",
+                    return_value={"passed": True,
+                                  "failed_control": None,
+                                  "controls": []})),
                 ("resolve", mock.patch.object(
                     muse_mod, "resolve_pinned_muse",
                     return_value=dict(snap))),

@@ -926,6 +926,500 @@ def _exec_repair_parent(preflight_home) -> str:
     return parent
 
 
+# ---------------------------------------------------------------------------
+# Slice 303: native self-test before the repair spawn.
+#
+# exec_source_repair builds the repair-broker policy and wrapper and
+# then spawns the worker. On every attempt that gets past admission
+# it first runs this self-test under the attempt's own wrapper argv
+# and policy file, before the model child starts, and refuses with
+# 125/native-selftest-failed when any control gives the wrong
+# answer. No model request can happen during the self-test: the only
+# processes it spawns are the wrapper argv itself (plus the one
+# unwrapped /usr/bin/true baseline), and the model child is spawned
+# only after the self-test returns passed.
+#
+# Controls (fail fast, first failure ends the run and names itself
+# in failed_control):
+#   baseline_unwrapped_true  /usr/bin/true unwrapped must exit 0, so
+#       a broken no-rule baseline is not read as a denial.
+#   non_pinned_exec  /usr/bin/true through the wrapper must exit 71:
+#       the policy pins the worker binary, anything else refuses.
+#   pinned_runs  the pinned binary runs offline (--help) with exit 0.
+#   write_inside  schema export --out <canon>/native-selftest-exports
+#       must exit 0 and create files. The export stays in the
+#       attempt's own root as evidence; no cleanup there.
+#   write_outside  schema export --out <sibling>/selftest-outside-<hex>
+#       must exit nonzero and create nothing. The parent must be a
+#       writable directory or the control fails (a permission error
+#       is not a denial); a created file is left where it is for
+#       evidence and its path goes in the record.
+#   paired_write + git_deny  a paired write inside one fresh
+#       product-owned dir D = <workdir>/.om-selftest-<hex> (asserted
+#       absent first): export --out D/ctl must exit 0 with files
+#       (the binary can write at that depth), then export
+#       --out D/.git/x must exit nonzero with D/.git absent (denied
+#       under the policy, paired write succeeded -- not a kernel
+#       attribution). Any symlink at or under D refuses, a failed D
+#       removal is a failure, and D must be gone afterwards.
+#   worktree_identity  the derived worktree must be byte-identical
+#       before and after the self-test: regular files by sha256,
+#       symlinks by target, plus the directory set, so a leftover
+#       empty dir fails. No symlink is followed; a read error, an
+#       entry cap, or a byte cap fails closed. File count and
+#       hashing seconds go in the record.
+#   broker_tripwire  the broker log must hold zero entries of any
+#       kind when the self-test ends. This is a tripwire after the
+#       fact, not a guarantee: any entry of any kind fails.
+#
+# Each control gets control_timeout_s (10 s or less) and the whole
+# self-test (controls plus hashing) is bounded by overall_timeout_s;
+# over either limit is a failure. A missing sandbox-exec is a
+# failure, not a skip, raised before any spawn. No control output is
+# trusted beyond exit codes and filesystem facts. The broker is
+# stopped and its log kept on refusal like the other refusals there.
+# Writing calls (add, commit, worktree add) are not covered here and
+# keep today's behaviour: attributes still apply to them, and no
+# model-written tree is committed through them without the existing
+# gates.
+# ---------------------------------------------------------------------------
+
+_SELFTEST_TRUE = "/usr/bin/true"
+_NATIVE_SELFTEST_CONTROL_TIMEOUT_S = 10
+_NATIVE_SELFTEST_OVERALL_TIMEOUT_S = 90
+_NATIVE_SELFTEST_MAX_SNAPSHOT_BYTES = 1 << 30
+_NATIVE_SELFTEST_MAX_SNAPSHOT_ENTRIES = 100000
+
+
+def _native_selftest_spawn(argv, env, cwd, timeout_s):
+    """Run one control argv via the spawn seam; never raise.
+
+    Stdin is never closed by hand: communicate() with no input
+    flushes and closes it itself on every supported Python. The
+    wait is bounded; a hang or transport error group-kills the
+    whole child tree (single-child fallback), then reaps.
+    Returns a record with argv, exit (None when the child never
+    ran or never exited), timeout, spawned, and spawn_error.
+    Output bytes are discarded unread.
+    """
+    rec = {"argv": list(argv), "exit": None, "timeout": False,
+           "spawned": False, "spawn_error": None}
+    try:
+        proc = _msp_spawn_process(argv, env, cwd)
+    except Exception as exc:
+        rec["spawn_error"] = "%s: %s" % (type(exc).__name__, exc)
+        return rec
+    rec["spawned"] = True
+    # No manual stdin close: communicate() with no input flushes and
+    # closes stdin itself on every supported Python. An explicit
+    # close first raises ValueError (flush of closed file) on 3.9
+    # while 3.14 tolerates it, which failed every control there.
+    try:
+        proc.communicate(timeout=timeout_s)
+    except Exception as exc:
+        # Timeout or transport error after the child exists: never
+        # leave it (or its children) running. The spawn uses
+        # start_new_session, so group-kill the whole tree, fall
+        # back to the single child when the group signal fails,
+        # then reap (best effort, never raise); the record says
+        # what happened.
+        if isinstance(exc, subprocess.TimeoutExpired):
+            rec["timeout"] = True
+        else:
+            rec["spawn_error"] = "%s: %s" % (type(exc).__name__,
+                                              exc)
+        # The two kills are independent: reading proc.pid or the
+        # group signal can itself raise (a minimal transport may
+        # expose no pid), and that must never skip the single
+        # fallback. Group kill first (the spawn owns its process
+        # group), single kill whenever the group did not report
+        # delivery.
+        delivered = False
+        try:
+            delivered = bool(_kill_owned_group(proc.pid))
+        except Exception:
+            delivered = False
+        if not delivered:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        try:
+            rec["exit"] = proc.returncode
+        except Exception:
+            pass
+        return rec
+    try:
+        rec["exit"] = proc.returncode
+    except Exception:
+        pass
+    return rec
+
+
+def _native_selftest_snapshot(root):
+    """Snapshot a tree: (ok, error, entries).
+
+    Regular files map relpath -> ("f", sha256), symlinks map
+    relpath -> ("l", readlink target), directories map
+    relpath -> ("d",). Never follows a symlink. A read error, more
+    than _NATIVE_SELFTEST_MAX_SNAPSHOT_ENTRIES entries, or more
+    than _NATIVE_SELFTEST_MAX_SNAPSHOT_BYTES of file bytes fails
+    closed with (False, reason, {}).
+    """
+    entries = {}
+    total_bytes = 0
+    try:
+        walker = os.walk(root, followlinks=False)
+        for dirpath, dirnames, filenames in walker:
+            for name in dirnames:
+                full = os.path.join(dirpath, name)
+                rel = os.path.relpath(full, root)
+                try:
+                    if os.path.islink(full):
+                        entries[rel] = ("l", os.readlink(full))
+                    else:
+                        entries[rel] = ("d",)
+                except OSError as exc:
+                    return (False,
+                            "unreadable dir entry %s: %s" % (rel, exc),
+                            {})
+                if len(entries) > _NATIVE_SELFTEST_MAX_SNAPSHOT_ENTRIES:
+                    return False, "too many entries", {}
+            for name in filenames:
+                full = os.path.join(dirpath, name)
+                rel = os.path.relpath(full, root)
+                try:
+                    if os.path.islink(full):
+                        entries[rel] = ("l", os.readlink(full))
+                    else:
+                        digest = hashlib.sha256()
+                        with open(full, "rb") as fh:
+                            while True:
+                                part = fh.read(65536)
+                                if not part:
+                                    break
+                                total_bytes += len(part)
+                                if total_bytes > \
+                                        _NATIVE_SELFTEST_MAX_SNAPSHOT_BYTES:
+                                    return (False, "too many bytes",
+                                            {})
+                                digest.update(part)
+                        entries[rel] = ("f", digest.hexdigest())
+                except OSError as exc:
+                    return (False,
+                            "unreadable file %s: %s" % (rel, exc),
+                            {})
+                if len(entries) > _NATIVE_SELFTEST_MAX_SNAPSHOT_ENTRIES:
+                    return False, "too many entries", {}
+    except Exception as exc:
+        return (False, "unwalkable %s: %s: %s"
+                % (root, type(exc).__name__, exc), {})
+    return True, "", entries
+
+
+def _native_selftest_remove_tree(path):
+    """Remove exactly the tree at path; refuse on any symlink.
+
+    Returns (removed, error): removed is True only when path is gone
+    afterwards with no symlink encountered. Never follows a link.
+    """
+    try:
+        if os.path.islink(path):
+            return False, "refused: symlink at top %s" % path
+        for dirpath, dirnames, filenames in os.walk(
+                path, followlinks=False):
+            for name in list(dirnames) + list(filenames):
+                full = os.path.join(dirpath, name)
+                if os.path.islink(full):
+                    return (False,
+                            "refused: symlink under D %s"
+                            % os.path.relpath(full, path))
+    except OSError as exc:
+        return False, "unreadable %s: %s" % (path, exc)
+    try:
+        shutil.rmtree(path)
+    except Exception as exc:
+        return False, "%s: %s" % (type(exc).__name__, exc)
+    if os.path.lexists(path):
+        return False, "still present after removal"
+    return True, None
+
+
+def _native_selftest_count_files(root):
+    """Count regular files under root (no symlink follows)."""
+    count = 0
+    for dirpath, _dirnames, filenames in os.walk(
+            root, followlinks=False):
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            try:
+                if not os.path.islink(full):
+                    count += 1
+            except OSError:
+                pass
+    return count
+
+
+def _native_selftest(*, wrapper_argv, policy, pinned_sha256, canon,
+                     workdir, broker, base_env,
+                     control_timeout_s=_NATIVE_SELFTEST_CONTROL_TIMEOUT_S,
+                     overall_timeout_s=_NATIVE_SELFTEST_OVERALL_TIMEOUT_S):
+    """Run the repair-spawn self-test; return the usage record.
+
+    Fail fast: the first bad control ends the run, names itself in
+    failed_control, and leaves passed False. All controls passed
+    returns passed True. Never raises for control outcomes (only
+    for programmer-shape misuse, which the caller turns into the
+    same 125 refusal).
+    """
+    started = time.monotonic()
+    deadline = started + overall_timeout_s
+    record = {
+        "policy_sha256": (policy or {}).get("sha256"),
+        "pinned_sha256": pinned_sha256,
+        "sandbox_exec": (policy or {}).get("sandbox_exec"),
+        "canon": canon,
+        "workdir": workdir,
+        "control_timeout_s": control_timeout_s,
+        "overall_timeout_s": overall_timeout_s,
+        "controls": [],
+        "failed_control": None,
+        "elapsed_s": 0.0,
+        "passed": False,
+    }
+
+    def _finish(name, detail, failed):
+        ctl = {"name": name,
+               "status": "failed" if failed else "passed"}
+        ctl.update(detail)
+        record["controls"].append(ctl)
+        if failed:
+            record["failed_control"] = name
+            record["elapsed_s"] = round(
+                time.monotonic() - started, 3)
+        return record
+
+    def _over():
+        return time.monotonic() >= deadline
+
+    argv = list(wrapper_argv or [])
+    if not argv:
+        return _finish("wrapper_argv",
+                       {"error": "empty wrapper argv"}, True)
+    sandbox_exec = (policy or {}).get("sandbox_exec") or ""
+    if not sandbox_exec or sandbox_exec != argv[0] \
+            or not os.path.isfile(sandbox_exec):
+        return _finish(
+            "sandbox_exec",
+            {"error": "sandbox-exec missing, not the spawned "
+                      "wrapper head, or not a file",
+             "path": sandbox_exec or None,
+             "argv0": argv[0] if argv else None}, True)
+
+    snap_start = time.monotonic()
+    snap_ok, snap_err, before = _native_selftest_snapshot(workdir)
+    snap_elapsed = round(time.monotonic() - snap_start, 3)
+    if not snap_ok:
+        return _finish("worktree_identity",
+                       {"match": False, "error": snap_err,
+                        "files": 0, "elapsed_s": snap_elapsed,
+                        "created": False}, True)
+
+    if _over():
+        return _finish("baseline_unwrapped_true",
+                       {"error": "overall self-test limit exceeded",
+                        "timeout": True, "created": False}, True)
+    r0 = _native_selftest_spawn([_SELFTEST_TRUE], base_env, canon,
+                                control_timeout_s)
+    r0["created"] = False
+    if r0["timeout"] or r0["spawn_error"] or r0["exit"] != 0:
+        return _finish("baseline_unwrapped_true", r0, True)
+    record["controls"].append(
+        {"name": "baseline_unwrapped_true", "status": "passed",
+         **r0})
+
+    if _over():
+        return _finish("non_pinned_exec",
+                       {"error": "overall self-test limit exceeded",
+                        "timeout": True, "created": False}, True)
+    r1 = _native_selftest_spawn(argv[:-1] + [_SELFTEST_TRUE],
+                                base_env, canon, control_timeout_s)
+    r1["created"] = False
+    if r1["timeout"] or r1["spawn_error"] or r1["exit"] != 71:
+        return _finish("non_pinned_exec", r1, True)
+    record["controls"].append(
+        {"name": "non_pinned_exec", "status": "passed", **r1})
+
+    if _over():
+        return _finish("pinned_runs",
+                       {"error": "overall self-test limit exceeded",
+                        "timeout": True, "created": False}, True)
+    r2 = _native_selftest_spawn(argv + ["--help"], base_env, canon,
+                                control_timeout_s)
+    r2["created"] = False
+    if r2["timeout"] or r2["spawn_error"] or r2["exit"] != 0:
+        return _finish("pinned_runs", r2, True)
+    record["controls"].append(
+        {"name": "pinned_runs", "status": "passed", **r2})
+
+    inside = os.path.join(canon, "native-selftest-exports")
+    if _over():
+        return _finish("write_inside",
+                       {"error": "overall self-test limit exceeded",
+                        "timeout": True, "created": False}, True)
+    r3 = _native_selftest_spawn(
+        argv + ["schema", "generate-json-schema", "--out", inside],
+        base_env, canon, control_timeout_s)
+    r3files = _native_selftest_count_files(inside) \
+        if os.path.isdir(inside) and not os.path.islink(inside) else 0
+    r3["created"] = bool(r3files)
+    r3["files"] = r3files
+    r3["path"] = inside
+    if r3["timeout"] or r3["spawn_error"] or r3["exit"] != 0 \
+            or not r3files:
+        return _finish("write_inside", r3, True)
+    record["controls"].append(
+        {"name": "write_inside", "status": "passed", **r3})
+
+    parent = os.path.dirname(os.path.realpath(workdir))
+    if not os.path.isdir(parent) or \
+            not os.access(parent, os.W_OK | os.X_OK):
+        return _finish(
+            "write_outside",
+            {"error": "outside parent not writable; a permission "
+                      "error is not a denial",
+             "parent": parent, "created": False}, True)
+    outside_token = os.urandom(8).hex()
+    outside = os.path.join(
+        parent, "selftest-outside-" + outside_token)
+    if os.path.lexists(outside):
+        return _finish("write_outside",
+                       {"error": "stale outside target",
+                        "path": outside, "created": False}, True)
+    if _over():
+        return _finish("write_outside",
+                       {"error": "overall self-test limit exceeded",
+                        "timeout": True, "created": False}, True)
+    r4 = _native_selftest_spawn(
+        argv + ["schema", "generate-json-schema", "--out", outside],
+        base_env, canon, control_timeout_s)
+    r4made = os.path.lexists(outside)
+    r4["created"] = bool(r4made)
+    r4["path"] = outside
+    if r4["timeout"] or r4["spawn_error"] or r4["exit"] == 0 \
+            or r4made:
+        # A created file is left where it is for evidence and its
+        # path is in the record; it is outside the worktree so the
+        # identity check below is unaffected.
+        return _finish("write_outside", r4, True)
+    record["controls"].append(
+        {"name": "write_outside", "status": "passed", **r4})
+
+    token = os.urandom(8).hex()
+    dpath = os.path.join(workdir, ".om-selftest-" + token)
+    if os.path.lexists(dpath):
+        return _finish("paired_write",
+                       {"error": "stale self-test dir",
+                        "path": dpath, "created": False}, True)
+    if _over():
+        return _finish("paired_write",
+                       {"error": "overall self-test limit exceeded",
+                        "timeout": True, "created": False}, True)
+    r5a = _native_selftest_spawn(
+        argv + ["schema", "generate-json-schema", "--out",
+                os.path.join(dpath, "ctl")],
+        base_env, canon, control_timeout_s)
+    r5afiles = _native_selftest_count_files(
+        os.path.join(dpath, "ctl")) \
+        if os.path.isdir(os.path.join(dpath, "ctl")) \
+        and not os.path.islink(os.path.join(dpath, "ctl")) else 0
+    r5a["created"] = bool(r5afiles)
+    r5a["files"] = r5afiles
+    r5a["path"] = dpath
+    if r5a["timeout"] or r5a["spawn_error"] or r5a["exit"] != 0 \
+            or not r5afiles:
+        return _finish("paired_write", r5a, True)
+    record["controls"].append(
+        {"name": "paired_write", "status": "passed", **r5a})
+
+    if _over():
+        return _finish("git_deny",
+                       {"error": "overall self-test limit exceeded",
+                        "timeout": True, "created": False,
+                        "removed": False}, True)
+    r5b = _native_selftest_spawn(
+        argv + ["schema", "generate-json-schema", "--out",
+                os.path.join(dpath, ".git", "x")],
+        base_env, canon, control_timeout_s)
+    git_path = os.path.join(dpath, ".git")
+    git_made = os.path.lexists(git_path)
+    r5b["created"] = bool(git_made)
+    r5b["path"] = dpath
+    deny_ok = (not r5b["timeout"] and not r5b["spawn_error"]
+               and r5b["exit"] is not None and r5b["exit"] != 0
+               and not git_made)
+    removed, removal_error = (False, None)
+    if deny_ok:
+        removed, removal_error = _native_selftest_remove_tree(dpath)
+    r5b["removed"] = bool(removed)
+    r5b["removal_error"] = removal_error
+    if not deny_ok or not removed:
+        return _finish("git_deny", r5b, True)
+    record["controls"].append(
+        {"name": "git_deny", "status": "passed", **r5b})
+
+    if _over():
+        return _finish("worktree_identity",
+                       {"match": False,
+                        "error": "overall self-test limit exceeded",
+                        "files": 0, "elapsed_s": 0.0,
+                        "created": False}, True)
+    after_start = time.monotonic()
+    after_ok, after_err, after = _native_selftest_snapshot(workdir)
+    after_elapsed = round(time.monotonic() - after_start, 3)
+    match = bool(after_ok) and after == before
+    identity = {"match": bool(match),
+                "files": len(after) if after_ok else 0,
+                "elapsed_s": after_elapsed,
+                "created": False}
+    if not after_ok:
+        identity["error"] = after_err
+    if not match:
+        return _finish("worktree_identity", identity, True)
+    record["controls"].append(
+        {"name": "worktree_identity", "status": "passed",
+         **identity})
+
+    try:
+        broker_log = broker.log() if broker is not None else None
+    except Exception as exc:
+        return _finish("broker_tripwire",
+                       {"error": "broker log unreadable: %s: %s"
+                                 % (type(exc).__name__, exc),
+                        "entries": None, "created": False}, True)
+    entries = len(broker_log) if isinstance(broker_log, list) else None
+    trip = {"entries": entries, "created": False,
+            "note": "tripwire after the fact, not a guarantee: "
+                    "any entry of any kind fails"}
+    if not isinstance(broker_log, list) or entries != 0:
+        trip["error"] = "broker log not empty" if isinstance(
+            broker_log, list) else "broker log has no list shape"
+        return _finish("broker_tripwire", trip, True)
+    record["controls"].append(
+        {"name": "broker_tripwire", "status": "passed", **trip})
+
+    record["passed"] = True
+    record["elapsed_s"] = round(time.monotonic() - started, 3)
+    return record
+
+
 def _walk_tool_names(rec):
     """(names, null_hit): every tool_name value in rec, any depth.
 
@@ -1544,6 +2038,34 @@ def exec_source_repair(prompt: str, workdir, timeout: int = 600,
                 code="containment",
                 repair_root=canon,
                 tokens_measurable=False, tokens=None)
+        # Slice 303: native self-test before the model spawn, under
+        # the attempt's own wrapper argv and policy file. Any
+        # failed, timed-out, or unrunnable control refuses here with
+        # the broker stopped and its log kept, before the model
+        # child starts.
+        try:
+            selftest_record = _native_selftest(
+                wrapper_argv=wrapped["argv"], policy=wrapped["policy"],
+                pinned_sha256=snap["sha256"], canon=canon,
+                workdir=str(workdir), broker=broker, base_env=base)
+        except Exception as exc:
+            final = _halt_exec_broker(broker)
+            return 125, "", dict(
+                final,
+                error="refused: native self-test errored: %s" % exc,
+                code="native-selftest-failed",
+                repair_root=canon,
+                tokens_measurable=False, tokens=None)
+        if not selftest_record.get("passed"):
+            final = _halt_exec_broker(broker)
+            return 125, "", dict(
+                final,
+                error="refused: native self-test failed at %s" %
+                      selftest_record.get("failed_control"),
+                code="native-selftest-failed",
+                repair_root=canon,
+                native_selftest=selftest_record,
+                tokens_measurable=False, tokens=None)
         proxy_flag = ["-c", 'endpoint_transport.proxy='
                       '"http://127.0.0.1:%d"' % broker_port]
         cmd = list(wrapped["argv"]) + cmd[1:anchor + 2] \
@@ -1655,6 +2177,7 @@ def exec_source_repair(prompt: str, workdir, timeout: int = 600,
     usage["broker_log"] = final["broker_log"]
     usage["broker_stop"] = final["broker_stop"]
     usage["repair_root"] = canon
+    usage["native_selftest"] = selftest_record
     if trace:
         trace_path = os.path.join(str(workdir), "transport.trace")
         try:
@@ -2795,11 +3318,15 @@ def _msp_build_wrapper(root: str, snap: dict, *,
         raise MspError(f"offline wrapper unavailable: {exc}",
                        code="containment") from exc
     return {"argv": list(argv),
+            # Slice 303: the self-test binds the policy to the
+            # spawned wrapper head, so the builder reports the
+            # sandbox path it actually put in argv[0].
             "policy": {"path": policy["policy_path"],
                        "sha256": policy["policy_sha256"],
                        "size": policy["policy_size"],
                        "dev": policy["policy_dev"],
-                       "ino": policy["policy_ino"]}}
+                       "ino": policy["policy_ino"],
+                       "sandbox_exec": argv[0]}}
 
 
 def _msp_spawn_process(cmd, env, cwd):
