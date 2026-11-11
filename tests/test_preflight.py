@@ -1578,12 +1578,33 @@ class MuseDedicatedCase(PreflightCase):
             # the product, so these exec fixtures route it through
             # its own seam with a passing record; the self-test
             # itself is covered by test_303_native_selftest.
-            # Assertions unchanged.
+            # Slice 304a: the record must also pass the product
+            # validator, so the stub carries the expected control
+            # names and the exact bindings of the canned
+            # wrapper/policy/snap below; the pre-spawn
+            # revalidation (which stats a real policy file the
+            # canned wrapper never creates) is stubbed to pass
+            # at the same seam. Assertions unchanged.
             ("selftest",
              mock.patch.object(muse, "_native_selftest",
-                               return_value={"passed": True,
-                                             "failed_control": None,
-                                             "controls": []})),
+                               return_value={
+                                   "passed": True,
+                                   "failed_control": None,
+                                   "controls": [
+                                       {"name": n,
+                                        "status": "passed"}
+                                       for n in muse
+                                       ._EXPECTED_SELFTEST_CONTROLS],
+                                   "policy_sha256": "a" * 64,
+                                   "policy_size": 1,
+                                   "policy_dev": 1,
+                                   "policy_ino": 1,
+                                   "sandbox_exec":
+                                   "/usr/bin/sandbox-exec",
+                                   "pinned_sha256": "f" * 64})),
+            ("revalidate",
+             mock.patch.object(muse, "_revalidate_pre_spawn",
+                               return_value=(True, ""))),
             ("resolve",
              mock.patch.object(muse, "resolve_pinned_muse",
                                return_value=dict(snap))),
@@ -1648,7 +1669,9 @@ class MuseDedicatedCase(PreflightCase):
                          "/owned/fixture/muse"],
                 "policy": {"path": "/owned/policy",
                            "sha256": "a" * 64, "size": 1,
-                           "dev": 1, "ino": 1}})
+                           "dev": 1, "ino": 1,
+                           "sandbox_exec":
+                           "/usr/bin/sandbox-exec"}})
         wrapper_patch.start()
         self.addCleanup(wrapper_patch.stop)
         with mock.patch.dict(os.environ):
@@ -1710,7 +1733,9 @@ class MuseDedicatedCase(PreflightCase):
                          "/owned/fixture/muse"],
                 "policy": {"path": "/owned/policy",
                            "sha256": "a" * 64, "size": 1,
-                           "dev": 1, "ino": 1}})
+                           "dev": 1, "ino": 1,
+                           "sandbox_exec":
+                           "/usr/bin/sandbox-exec"}})
         wrapper_patch.start()
         self.addCleanup(wrapper_patch.stop)
         with mock.patch.dict(os.environ):

@@ -817,6 +817,87 @@ def build_subscription_broker_policy_text(root: str,
     return text
 
 
+# Reviewed read-exception set (gate (2)): the repair policy must
+# contain exactly these named read exceptions and no others. This
+# literal pins the reviewed set INDEPENDENTLY of
+# SUBSCRIPTION_WORKER_READ_EXCEPTIONS: editing that tuple without
+# updating this literal fails the build. Text-only proof, not
+# live enforcement: it shows the built text carries the reviewed
+# set, not that the running child is confined (see preflight).
+_REVIEWED_READ_EXCEPTION_PATHS = (
+    ("subpath", "~/.config/muse"),
+    ("subpath", "~/Library/Keychains/login.keychain-db"),
+    ("subpath", "~/Library/Preferences/com.apple.security.plist"),
+    ("subpath", "~/.claude/skills"),
+    ("subpath", "~/.codex/skills"),
+    ("literal", "/Library"),
+    ("literal", "/Library/Application Support"),
+    ("literal", "~/.claude/CLAUDE.md"),
+)
+
+
+def _expand_reviewed_exception(home_real, kind, spec):
+    """Expand one reviewed spec with the same rules the builder
+    uses for subscription_worker_exceptions: a "~/" spec is
+    joined to the home whatever the kind (the builder does not
+    check kind before joining); an absolute spec is
+    normalized; anything else refuses."""
+    if spec.startswith("~/"):
+        return (kind, os.path.normpath(
+            os.path.join(home_real, spec[2:])))
+    if os.path.isabs(spec):
+        return (kind, os.path.normpath(spec))
+    raise ContainmentError(
+        "bad reviewed exception spec: %r" % (spec,))
+
+
+def _prove_repair_read_exceptions(exceptions, home_real,
+                                 text) -> None:
+    """Prove the built text carries exactly the reviewed set.
+
+    `exceptions` is the {"path", "kind", "reason"} dict list the
+    builder derived from SUBSCRIPTION_WORKER_READ_EXCEPTIONS; its
+    (kind, path) pairs must match the reviewed literal exactly
+    (same pairs, no more, no fewer). A dropped exception
+    (silent narrowing) or an added one (silent widening) raises
+    ContainmentError. Each reviewed pair must then appear as its
+    exact allow clause exactly once in the single read-deny
+    line of the returned text. Text-only proof, not live
+    enforcement: it shows the built text carries the reviewed
+    set, not that the running child is confined (the 1878
+    refusal and preflight stay unchanged).
+    """
+    reviewed = set(
+        _expand_reviewed_exception(home_real, kind, spec)
+        for kind, spec in _REVIEWED_READ_EXCEPTION_PATHS)
+    if len(_REVIEWED_READ_EXCEPTION_PATHS) != len(reviewed):
+        raise ContainmentError(
+            "repair proof: reviewed exception set is ambiguous")
+    got = set((entry["kind"], entry["path"])
+              for entry in exceptions)
+    if got != reviewed:
+        raise ContainmentError(
+            "repair proof: read exceptions differ from the "
+            "reviewed set")
+    readlines = [ln for ln in text.splitlines()
+                 if ln.startswith("(deny file-read*")]
+    if len(readlines) != 1:
+        raise ContainmentError(
+            "repair proof: base read line not unique")
+    readline = readlines[0]
+    for kind, path in sorted(reviewed):
+        clause = "(%s %s)" % (kind, _sb_literal(path))
+        found = readline.count(clause)
+        if found == 0:
+            raise ContainmentError(
+                "repair proof: reviewed exception missing from "
+                "policy text: %s %s" % (kind, path))
+        if found != 1:
+            raise ContainmentError(
+                "repair proof: reviewed exception duplicated in "
+                "policy text: %s %s" % (kind, path))
+
+
 def _prove_repair_plus(text: str, sub: str,
                        extra_lines) -> None:
     """Prove text is the broker text plus exactly the repair
@@ -928,6 +1009,9 @@ def build_repair_broker_policy_text(root: str,
     text = sub + "".join(
         ln + "\n" for ln in extra)
     _prove_repair_plus(text, sub, extra)
+    _prove_repair_read_exceptions(
+        subscription_worker_exceptions(home_real), home_real,
+        text)
     return text
 
 

@@ -413,12 +413,31 @@ class ExecBrokerLifecycleCase(unittest.TestCase):
                 # the product, so these broker-lifecycle fixtures
                 # route it through its own seam with a passing
                 # record; the self-test itself is covered by
-                # test_303_native_selftest. Assertions unchanged.
+                # test_303_native_selftest. Slice 304a: the record
+                # must also pass the product validator, so the stub
+                # carries the expected control names and the exact
+                # bindings of THIS fixture's wrapper/policy/snap;
+                # the pre-spawn revalidation (which stats a real
+                # policy file these fixtures never create) is
+                # stubbed to pass at the same seam. Assertions
+                # unchanged.
                 ("selftest", mock.patch.object(
                     muse_mod, "_native_selftest",
-                    return_value={"passed": True,
-                                  "failed_control": None,
-                                  "controls": []})),
+                    return_value={
+                        "passed": True,
+                        "failed_control": None,
+                        "controls": [
+                            {"name": n, "status": "passed"}
+                            for n in muse_mod
+                            ._EXPECTED_SELFTEST_CONTROLS],
+                        "policy_sha256": "a" * 64,
+                        "policy_size": 1,
+                        "policy_dev": 1, "policy_ino": 1,
+                        "sandbox_exec": "/usr/bin/sandbox-exec",
+                        "pinned_sha256": "f" * 64})),
+                ("revalidate", mock.patch.object(
+                    muse_mod, "_revalidate_pre_spawn",
+                    return_value=(True, ""))),
                 ("resolve", mock.patch.object(
                     muse_mod, "resolve_pinned_muse",
                     return_value=dict(snap))),
@@ -434,7 +453,9 @@ class ExecBrokerLifecycleCase(unittest.TestCase):
                         "policy": {"path": "/owned/policy",
                                    "sha256": "a" * 64,
                                    "size": 1, "dev": 1,
-                                   "ino": 1}})),
+                                   "ino": 1,
+                                   "sandbox_exec":
+                                   "/usr/bin/sandbox-exec"}})),
                 ("capture", mock.patch.object(
                     muse_mod, "_communicate_bounded",
                     return_value=capture)),

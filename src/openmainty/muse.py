@@ -927,7 +927,7 @@ def _exec_repair_parent(preflight_home) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Slice 303: native self-test before the repair spawn.
+# Slice 303/304a: native self-test before the repair spawn.
 #
 # exec_source_repair builds the repair-broker policy and wrapper and
 # then spawns the worker. On every attempt that gets past admission
@@ -962,6 +962,18 @@ def _exec_repair_parent(preflight_home) -> str:
 #       under the policy, paired write succeeded -- not a kernel
 #       attribution). Any symlink at or under D refuses, a failed D
 #       removal is a failure, and D must be gone afterwards.
+#   copy_exec  the app copies the pinned exe bytes to D/copy
+#       (mode 0755) and execs D/copy --help through the wrapper
+#       prefix -- the same shape as non_pinned_exec, which runs
+#       /usr/bin/true there. Close to non_pinned_exec, but it adds
+#       this: the SAME BYTES under a DIFFERENT PATH must still be
+#       denied (exit nonzero, no new files), proving the exec pin
+#       follows identity, not the path string. Note on MCP: with
+#       exec pinned to the literal exe, any spawned server or
+#       child process IS this same binary; what the binary does
+#       with server flags stays behaviorally unproven -- the
+#       stream tool allowlist (write_file only) is the refusal
+#       point for that, not this control.
 #   worktree_identity  the derived worktree must be byte-identical
 #       before and after the self-test: regular files by sha256,
 #       symlinks by target, plus the directory set, so a leftover
@@ -989,6 +1001,7 @@ _NATIVE_SELFTEST_CONTROL_TIMEOUT_S = 10
 _NATIVE_SELFTEST_OVERALL_TIMEOUT_S = 90
 _NATIVE_SELFTEST_MAX_SNAPSHOT_BYTES = 1 << 30
 _NATIVE_SELFTEST_MAX_SNAPSHOT_ENTRIES = 100000
+_NATIVE_SELFTEST_MAX_COPY_BYTES = 1 << 26
 
 
 def _native_selftest_spawn(argv, env, cwd, timeout_s):
@@ -1167,6 +1180,117 @@ def _native_selftest_count_files(root):
     return count
 
 
+_EXPECTED_SELFTEST_CONTROLS = (
+    "baseline_unwrapped_true", "non_pinned_exec", "pinned_runs",
+    "write_inside", "write_outside", "paired_write", "copy_exec",
+    "git_deny", "worktree_identity", "broker_tripwire")
+
+
+def _validate_selftest_record(wrapper_argv, policy, snap, record):
+    """Pure validator for a self-test record: (ok, reason).
+
+    The record must be the in-call passing return: exact control
+    names in order, each passed, failed_control None, and the
+    policy sha/size/dev/ino/sandbox_exec plus the pinned sha bound
+    to THIS attempt's wrapper and snapshot. No parameter, cache,
+    file, or usage field can supply a record: the only accepted
+    source is the _native_selftest return value compared here
+    against the live bindings.
+    """
+    if not isinstance(record, dict) or not record.get("passed"):
+        return False, "not a passing record"
+    if record.get("failed_control") is not None:
+        return False, "failed_control is set"
+    controls = record.get("controls")
+    if not isinstance(controls, list):
+        return False, "controls is not a list"
+    names = [c.get("name") if isinstance(c, dict) else None
+             for c in controls]
+    if names != list(_EXPECTED_SELFTEST_CONTROLS):
+        return False, "control names/order mismatch"
+    if any(not isinstance(c, dict) or c.get("status") != "passed"
+           for c in controls):
+        return False, "a control did not pass"
+    pol = policy or {}
+    if record.get("policy_sha256") != pol.get("sha256"):
+        return False, "policy sha256 mismatch"
+    if record.get("policy_size") != pol.get("size"):
+        return False, "policy size mismatch"
+    if record.get("policy_dev") != pol.get("dev"):
+        return False, "policy dev mismatch"
+    if record.get("policy_ino") != pol.get("ino"):
+        return False, "policy ino mismatch"
+    if record.get("sandbox_exec") != pol.get("sandbox_exec"):
+        return False, "policy sandbox_exec mismatch"
+    argv = list(wrapper_argv or [])
+    if not argv or record.get("sandbox_exec") != argv[0]:
+        return False, "sandbox_exec not bound to wrapper head"
+    if record.get("pinned_sha256") != (snap or {}).get("sha256"):
+        return False, "pinned sha mismatch"
+    return True, ""
+
+
+def _revalidate_pre_spawn(wrapped, snap):
+    """Re-check policy file and binary just before the model spawn.
+
+    Re-hashes the policy file (opened nofollow, must be a regular
+    file, same dev/ino/size/sha), re-snapshots the spawned
+    executable, and requires the sandbox head to still be a file.
+    Any drift refuses: (True, "") or (False, reason). Never raises
+    for filesystem facts (only for programmer-shape misuse, which
+    the caller turns into the same refusal).
+    """
+    policy = wrapped["policy"]
+    argv = list(wrapped["argv"])
+    if not argv:
+        return False, "empty wrapper argv"
+    try:
+        lst = os.lstat(policy["path"])
+    except OSError as exc:
+        return False, "policy stat failed: %s" % exc
+    if not stat.S_ISREG(lst.st_mode):
+        return False, "policy is not a regular file"
+    try:
+        fd = os.open(policy["path"], os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        return False, "policy open failed: %s" % exc
+    try:
+        fst = os.fstat(fd)
+        if (fst.st_dev, fst.st_ino) != (policy["dev"],
+                                        policy["ino"]):
+            return False, "policy replaced (dev/ino)"
+        if fst.st_size != policy["size"]:
+            return False, "policy size drift"
+        if fst.st_size > (1 << 20):
+            return False, "policy implausibly large"
+        digest = hashlib.sha256()
+        while True:
+            part = os.read(fd, 65536)
+            if not part:
+                break
+            digest.update(part)
+    except OSError as exc:
+        return False, "policy read failed: %s" % exc
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    if digest.hexdigest() != policy["sha256"]:
+        return False, "policy content drift"
+    try:
+        fresh = _snapshot_binary(argv[-1])
+    except OSError as exc:
+        return False, "binary re-snapshot failed: %s" % exc
+    old = snap or {}
+    for key in ("sha256", "size", "dev", "ino"):
+        if fresh.get(key) != old.get(key):
+            return False, "binary %s drift" % key
+    if not os.path.isfile(argv[0]):
+        return False, "sandbox-exec gone"
+    return True, ""
+
+
 def _native_selftest(*, wrapper_argv, policy, pinned_sha256, canon,
                      workdir, broker, base_env,
                      control_timeout_s=_NATIVE_SELFTEST_CONTROL_TIMEOUT_S,
@@ -1183,6 +1307,9 @@ def _native_selftest(*, wrapper_argv, policy, pinned_sha256, canon,
     deadline = started + overall_timeout_s
     record = {
         "policy_sha256": (policy or {}).get("sha256"),
+        "policy_size": (policy or {}).get("size"),
+        "policy_dev": (policy or {}).get("dev"),
+        "policy_ino": (policy or {}).get("ino"),
         "pinned_sha256": pinned_sha256,
         "sandbox_exec": (policy or {}).get("sandbox_exec"),
         "canon": canon,
@@ -1348,6 +1475,74 @@ def _native_selftest(*, wrapper_argv, policy, pinned_sha256, canon,
         return _finish("paired_write", r5a, True)
     record["controls"].append(
         {"name": "paired_write", "status": "passed", **r5a})
+
+    copy_path = os.path.join(dpath, "copy")
+    if os.path.lexists(copy_path):
+        return _finish("copy_exec",
+                       {"error": "stale copy target",
+                        "path": copy_path, "created": False}, True)
+    try:
+        with open(argv[-1], "rb") as fh:
+            copy_bytes = fh.read(_NATIVE_SELFTEST_MAX_COPY_BYTES + 1)
+    except OSError as exc:
+        return _finish("copy_exec",
+                       {"error": "cannot read pinned bytes: %s" % exc,
+                        "path": copy_path, "created": False}, True)
+    if not copy_bytes or len(copy_bytes) > _NATIVE_SELFTEST_MAX_COPY_BYTES:
+        return _finish("copy_exec",
+                       {"error": "pinned bytes empty or too large",
+                        "path": copy_path, "created": False}, True)
+    try:
+        fd = os.open(copy_path,
+                     os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o755)
+    except OSError as exc:
+        return _finish("copy_exec",
+                       {"error": "cannot stage copy: %s" % exc,
+                        "path": copy_path, "created": False}, True)
+    try:
+        os.write(fd, copy_bytes)
+    except OSError as exc:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return _finish("copy_exec",
+                       {"error": "cannot write copy: %s" % exc,
+                        "path": copy_path, "created": False}, True)
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        os.chmod(copy_path, 0o755)
+    except OSError as exc:
+        return _finish("copy_exec",
+                       {"error": "cannot chmod copy: %s" % exc,
+                        "path": copy_path, "created": True}, True)
+    snap_d0_ok, snap_d0_err, snap_d0 = _native_selftest_snapshot(dpath)
+    if not snap_d0_ok:
+        return _finish("copy_exec",
+                       {"error": snap_d0_err,
+                        "path": copy_path, "created": True}, True)
+    if _over():
+        return _finish("copy_exec",
+                       {"error": "overall self-test limit exceeded",
+                        "timeout": True, "created": True}, True)
+    r5c = _native_selftest_spawn(
+        argv[:-1] + [copy_path, "--help"],
+        base_env, canon, control_timeout_s)
+    r5c["created"] = bool(os.path.lexists(copy_path))
+    r5c["path"] = dpath
+    snap_d1_ok, snap_d1_err, snap_d1 = _native_selftest_snapshot(dpath)
+    snap_same = bool(snap_d1_ok) and snap_d1 == snap_d0
+    r5c["extra_files"] = not snap_same
+    if not snap_d1_ok:
+        r5c["snapshot_error"] = snap_d1_err
+    if r5c["timeout"] or r5c["spawn_error"] or r5c["exit"] == 0 \
+            or not r5c["created"] or not snap_same:
+        return _finish("copy_exec", r5c, True)
+    record["controls"].append(
+        {"name": "copy_exec", "status": "passed", **r5c})
 
     if _over():
         return _finish("git_deny",
@@ -2063,6 +2258,45 @@ def exec_source_repair(prompt: str, workdir, timeout: int = 600,
                 error="refused: native self-test failed at %s" %
                       selftest_record.get("failed_control"),
                 code="native-selftest-failed",
+                repair_root=canon,
+                native_selftest=selftest_record,
+                tokens_measurable=False, tokens=None)
+        # Slice 304a: the record must be the in-call return bound
+        # to this attempt's wrapper and snapshot; anything else
+        # (downgraded names, swapped policy/pin) refuses here.
+        try:
+            record_ok, record_why = _validate_selftest_record(
+                wrapped["argv"], wrapped["policy"], snap,
+                selftest_record)
+        except Exception as exc:
+            record_ok, record_why = False, \
+                "validator errored: %s" % exc
+        if not record_ok:
+            final = _halt_exec_broker(broker)
+            return 125, "", dict(
+                final,
+                error="refused: native self-test record invalid: "
+                      "%s" % record_why,
+                code="native-selftest-failed",
+                repair_root=canon,
+                native_selftest=selftest_record,
+                tokens_measurable=False, tokens=None)
+        # Slice 304a: re-check policy file and binary after the
+        # last control, before the model Popen. Any drift refuses
+        # with its own code.
+        try:
+            fresh_ok, fresh_why = _revalidate_pre_spawn(
+                wrapped, snap)
+        except Exception as exc:
+            fresh_ok, fresh_why = False, \
+                "revalidation errored: %s" % exc
+        if not fresh_ok:
+            final = _halt_exec_broker(broker)
+            return 125, "", dict(
+                final,
+                error="refused: pre-spawn revalidation failed: "
+                      "%s" % fresh_why,
+                code="native-selftest-stale",
                 repair_root=canon,
                 native_selftest=selftest_record,
                 tokens_measurable=False, tokens=None)

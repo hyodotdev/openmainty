@@ -20,8 +20,10 @@ so a failure can never print inherited secrets. No test prints an env
 mapping: assertions use assertTrue/assertEqual with a message.
 """
 
+import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 import time
@@ -56,8 +58,12 @@ with open(LOG_PATH, "a") as fh:
     fh.write(json.dumps(argv) + "\\n")
 exe = argv[2] if len(argv) > 2 else ""
 rest = argv[3:]
-if mode != "true-allow" and exe != EXPECTED_EXE:
-    sys.exit(71)
+if exe == "/usr/bin/true":
+    if mode != "true-allow":
+        sys.exit(71)
+elif exe != EXPECTED_EXE:
+    if mode != "copy-allow":
+        sys.exit(71)
 os.execvp(exe, [exe] + rest)
 """
 
@@ -101,6 +107,10 @@ if (len(a) >= 4 and a[0] == "schema"
     if mode == "git-sneak" and is_git:
         _write_tree(out)
         sys.exit(1)
+    if mode == "readonly-d" and is_git:
+        d = os.path.dirname(os.path.dirname(out))
+        os.chmod(os.path.join(d, "ctl"), 0o555)
+        os.chmod(d, 0o555)
     if is_git and mode != "git-allow":
         sys.exit(1)
     if mode == "outside-sneak" and is_outside:
@@ -123,10 +133,6 @@ if (len(a) >= 4 and a[0] == "schema"
         os.makedirs(victim, exist_ok=True)
         with open(os.path.join(victim, "x"), "w") as fh:
             fh.write("litter\\n")
-    if mode == "readonly-d" and is_5a:
-        d = os.path.dirname(out)
-        os.chmod(out, 0o555)
-        os.chmod(d, 0o555)
     sys.exit(0)
 sys.exit(0)
 """
@@ -171,6 +177,9 @@ def _emulated_spawn(argv, env, cwd):
     if tail == "/usr/bin/true":
         return _EmulatedProc(71)
     if tail == "--help":
+        if len(argv) >= 2 and ".om-selftest-" in argv[-2]:
+            # A copied binary is not the pinned path: denied.
+            return _EmulatedProc(71)
         return _EmulatedProc(0)
     if len(argv) >= 2 and argv[-2] == "--out":
         out = tail
@@ -269,9 +278,15 @@ class SelftestCase(unittest.TestCase):
         self.policy_path = os.path.join(self.tmp, "policy.sb")
         with open(self.policy_path, "w") as fh:
             fh.write("(version 1)\n")
+        with open(self.policy_path, "rb") as fh:
+            policy_bytes = fh.read()
+        policy_stat = os.stat(self.policy_path)
+        digest = hashlib.sha256(policy_bytes).hexdigest()
         self.policy = {"path": self.policy_path,
-                       "sha256": "a" * 64,
-                       "size": 1, "dev": 1, "ino": 1,
+                       "sha256": digest,
+                       "size": policy_stat.st_size,
+                       "dev": policy_stat.st_dev,
+                       "ino": policy_stat.st_ino,
                        "sandbox_exec": self.sandbox_fake}
         self.wrapper_argv = [sandbox_fake, "-f", self.policy_path,
                              exe_fake]
@@ -302,12 +317,11 @@ class SelftestCase(unittest.TestCase):
                                          "kind": "target"})
         self._patch_object(pf, "native_containment",
                            return_value=None)
-        pinned = os.path.join(self.tmp, "muse-pinned")
-        with open(pinned, "w") as fh:
-            fh.write("pinned\n")
-        # A real snapshot of the fixture file: the product
-        # re-snapshots before spawn and refuses on drift.
-        snap = muse_mod._snapshot_binary(pinned)
+        # A real snapshot of the fixture executable: the product
+        # re-snapshots before spawn and refuses on drift, and the
+        # pre-spawn revalidation compares against this same snap.
+        snap = muse_mod._snapshot_binary(self.exe_fake)
+        self.snap = snap
         self._patch_object(muse_mod, "resolve_pinned_muse",
                            return_value=snap)
         policy = self.policy
@@ -526,10 +540,13 @@ class SelftestCase(unittest.TestCase):
         self.assertTrue(record.get("failed_control") is None)
         argvs = self._spawn_argvs()
         shaped = [a for a in argvs if _control_shaped(a)]
-        self.assertEqual(len(shaped), 6,
-                         "six wrapped control spawns must run")
-        self.assertEqual(len(argvs), 7,
+        self.assertEqual(len(shaped), 7,
+                         "seven wrapped control spawns must run")
+        self.assertEqual(len(argvs), 8,
                          "exactly one extra spawn (the model) may run")
+        by_name = self._by_name(record)
+        self.assertEqual(by_name["copy_exec"]["exit"], 71)
+        self.assertTrue(by_name["copy_exec"]["created"])
         self.assertNotEqual(usage.get("code"), "native-selftest-failed")
         self.assertTrue(_FakeBroker.instances[0].stopped,
                         "broker must be stopped after the run")
@@ -767,6 +784,353 @@ class SelftestCase(unittest.TestCase):
                 broker=_FakeBroker(), base_env=dict(self.env))
         self.assertEqual(record.get("failed_control"), "sandbox_exec",
                          "a policy/argv sandbox mismatch must refuse")
+
+    def test_copy_exec_fails_when_copy_runs(self):
+        exit_code, _out, usage = self._run(mode="copy-allow")
+        self.assertEqual(exit_code, 125,
+                         "an executable copy must refuse")
+        self.assertEqual(usage.get("code"), "native-selftest-failed")
+        record = self._record(usage)
+        self.assertEqual(record["failed_control"], "copy_exec")
+        ctl = self._by_name(record)["copy_exec"]
+        self.assertEqual(ctl["exit"], 0)
+        self.assertTrue(ctl["created"])
+
+    def test_policy_swap_fails_pre_spawn(self):
+        swapped = {}
+        orig = muse_mod._msp_spawn_process
+
+        def _swapping(argv, env, cwd):
+            if "done" not in swapped:
+                with open(self.policy_path, "ab") as fh:
+                    fh.write(b"# drift\n")
+                swapped["done"] = True
+            return orig(argv, env, cwd)
+
+        with mock.patch.object(muse_mod, "_msp_spawn_process",
+                               side_effect=_swapping):
+            exit_code, _out, usage = self._run()
+        self.assertEqual(exit_code, 125,
+                         "a swapped policy file must refuse")
+        self.assertEqual(usage.get("code"), "native-selftest-stale")
+        self.assertTrue(_FakeBroker.instances[0].stopped,
+                        "broker must be stopped on stale refusal")
+
+    def test_binary_swap_fails_pre_spawn(self):
+        swapped = {}
+        orig = muse_mod._msp_spawn_process
+
+        def _swapping(argv, env, cwd):
+            if "done" not in swapped:
+                with open(self.exe_fake, "ab") as fh:
+                    fh.write(b"# drift\n")
+                swapped["done"] = True
+            return orig(argv, env, cwd)
+
+        with mock.patch.object(muse_mod, "_msp_spawn_process",
+                               side_effect=_swapping):
+            exit_code, _out, usage = self._run()
+        self.assertEqual(exit_code, 125,
+                         "a swapped binary must refuse")
+        self.assertEqual(usage.get("code"), "native-selftest-stale")
+
+    def test_tampered_record_missing_control_refuses(self):
+        names = ["baseline_unwrapped_true", "non_pinned_exec",
+                 "pinned_runs", "write_inside", "write_outside",
+                 "paired_write", "copy_exec", "git_deny",
+                 "worktree_identity", "broker_tripwire"]
+        self._admit()
+        record = {"passed": True, "failed_control": None,
+                  "controls": [{"name": n, "status": "passed"}
+                               for n in names if n != "git_deny"],
+                  "policy_sha256": self.policy["sha256"],
+                  "policy_size": self.policy["size"],
+                  "policy_dev": self.policy["dev"],
+                  "policy_ino": self.policy["ino"],
+                  "sandbox_exec": self.policy["sandbox_exec"],
+                  "pinned_sha256": self.snap["sha256"]}
+        with mock.patch.object(muse_mod, "_native_selftest",
+                               return_value=record):
+            with mock.patch.dict(os.environ, self.env, clear=True):
+                exit_code, _out, usage = muse_mod.exec_source_repair(
+                    "selftest probe", self.work, timeout=120,
+                    admission_kind="target",
+                    preflight_home=self.home)
+        self.assertEqual(exit_code, 125,
+                         "a downgraded record must refuse")
+        self.assertEqual(usage.get("code"), "native-selftest-failed")
+
+    def test_policy_field_tamper_refuses(self):
+        # The record is built from the same dict, so the validator
+        # sees a consistent pair; the revalidation against the
+        # policy FILE is what refuses (stale, not failed).
+        for field, bad in (("sha256", "0" * 64),
+                           ("size", 999999),
+                           ("dev", 999999),
+                           ("ino", 999999)):
+            with self.subTest(field=field):
+                _FakeBroker.instances = []
+                self.policy[field] = bad
+                exit_code, _out, usage = self._run()
+                self.assertEqual(
+                    exit_code, 125,
+                    "a tampered policy %s must refuse" % field)
+                self.assertEqual(usage.get("code"),
+                                 "native-selftest-stale")
+
+    def test_repair_cmd_disables_tools(self):
+        cmd = muse_mod.build_source_repair_cmd("probe", self.tmp)
+        self.assertTrue("--disable-shell" in cmd,
+                        "repair argv must disable shell tools")
+        self.assertTrue("--disable-web-tools" in cmd,
+                        "repair argv must disable web tools")
+        self.assertTrue("--trust-workspace" not in cmd,
+                        "repair argv must not trust the workspace")
+        self.assertTrue("--sandbox-network" not in cmd,
+                        "repair argv must not open network")
+
+    def test_repair_policy_text_proof_rejects_tampered_exceptions(
+            self):
+        from openmainty import ncontain as ncontain_mod
+        root = os.path.join(os.path.realpath(self.tmp), "rproot")
+        os.makedirs(root, 0o700)
+        exe = os.path.join(self.tmp, "repair-exe")
+        with open(exe, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(exe, 0o755)
+        snap = muse_mod._snapshot_binary(exe)
+        exe_pin = {"path": snap["real_path"],
+                   "real_path": snap["real_path"],
+                   "sha256": snap["sha256"], "size": snap["size"],
+                   "dev": snap["dev"], "ino": snap["ino"],
+                   "mode": oct(stat.S_IMODE(os.lstat(exe).st_mode)),
+                   "offline_only": True, "admits_worker": False}
+        home = os.path.join(os.path.realpath(self.tmp), "rphome")
+        os.makedirs(home, 0o700)
+        work = os.path.join(os.path.realpath(self.tmp), "rpwork")
+        os.makedirs(work)
+        base = list(ncontain_mod.SUBSCRIPTION_WORKER_READ_EXCEPTIONS)
+        dropped = tuple(base[:-1])
+        added = tuple(base + [("subpath", "/tmp", "tampered")])
+        for label, tampered in (("drop", dropped), ("add", added)):
+            with self.subTest(label=label):
+                with mock.patch.object(
+                        ncontain_mod,
+                        "SUBSCRIPTION_WORKER_READ_EXCEPTIONS",
+                        tampered):
+                    with self.assertRaisesRegex(
+                            ncontain_mod.ContainmentError,
+                            "differ from the reviewed set",
+                            msg="tampered exception set must refuse"):
+                        ncontain_mod.create_repair_broker_policy(
+                            root, exe_pin, home, 19999, work)
+
+    def test_repair_policy_text_proof_carries_reviewed_exceptions(
+            self):
+        # Positive control: an untampered build succeeds and the
+        # returned text carries every live read exception as its
+        # exact allow clause, exactly once, in the single
+        # read-deny line. Text-only proof, not live enforcement.
+        from openmainty import ncontain as ncontain_mod
+        root = os.path.join(os.path.realpath(self.tmp), "okroot")
+        os.makedirs(root, 0o700)
+        exe = os.path.join(self.tmp, "ok-repair-exe")
+        with open(exe, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(exe, 0o755)
+        snap = muse_mod._snapshot_binary(exe)
+        exe_pin = {"path": snap["real_path"],
+                   "real_path": snap["real_path"],
+                   "sha256": snap["sha256"], "size": snap["size"],
+                   "dev": snap["dev"], "ino": snap["ino"],
+                   "mode": oct(stat.S_IMODE(os.lstat(exe).st_mode)),
+                   "offline_only": True, "admits_worker": False}
+        home = os.path.join(os.path.realpath(self.tmp), "okhome")
+        os.makedirs(home, 0o700)
+        work = os.path.join(os.path.realpath(self.tmp), "okwork")
+        os.makedirs(work)
+        policy = ncontain_mod.create_repair_broker_policy(
+            root, exe_pin, home, 19998, work)
+        with open(policy["policy_path"]) as fh:
+            text = fh.read()
+        readlines = [ln for ln in text.splitlines()
+                     if ln.startswith("(deny file-read*")]
+        self.assertEqual(len(readlines), 1,
+                         "repair text must keep one read-deny line")
+        live = ncontain_mod.subscription_worker_exceptions(home)
+        self.assertEqual(len(live), 8,
+                         "reviewed exception set has 8 entries")
+        for entry in live:
+            clause = "(%s %s)" % (
+                entry["kind"],
+                ncontain_mod._sb_literal(entry["path"]))
+            self.assertEqual(readlines[0].count(clause), 1,
+                             "clause must appear exactly once: "
+                             "%s %s" % (entry["kind"],
+                                        entry["path"]))
+
+    def _build_repair_text(self):
+        # Untouched repair text plus its home, for tests that
+        # tamper the TEXT while the exception tuple stays
+        # intact: the text half of the proof must refuse.
+        from openmainty import ncontain as ncontain_mod
+        base = os.path.realpath(self.tmp)
+        root = os.path.join(base, "txtroot")
+        os.makedirs(root, 0o700, exist_ok=True)
+        exe = os.path.join(base, "txt-repair-exe")
+        with open(exe, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(exe, 0o755)
+        snap = muse_mod._snapshot_binary(exe)
+        exe_pin = {"path": snap["real_path"],
+                   "real_path": snap["real_path"],
+                   "sha256": snap["sha256"], "size": snap["size"],
+                   "dev": snap["dev"], "ino": snap["ino"],
+                   "mode": oct(stat.S_IMODE(os.lstat(exe).st_mode)),
+                   "offline_only": True, "admits_worker": False}
+        home = os.path.join(base, "txthome")
+        os.makedirs(home, 0o700, exist_ok=True)
+        work = os.path.join(base, "txtwork")
+        os.makedirs(work, exist_ok=True)
+        policy = ncontain_mod.create_repair_broker_policy(
+            root, exe_pin, home, 19996, work)
+        with open(policy["policy_path"]) as fh:
+            return fh.read(), home
+
+    def test_proof_text_missing_clause_refuses(self):
+        from openmainty import ncontain as ncontain_mod
+        text, home = self._build_repair_text()
+        live = ncontain_mod.subscription_worker_exceptions(home)
+        victim = live[0]
+        clause = "(%s %s)" % (
+            victim["kind"],
+            ncontain_mod._sb_literal(victim["path"]))
+        self.assertEqual(text.count(clause), 1,
+                         "victim clause must occur once overall")
+        tampered = text.replace(clause, "", 1)
+        with self.assertRaisesRegex(
+                ncontain_mod.ContainmentError, "missing from",
+                msg="a text missing a reviewed clause must refuse"):
+            ncontain_mod._prove_repair_read_exceptions(
+                live, os.path.realpath(home), tampered)
+
+    def test_proof_text_duplicated_clause_refuses(self):
+        from openmainty import ncontain as ncontain_mod
+        text, home = self._build_repair_text()
+        live = ncontain_mod.subscription_worker_exceptions(home)
+        victim = live[0]
+        clause = "(%s %s)" % (
+            victim["kind"],
+            ncontain_mod._sb_literal(victim["path"]))
+        self.assertEqual(text.count(clause), 1,
+                         "victim clause must occur once overall")
+        tampered = text.replace(clause, clause + clause, 1)
+        with self.assertRaisesRegex(
+                ncontain_mod.ContainmentError, "duplicated in",
+                msg="a text duplicating a reviewed clause must "
+                    "refuse"):
+            ncontain_mod._prove_repair_read_exceptions(
+                live, os.path.realpath(home), tampered)
+
+    def test_proof_text_two_read_lines_refuses(self):
+        from openmainty import ncontain as ncontain_mod
+        text, home = self._build_repair_text()
+        live = ncontain_mod.subscription_worker_exceptions(home)
+        readlines = [ln for ln in text.splitlines()
+                     if ln.startswith("(deny file-read*")]
+        self.assertEqual(len(readlines), 1,
+                         "untouched text keeps one read-deny line")
+        tampered = text + readlines[0] + "\n"
+        with self.assertRaisesRegex(
+                ncontain_mod.ContainmentError, "not unique",
+                msg="a text with two read-deny lines must refuse"):
+            ncontain_mod._prove_repair_read_exceptions(
+                live, os.path.realpath(home), tampered)
+
+    def _valid_record(self):
+        names = ["baseline_unwrapped_true", "non_pinned_exec",
+                 "pinned_runs", "write_inside", "write_outside",
+                 "paired_write", "copy_exec", "git_deny",
+                 "worktree_identity", "broker_tripwire"]
+        snap = muse_mod._snapshot_binary(self.exe_fake)
+        record = {"passed": True, "failed_control": None,
+                  "controls": [{"name": n, "status": "passed"}
+                               for n in names],
+                  "policy_sha256": self.policy["sha256"],
+                  "policy_size": self.policy["size"],
+                  "policy_dev": self.policy["dev"],
+                  "policy_ino": self.policy["ino"],
+                  "sandbox_exec": self.policy["sandbox_exec"],
+                  "pinned_sha256": snap["sha256"]}
+        return record, snap
+
+    def test_record_validator_rejects_bad_records(self):
+        record, snap = self._valid_record()
+        ok, _why = muse_mod._validate_selftest_record(
+            list(self.wrapper_argv), dict(self.policy),
+            snap, record)
+        self.assertTrue(ok, "a complete record must validate")
+        bad_unpassed = dict(record, passed=False)
+        ok, _why = muse_mod._validate_selftest_record(
+            list(self.wrapper_argv), dict(self.policy),
+            snap, bad_unpassed)
+        self.assertTrue(not ok, "an unpassed record must not count")
+        bad_failed = dict(record, failed_control="git_deny")
+        ok, _why = muse_mod._validate_selftest_record(
+            list(self.wrapper_argv), dict(self.policy),
+            snap, bad_failed)
+        self.assertTrue(not ok, "failed_control set must not count")
+        bad_order = dict(
+            record,
+            controls=list(reversed(record["controls"])))
+        ok, _why = muse_mod._validate_selftest_record(
+            list(self.wrapper_argv), dict(self.policy),
+            snap, bad_order)
+        self.assertTrue(not ok, "reordered controls must not count")
+        bad_status = dict(record, controls=[
+            dict(c, status="failed") if c["name"] == "git_deny"
+            else dict(c) for c in record["controls"]])
+        ok, _why = muse_mod._validate_selftest_record(
+            list(self.wrapper_argv), dict(self.policy),
+            snap, bad_status)
+        self.assertTrue(not ok, "a failed control must not count")
+        bad_pinned = dict(record, pinned_sha256="0" * 64)
+        ok, _why = muse_mod._validate_selftest_record(
+            list(self.wrapper_argv), dict(self.policy),
+            snap, bad_pinned)
+        self.assertTrue(not ok, "a wrong pin must not count")
+        for field, bad in (("policy_sha256", "0" * 64),
+                           ("policy_size", 999999),
+                           ("policy_dev", 999999),
+                           ("policy_ino", 999999)):
+            bad_pol = dict(record)
+            bad_pol[field] = bad
+            ok, _why = muse_mod._validate_selftest_record(
+                list(self.wrapper_argv), dict(self.policy),
+                snap, bad_pol)
+            self.assertTrue(not ok,
+                            "a wrong %s must not count" % field)
+
+    def test_record_validator_sandbox_head(self):
+        # sandbox_exec must equal the spawned wrapper head.
+        record, snap = self._valid_record()
+        other_argv = ["/usr/bin/true", "-f", "x"]
+        ok, _why = muse_mod._validate_selftest_record(
+            other_argv, dict(self.policy), snap, record)
+        self.assertTrue(
+            not ok, "sandbox_exec must match the wrapper head")
+
+    def test_record_validator_sandbox_policy(self):
+        # sandbox_exec must equal the policy entry (argv chosen so
+        # the head binding holds and only the policy comparison
+        # can refuse).
+        record, snap = self._valid_record()
+        other_argv = ["/usr/bin/true", "-f", "x"]
+        rec2 = dict(record, sandbox_exec="/usr/bin/true")
+        ok, _why = muse_mod._validate_selftest_record(
+            other_argv, dict(self.policy), snap, rec2)
+        self.assertTrue(
+            not ok, "sandbox_exec must match the policy entry")
 
     def test_pin_drift_never_reaches_selftest(self):
         self._set_mode("ok")
