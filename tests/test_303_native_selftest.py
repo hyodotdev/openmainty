@@ -1171,6 +1171,53 @@ class SelftestCase(unittest.TestCase):
                       "a corrupt copy must report a mismatch, not "
                       "a denial: %r" % (ctl,))
 
+    def test_copy_exec_zero_write_ends_in_refusal(self):
+        # os.write on the staged copy returns 0 for a while, then
+        # completes: the zero-progress guard must refuse at the
+        # first 0 (125, copy_exec, no model spawn) instead of
+        # looping. The stub bounds itself to 5 zeroes so a
+        # missing guard fails fast instead of hanging.
+        orig_open, orig_write, orig_close = os.open, os.write, os.close
+        copy_fds = set()
+        state = {"zeros": 0}
+
+        def _open(path, flags, *args, **kwargs):
+            fd = orig_open(path, flags, *args, **kwargs)
+            if isinstance(path, str) and path.endswith("/copy"):
+                copy_fds.add(fd)
+            return fd
+
+        def _close(fd):
+            copy_fds.discard(fd)
+            return orig_close(fd)
+
+        def _zero_write(fd, data):
+            if fd in copy_fds and len(data) > 0:
+                if state["zeros"] < 5:
+                    state["zeros"] += 1
+                    return 0
+            return orig_write(fd, data)
+
+        with mock.patch.object(os, "open", side_effect=_open), \
+                mock.patch.object(os, "close", side_effect=_close), \
+                mock.patch.object(os, "write",
+                                  side_effect=_zero_write):
+            exit_code, _out, usage = self._run()
+        self.assertTrue(state["zeros"] > 0,
+                        "the zero-write stub must have fired")
+        self.assertEqual(exit_code, 125,
+                         "a zero-progress copy write must refuse")
+        self.assertEqual(usage.get("code"), "native-selftest-failed")
+        record = self._record(usage)
+        self.assertEqual(record["failed_control"], "copy_exec")
+        ctl = self._by_name(record)["copy_exec"]
+        self.assertIn("no progress", ctl.get("error", ""),
+                      "a zero-progress write must say so: %r"
+                      % (ctl,))
+        for argv in self._spawn_argvs():
+            self.assertTrue(_control_shaped(argv),
+                            "model child must never start on refusal")
+
     def test_allow_extra_write_rule_refuses(self):
         from openmainty import ncontain as ncontain_mod
         prove = getattr(ncontain_mod,
