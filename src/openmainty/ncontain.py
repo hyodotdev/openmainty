@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import os
 import pwd
+import re
 import stat as _stat
 import sys
 
@@ -107,6 +108,44 @@ SUBSCRIPTION_WORKER_READ_EXCEPTIONS = (
 # live check later; do NOT copy the E19 cumulative seed here.
 SUBSCRIPTION_WORKER_EXTRA_META_LITERALS = (
     "/Library/Application Support",
+)
+
+# D2 (owner decision, gate 2 E28/root425): the ONLY file the
+# contained subscription worker may write. The host takes an
+# advisory lock on exactly this file during settings/read, so
+# the policy allows file-write-data + file-write-create on
+# this literal only: no unlink/rename, nothing else in
+# ~/.config/muse writable.
+SUBSCRIPTION_WORKER_SETTINGS_LOCK = (
+    "~/.config/muse/.settings.json.lock")
+
+# E31 narrow network hole (Root steer, gate 2): the ONLY
+# network the subscription-canary profile allows. Outbound
+# TCP 443 (model transport; the endpoint hostname is unknown
+# so no host allowlist can be written honestly) plus the DNS
+# resolver socket. Inbound stays denied: (deny network*) is
+# kept and these append last-match-wins. No broker: E3-0
+# measured 0 broker hits, so the binary ignores the proxy
+# env and dials direct.
+SUBSCRIPTION_CANARY_NETWORK_LINES = (
+    '(allow network-outbound (remote tcp "*:443"))',
+    '(allow network-outbound '
+    '(literal "/private/var/run/mDNSResponder"))',
+)
+
+# Canary read lines, DNS-only (gate 2, slice 295b).
+# E35a5 leave-one-out (result 9076182f): removing ONLY
+# this line broke DNS (curl exit 6); removing any of the
+# other eight V1 lines (/private, /private/var,
+# /private/var/run, mDNSResponder read, resolv.conf,
+# hosts, services) still resolved. Those eight stay out.
+# Slice 295 also carried a TLS-roots group (a trust-roots
+# file plus its path metadata, evidence E35a4 V2 for
+# curl); E35 ran with it. E36 tests the worker without
+# it. Appended after the network lines, canary profile
+# only; the plain subscription text never carries them.
+SUBSCRIPTION_CANARY_READ_LINES = (
+    '(allow file-read-metadata (literal "/var"))',
 )
 
 
@@ -399,13 +438,48 @@ def subscription_worker_exceptions(home=None) -> list:
     return out
 
 
+def subscription_canary_exceptions(home=None) -> list:
+    """Named exceptions for the canary UI, expanded for a home.
+
+    The subscription list plus one {"path", "kind",
+    "reason"} dict per SUBSCRIPTION_CANARY_NETWORK_LINES
+    entry (kind "network") and per
+    SUBSCRIPTION_CANARY_READ_LINES entry (kind "read"),
+    path verbatim: no home expansion — the lines carry no
+    home path.
+    """
+    out = subscription_worker_exceptions(home)
+    reasons = {
+        SUBSCRIPTION_CANARY_NETWORK_LINES[0]:
+            "model transport: outbound TCP 443 only "
+            "(no host allowlist is writable honestly)",
+        SUBSCRIPTION_CANARY_NETWORK_LINES[1]:
+            "DNS resolver socket for the 443 transport",
+    }
+    for line in SUBSCRIPTION_CANARY_NETWORK_LINES:
+        out.append({"path": line, "kind": "network",
+                    "reason": reasons[line]})
+    read_reasons = {
+        SUBSCRIPTION_CANARY_READ_LINES[0]:
+            "DNS resolver path (E35a5: only this V1 line "
+            "was needed for DNS)",
+    }
+    for line in SUBSCRIPTION_CANARY_READ_LINES:
+        out.append({"path": line, "kind": "read",
+                    "reason": read_reasons[line]})
+    return out
+
+
 def _prove_subscription_plus(text: str, base: str,
                              read_clauses: list,
-                             meta_entries: list) -> None:
+                             meta_entries: list,
+                             extra_lines=()) -> None:
     """Prove text is the base policy plus exactly the given
-    read clauses and metadata entries — removal style. Read
-    removal operates on the read-deny line only, metadata
-    removal on the metadata line only; every other line
+    read clauses, metadata entries, and whole extra lines —
+    removal style. Read removal operates on the read-deny
+    line only, metadata removal on the metadata line only,
+    and each extra line (the D2 write rule) must appear
+    exactly once outside those lines; every other line
     (network deny, write confinement, exec pin, securityd
     deny) must be identical.
     """
@@ -451,6 +525,11 @@ def _prove_subscription_plus(text: str, base: str,
               if ln != tread and ln != tmeta]
     rest_b = [ln for ln in blines
               if ln != oread and ln != ometa]
+    for extra in extra_lines:
+        if rest_t.count(extra) != 1:
+            raise ContainmentError(
+                "subscription proof: extra not unique")
+        rest_t.remove(extra)
     if rest_t != rest_b:
         raise ContainmentError(
             "subscription proof: extra diff")
@@ -461,15 +540,20 @@ def build_subscription_worker_policy_text(root: str,
                                           home=None) -> str:
     """Contained subscription-worker profile: product A text
     plus exactly the F2 named read exception (gate (2),
-    root301).
+    root301) and the one D2 settings-lock write rule (gate
+    (2), root425).
 
     Reads: the SUBSCRIPTION_WORKER_READ_EXCEPTIONS clauses.
     Metadata: the ancestor literals of each read path plus
     SUBSCRIPTION_WORKER_EXTRA_META_LITERALS, restricted to
-    entries not already present in the base text. Network
-    deny, owned-only writes, the exec pin, and the securityd
-    deny stay exactly as in the base policy. The result is
-    proven base-plus by removal; anything else raises
+    entries not already present in the base text. Write: one
+    appended allow line, file-write-data + file-write-create
+    on the SUBSCRIPTION_WORKER_SETTINGS_LOCK literal only
+    (advisory lock for settings/read; no unlink/rename,
+    nothing else writable). Network deny, the write-deny
+    line itself, the exec pin, and the securityd deny stay
+    byte-identical to the base policy. The result is proven
+    base-plus by removal; anything else raises
     ContainmentError. Nothing here authorizes a model worker.
     """
     if not root or not os.path.isabs(root):
@@ -533,8 +617,451 @@ def build_subscription_worker_policy_text(root: str,
     text = text.replace(metaline,
                         metaline[:-1] + "".join(meta_entries)
                         + ")", 1)
+    account_home = _resolve_worker_home(home)
+    lock_path = os.path.normpath(os.path.join(
+        account_home, SUBSCRIPTION_WORKER_SETTINGS_LOCK[2:]))
+    real_lock = os.path.realpath(lock_path)
+    if real_lock == real_root or real_lock.startswith(
+            real_root + os.sep):
+        raise ContainmentError(
+            "worker exception must not resolve under the "
+            "owned root: %s" % lock_path)
+    write_rule = ("(allow file-write-data file-write-create "
+                  "(literal %s))" % _sb_literal(lock_path))
+    if write_rule in text:
+        raise ContainmentError(
+            "subscription proof: write rule present")
+    if not text.endswith("\n"):
+        raise ContainmentError(
+            "subscription proof: base text shape")
+    text = text + write_rule + "\n"
     _prove_subscription_plus(text, base, read_clauses,
-                             meta_entries)
+                             meta_entries, [write_rule])
+    return text
+
+
+def _prove_canary_plus(text: str, sub: str) -> None:
+    """Prove text is the subscription text plus exactly the
+    canary network lines plus exactly the canary read
+    lines — removal style. Each line must be absent from
+    the subscription text and present exactly once in the
+    canary text, network lines first, then read lines;
+    everything else must be identical.
+    """
+    expected = list(SUBSCRIPTION_CANARY_NETWORK_LINES) \
+        + list(SUBSCRIPTION_CANARY_READ_LINES)
+    for line in expected:
+        if line in sub:
+            raise ContainmentError(
+                "canary proof: canary line already present")
+    tlines = text.splitlines()
+    slines = sub.splitlines()
+    if tlines != slines + expected:
+        raise ContainmentError("canary proof: extra diff")
+    for line in expected:
+        if tlines.count(line) != 1:
+            raise ContainmentError(
+                "canary proof: canary line not unique")
+
+
+def build_subscription_canary_policy_text(root: str,
+                                          exe_path: str,
+                                          home=None) -> str:
+    """Canary profile: subscription text plus exactly the two
+    E31 network lines plus exactly the 295 read lines for
+    DNS + TLS roots (gate (2)).
+
+    Appended at the END (SBPL last-match-wins) with
+    (deny network*) kept: outbound TCP 443 plus the DNS
+    resolver socket, then the resolver-path and TLS-root
+    reads the E35a4/E35a5 curl probes measured; inbound
+    stays denied. File-write, file-read, exec pin, and
+    securityd deny are identical to the subscription text
+    — proven by removal; anything else raises
+    ContainmentError. Nothing here authorizes a model
+    worker: the single canary turn is gated in muse.py, and
+    the "subscription" profile stays network-denied.
+    """
+    sub = build_subscription_worker_policy_text(
+        root, exe_path, home)
+    if not sub.endswith("\n"):
+        raise ContainmentError("canary proof: base text shape")
+    text = sub + "\n".join(
+        list(SUBSCRIPTION_CANARY_NETWORK_LINES)
+        + list(SUBSCRIPTION_CANARY_READ_LINES)) + "\n"
+    _prove_canary_plus(text, sub)
+    return text
+
+
+def _prove_broker_plus(text: str, sub: str, hole: str) -> None:
+    """Prove text is the subscription text plus exactly the
+    one broker egress line — removal style. The line must
+    be absent from the subscription text and present
+    exactly once, appended at the end; "(deny network*)"
+    must be kept; "*:443" must be absent; everything else
+    must be identical.
+    """
+    if hole in sub:
+        raise ContainmentError(
+            "broker proof: hole already present")
+    tlines = text.splitlines()
+    slines = sub.splitlines()
+    if tlines != slines + [hole]:
+        raise ContainmentError("broker proof: extra diff")
+    if tlines.count(hole) != 1:
+        raise ContainmentError(
+            "broker proof: hole not unique")
+    if "(deny network*)" not in sub:
+        raise ContainmentError(
+            "broker proof: network deny lost")
+    if "*:443" in text:
+        raise ContainmentError(
+            "broker proof: 443 line forbidden")
+
+
+def _check_repair_workdir(workdir, home_real: str) -> str:
+    """Canonical validated repair worktree path, or ContainmentError.
+
+    The derived worktree for one operation only: it must be an
+    existing directory, canonical (realpath equal to the passed
+    path, so no symlink in any component can redirect it
+    outside what the caller passed), never the filesystem
+    root or the account home, and must neither contain nor
+    sit inside the account's ~/.muse, ~/.config/muse or
+    ~/.local/share/muse. Returns the validated path.
+    """
+    if not isinstance(workdir, str) or not workdir:
+        raise ContainmentError("repair workdir must be a path")
+    if "\x00" in workdir:
+        raise ContainmentError("NUL byte in repair workdir")
+    if not os.path.isabs(workdir):
+        raise ContainmentError(
+            "repair workdir must be absolute")
+    try:
+        real = os.path.realpath(workdir)
+    except OSError as exc:
+        raise ContainmentError(
+            "repair workdir unresolvable: %s" % exc)
+    if real != workdir:
+        raise ContainmentError(
+            "repair workdir resolves outside the passed "
+            "path (symlink?): %s" % workdir)
+    try:
+        st = os.lstat(real)
+    except OSError as exc:
+        raise ContainmentError(
+            "repair workdir unavailable: %s" % exc)
+    if not _stat.S_ISDIR(st.st_mode):
+        raise ContainmentError(
+            "repair workdir is not a directory")
+    if real == "/":
+        raise ContainmentError(
+            "repair workdir must not be the filesystem root")
+    if real == home_real:
+        raise ContainmentError(
+            "repair workdir must not be the account home")
+    for leaf in (".muse", ".config/muse",
+                 ".local/share/muse"):
+        guarded = os.path.join(home_real, leaf)
+        if real == guarded or real.startswith(
+                guarded + os.sep):
+            raise ContainmentError(
+                "repair workdir must not sit inside %s"
+                % guarded)
+        if guarded.startswith(real + os.sep):
+            raise ContainmentError(
+                "repair workdir must not contain %s"
+                % guarded)
+    return real
+
+
+def _check_broker_port(port) -> int:
+    if isinstance(port, bool) or not isinstance(port, int):
+        raise ContainmentError(
+            "broker port must be an integer 1024-65535")
+    if port < 1024 or port > 65535:
+        raise ContainmentError(
+            "broker port must be an integer 1024-65535")
+    return port
+
+
+def build_subscription_broker_policy_text(root: str,
+                                          exe_path: str,
+                                          home,
+                                          port: int) -> str:
+    """Broker profile: subscription text plus exactly one
+    loopback egress line for the given broker port (gate
+    (2), slice 296).
+
+    E38 showed the host accepts
+    -c endpoint_transport.proxy="http://127.0.0.1:PORT"
+    (trace transport=proxy) and reaches the proxy with DNS
+    denied — so this profile carries NO *:443 line and NO
+    DNS lines: the only way out is the loopback broker,
+    which enforces the host allowlist itself. Appended at
+    the END (SBPL last-match-wins) with (deny network*)
+    kept. Proven by removal; anything else raises
+    ContainmentError. The "subscription" and
+    "subscription-canary" texts are untouched by this
+    builder.
+    """
+    port = _check_broker_port(port)
+    sub = build_subscription_worker_policy_text(
+        root, exe_path, home)
+    if not sub.endswith("\n"):
+        raise ContainmentError("broker proof: base text shape")
+    hole = ('(allow network-outbound (remote tcp '
+            '"localhost:%d"))' % port)
+    text = sub + hole + "\n"
+    _prove_broker_plus(text, sub, hole)
+    return text
+
+
+# Reviewed read-exception set (gate (2)): the repair policy must
+# contain exactly these named read exceptions and no others. This
+# literal pins the reviewed set INDEPENDENTLY of
+# SUBSCRIPTION_WORKER_READ_EXCEPTIONS: editing that tuple without
+# updating this literal fails the build. Text-only proof, not
+# live enforcement: it shows the built text carries the reviewed
+# set, not that the running child is confined (see preflight).
+_REVIEWED_READ_EXCEPTION_PATHS = (
+    ("subpath", "~/.config/muse"),
+    ("subpath", "~/Library/Keychains/login.keychain-db"),
+    ("subpath", "~/Library/Preferences/com.apple.security.plist"),
+    ("subpath", "~/.claude/skills"),
+    ("subpath", "~/.codex/skills"),
+    ("literal", "/Library"),
+    ("literal", "/Library/Application Support"),
+    ("literal", "~/.claude/CLAUDE.md"),
+)
+
+
+def _expand_reviewed_exception(home_real, kind, spec):
+    """Expand one reviewed spec with the same rules the builder
+    uses for subscription_worker_exceptions: a "~/" spec is
+    joined to the home whatever the kind (the builder does not
+    check kind before joining); an absolute spec is
+    normalized; anything else refuses."""
+    if spec.startswith("~/"):
+        return (kind, os.path.normpath(
+            os.path.join(home_real, spec[2:])))
+    if os.path.isabs(spec):
+        return (kind, os.path.normpath(spec))
+    raise ContainmentError(
+        "bad reviewed exception spec: %r" % (spec,))
+
+
+def _prove_repair_read_exceptions(exceptions, home_real,
+                                 text) -> None:
+    """Prove the built text carries exactly the reviewed set.
+
+    `exceptions` is the {"path", "kind", "reason"} dict list the
+    builder derived from SUBSCRIPTION_WORKER_READ_EXCEPTIONS; its
+    (kind, path) pairs must match the reviewed literal exactly
+    (same pairs, no more, no fewer). A dropped exception
+    (silent narrowing) or an added one (silent widening) raises
+    ContainmentError. Each reviewed pair must then appear as its
+    exact allow clause exactly once in the single read-deny
+    line of the returned text. Text-only proof, not live
+    enforcement: it shows the built text carries the reviewed
+    set, not that the running child is confined (the 1878
+    refusal and preflight stay unchanged).
+    """
+    reviewed = set(
+        _expand_reviewed_exception(home_real, kind, spec)
+        for kind, spec in _REVIEWED_READ_EXCEPTION_PATHS)
+    if len(_REVIEWED_READ_EXCEPTION_PATHS) != len(reviewed):
+        raise ContainmentError(
+            "repair proof: reviewed exception set is ambiguous")
+    got = set((entry["kind"], entry["path"])
+              for entry in exceptions)
+    if got != reviewed:
+        raise ContainmentError(
+            "repair proof: read exceptions differ from the "
+            "reviewed set")
+    readlines = [ln for ln in text.splitlines()
+                 if ln.startswith("(deny file-read*")]
+    if len(readlines) != 1:
+        raise ContainmentError(
+            "repair proof: base read line not unique")
+    readline = readlines[0]
+    for kind, path in sorted(reviewed):
+        clause = "(%s %s)" % (kind, _sb_literal(path))
+        found = readline.count(clause)
+        if found == 0:
+            raise ContainmentError(
+                "repair proof: reviewed exception missing from "
+                "policy text: %s %s" % (kind, path))
+        if found != 1:
+            raise ContainmentError(
+                "repair proof: reviewed exception duplicated in "
+                "policy text: %s %s" % (kind, path))
+
+
+_ALLOW_RULE_HEADS = ("(allow file-read", "(allow file-write",
+                      "(allow process-exec")
+
+
+def _prove_no_extra_allow_rules(text, root, exe_path, home,
+                                work, exceptions) -> None:
+    """Prove no allow rule outside the reviewed set.
+
+    Every line starting with `(allow file-read`, `(allow
+    file-write` or `(allow process-exec` must be exactly one of:
+    the metadata line recomputed from the base ancestors plus
+    the reviewed exception ancestors, the D2 settings-lock write
+    line for this home, or the repair extra lines for this work
+    root (write, conditional read, .git deny). Anything else --
+    an added rule or a removed one -- raises ContainmentError.
+    Text-only proof, not live enforcement: it shows the built
+    text carries exactly the reviewed allow surface, alongside
+    the layered removal proofs that pin each appended line.
+    """
+    wanted_meta = _ancestor_literals([root, exe_path])
+    for path in [entry["path"] for entry in exceptions]:
+        for anc in _ancestor_literals([path]):
+            if anc not in wanted_meta:
+                wanted_meta.append(anc)
+    for extra in SUBSCRIPTION_WORKER_EXTRA_META_LITERALS:
+        if extra not in wanted_meta:
+            wanted_meta.append(extra)
+    metaline = ("(allow file-read-metadata %s)"
+                % " ".join("(literal %s)" % _sb_literal(a)
+                           for a in wanted_meta))
+    account_home = _resolve_worker_home(home)
+    lock_path = os.path.normpath(os.path.join(
+        account_home, SUBSCRIPTION_WORKER_SETTINGS_LOCK[2:]))
+    d2_line = ("(allow file-write-data file-write-create "
+               "(literal %s))" % _sb_literal(lock_path))
+    expected = [metaline, d2_line] + _repair_extra_lines(
+        work, root)
+    expected = [ln for ln in expected
+                if ln.startswith(_ALLOW_RULE_HEADS)]
+    got = [ln for ln in text.splitlines()
+           if ln.startswith(_ALLOW_RULE_HEADS)]
+    if sorted(got) != sorted(expected):
+        raise ContainmentError(
+            "repair proof: allow rules differ from the "
+            "reviewed set")
+
+
+def _prove_repair_plus(text: str, sub: str,
+                       extra_lines) -> None:
+    """Prove text is the broker text plus exactly the repair
+    lines — removal style. Each line must be absent from the
+    broker text and present exactly once, appended at the
+    end in order; "(deny network*)" must be kept; "*:443"
+    must be absent; everything else must be identical.
+    """
+    extra_lines = list(extra_lines)
+    if len(extra_lines) not in (2, 3):
+        raise ContainmentError(
+            "repair proof: two or three lines, got %d"
+            % len(extra_lines))
+    if not extra_lines[-1].startswith("(deny file-write*"):
+        raise ContainmentError(
+            "repair proof: .git deny must be last")
+    for line in extra_lines:
+        if line in sub:
+            raise ContainmentError(
+                "repair proof: line already present")
+    tlines = text.splitlines()
+    slines = sub.splitlines()
+    if tlines != slines + extra_lines:
+        raise ContainmentError("repair proof: extra diff")
+    for line in extra_lines:
+        if tlines.count(line) != 1:
+            raise ContainmentError(
+                "repair proof: line not unique")
+    if "(deny network*)" not in sub:
+        raise ContainmentError(
+            "repair proof: network deny lost")
+    if "*:443" in text:
+        raise ContainmentError(
+            "repair proof: 443 line forbidden")
+
+
+def _repair_git_deny_line(work: str) -> str:
+    """Deny writes to any .git path under the workdir (299b).
+
+    One regex rule, built RAW: the #"..." literal is read
+    raw by the kernel, so _sb_literal doubling would ask
+    for a literal backslash and deny nothing. Covers the
+    top pointer/dir itself, anything under it, and nested
+    sub/.git paths, in any case ([gG][iI][tT]: on
+    case-insensitive volumes .GIT aliases .git). Plain
+    names like .gitignore or sub.git never match. The
+    worker has no reason to write any .git path; the
+    kernel test and the E45 controls prove the deny wins.
+    """
+    for char in work:
+        if char == '"' or char == "\\" or ord(char) < 0x20 \
+                or char == "\x7f":
+            raise ContainmentError(
+                "repair workdir not safe for a raw regex "
+                "literal")
+    pattern = "^%s/(.*/)?\\.[gG][iI][tT](/.*)?$" % re.escape(
+        work)
+    return '(deny file-write* (regex #"%s"))' % pattern
+
+
+def _repair_extra_lines(work: str, root: str) -> list:
+    """The exact lines the repair builder appends (order fixed).
+
+    Write rule, read rule when the workdir sits outside the
+    owned root, then the .git write deny LAST so it wins over
+    the workdir allow.
+    """
+    write_line = ('(allow file-write* (subpath %s))'
+                  % _sb_literal(work))
+    real_root = os.path.realpath(root)
+    if work == real_root or work.startswith(
+            real_root + os.sep):
+        extra = [write_line]
+    else:
+        extra = [write_line,
+                 '(allow file-read* (subpath %s))'
+                 % _sb_literal(work)]
+    extra.append(_repair_git_deny_line(work))
+    return extra
+
+
+def build_repair_broker_policy_text(root: str,
+                                    exe_path: str,
+                                    home,
+                                    port: int,
+                                    workdir) -> str:
+    """Repair profile: broker text plus exactly the write rule
+    for one derived worktree (gate (2), slice 298).
+
+    The write rule is always added; the read rule only when
+    the base text does not already allow the workdir (i.e.
+    it sits outside the owned root). Both are appended at
+    the END (SBPL last-match-wins) with (deny network*)
+    kept, followed by the .git write deny (299b), which wins
+    over the workdir allow. No other path becomes writable.
+    Proven by removal; anything else raises ContainmentError.
+    The "subscription", "subscription-canary" and
+    "subscription-broker" texts are untouched by this builder.
+    """
+    sub = build_subscription_broker_policy_text(
+        root, exe_path, home, port)
+    home_real = os.path.realpath(
+        _resolve_worker_home(home))
+    work = _check_repair_workdir(workdir, home_real)
+    if not sub.endswith("\n"):
+        raise ContainmentError(
+            "repair proof: base text shape")
+    extra = _repair_extra_lines(work, root)
+    text = sub + "".join(
+        ln + "\n" for ln in extra)
+    _prove_repair_plus(text, sub, extra)
+    _prove_repair_read_exceptions(
+        subscription_worker_exceptions(home_real), home_real,
+        text)
+    _prove_no_extra_allow_rules(
+        text, root, exe_path, home, work,
+        subscription_worker_exceptions(home_real))
     return text
 
 
@@ -675,6 +1202,178 @@ def create_subscription_worker_policy(root: str, exe_pin: dict,
                        "offline-only, not Meta-ready)",
             "profile": "subscription",
             "offline_only": True, "admits_worker": False}
+
+
+def create_subscription_canary_policy(root: str, exe_pin: dict,
+                                      home=None) -> dict:
+    """Write the subscription-canary policy into the owned root.
+
+    Same write discipline as create_subscription_worker_policy,
+    but the text is build_subscription_canary_policy_text:
+    subscription text plus exactly the two E31 network lines.
+    The returned identity says "canary" with offline_only
+    False and an honest network label; admits_worker stays
+    False because general worker admission is never granted
+    here — the single canary turn is gated in muse.py
+    (profile + prior canary admission + single use).
+    """
+    _require_darwin()
+    if not isinstance(exe_pin, dict):
+        raise ContainmentError("valid executable pin required")
+    if exe_pin.get("admits_worker"):
+        raise ContainmentError(
+            "a worker-admitting pin is never valid here")
+    fresh_pin = _repinned(exe_pin)
+    st = _check_owned_dir(root)
+    text = build_subscription_canary_policy_text(
+        root, fresh_pin["path"], home)
+    raw = text.encode("utf-8")
+    if len(raw) > _MAX_POLICY_BYTES:
+        raise ContainmentError("policy too large")
+    policy_path = os.path.join(root, POLICY_NAME)
+    if os.path.lexists(policy_path):
+        raise ContainmentError(
+            "policy already exists; refusing to overwrite")
+    fd = os.open(policy_path,
+                 os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        if os.write(fd, raw) != len(raw):
+            raise ContainmentError("short write of policy")
+    finally:
+        os.close(fd)
+    digest, pst = _read_identity(policy_path,
+                                _MAX_POLICY_BYTES)
+    if digest != hashlib.sha256(raw).hexdigest():
+        raise ContainmentError("policy changed after write")
+    return {"policy_path": policy_path,
+            "policy_sha256": digest,
+            "policy_size": pst.st_size,
+            "policy_dev": pst.st_dev,
+            "policy_ino": pst.st_ino,
+            "root": root, "root_dev": st.st_dev,
+            "root_ino": st.st_ino,
+            "executable": fresh_pin,
+            "sandbox_exec": SANDBOX_EXEC,
+            "network": "443-outbound + DNS-resolver only "
+                       "(canary, not Meta-ready)",
+            "profile": "canary",
+            "offline_only": False, "admits_worker": False}
+
+
+def create_subscription_broker_policy(root: str, exe_pin: dict,
+                                      home, port: int) -> dict:
+    """Write the subscription-broker policy into the owned root.
+
+    Same write discipline as create_subscription_canary_policy
+    (re-pinned executable, validated owned root, exclusive
+    create, post-write identity recheck), but the text is
+    build_subscription_broker_policy_text: subscription text
+    plus exactly the one loopback egress line for the given
+    broker port. The returned identity says "broker" with an
+    honest network label; admits_worker stays False because
+    general worker admission is never granted here — the
+    single brokered turn is gated in muse.py exactly like
+    the canary turn (profile + prior admission + single use).
+    """
+    _require_darwin()
+    if not isinstance(exe_pin, dict):
+        raise ContainmentError("valid executable pin required")
+    if exe_pin.get("admits_worker"):
+        raise ContainmentError(
+            "a worker-admitting pin is never valid here")
+    fresh_pin = _repinned(exe_pin)
+    st = _check_owned_dir(root)
+    text = build_subscription_broker_policy_text(
+        root, fresh_pin["path"], home, port)
+    raw = text.encode("utf-8")
+    if len(raw) > _MAX_POLICY_BYTES:
+        raise ContainmentError("policy too large")
+    policy_path = os.path.join(root, POLICY_NAME)
+    if os.path.lexists(policy_path):
+        raise ContainmentError(
+            "policy already exists; refusing to overwrite")
+    fd = os.open(policy_path,
+                 os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        if os.write(fd, raw) != len(raw):
+            raise ContainmentError("short write of policy")
+    finally:
+        os.close(fd)
+    digest, pst = _read_identity(policy_path,
+                                _MAX_POLICY_BYTES)
+    if digest != hashlib.sha256(raw).hexdigest():
+        raise ContainmentError("policy changed after write")
+    return {"policy_path": policy_path,
+            "policy_sha256": digest,
+            "policy_size": pst.st_size,
+            "policy_dev": pst.st_dev,
+            "policy_ino": pst.st_ino,
+            "root": root, "root_dev": st.st_dev,
+            "root_ino": st.st_ino,
+            "executable": fresh_pin,
+            "sandbox_exec": SANDBOX_EXEC,
+            "network": "loopback broker only "
+                       "(broker, not Meta-ready)",
+            "profile": "broker",
+            "offline_only": False, "admits_worker": False}
+
+
+def create_repair_broker_policy(root: str, exe_pin: dict,
+                                home, port: int,
+                                workdir) -> dict:
+    """Write the repair-broker policy into the owned root.
+
+    Same write discipline as
+    create_subscription_broker_policy (re-pinned
+    executable, validated owned root, exclusive create,
+    post-write identity recheck), but the text is
+    build_repair_broker_policy_text: broker text plus
+    exactly the write rule for one derived worktree (and
+    the read rule only when the base text does not
+    already allow it). admits_worker stays False: each
+    repair attempt proves itself in muse.py instead.
+    """
+    _require_darwin()
+    if not isinstance(exe_pin, dict):
+        raise ContainmentError("valid executable pin required")
+    if exe_pin.get("admits_worker"):
+        raise ContainmentError(
+            "a worker-admitting pin is never valid here")
+    fresh_pin = _repinned(exe_pin)
+    st = _check_owned_dir(root)
+    text = build_repair_broker_policy_text(
+        root, fresh_pin["path"], home, port, workdir)
+    raw = text.encode("utf-8")
+    if len(raw) > _MAX_POLICY_BYTES:
+        raise ContainmentError("policy too large")
+    policy_path = os.path.join(root, POLICY_NAME)
+    if os.path.lexists(policy_path):
+        raise ContainmentError(
+            "policy already exists; refusing to overwrite")
+    fd = os.open(policy_path,
+                 os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        if os.write(fd, raw) != len(raw):
+            raise ContainmentError("short write of policy")
+    finally:
+        os.close(fd)
+    digest, pst = _read_identity(policy_path,
+                                _MAX_POLICY_BYTES)
+    if digest != hashlib.sha256(raw).hexdigest():
+        raise ContainmentError("policy changed after write")
+    return {"policy_path": policy_path,
+            "policy_sha256": digest,
+            "policy_size": pst.st_size,
+            "policy_dev": pst.st_dev,
+            "policy_ino": pst.st_ino,
+            "root": root, "root_dev": st.st_dev,
+            "root_ino": st.st_ino,
+            "executable": fresh_pin,
+            "sandbox_exec": SANDBOX_EXEC,
+            "network": "loopback broker only "
+                       "(repair, not Meta-ready)",
+            "profile": "repair-broker",
+            "offline_only": False, "admits_worker": False}
 
 
 def wrapper_argv(policy: dict, exe_path: str) -> list:

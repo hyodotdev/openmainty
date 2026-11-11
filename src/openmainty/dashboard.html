@@ -12154,7 +12154,7 @@ async function paintDerivedFixSection(box, prep) {
         return head(pfSummaryTitle(pf)) +
           `<div class="ev small">검사 <span class="mono">${esc(pf.pfid || "?")}</span> · 완료 <span class="mono">${esc(pf.verified_at || "?")}</span></div>` +
           `<div class="ev small mono" style="white-space:pre-wrap;word-break:break-word;max-width:100%;">입력 핀 ${esc(pf.inputs_sha256 || "?")}</div>` +
-          `<div class="ev small">모델 <span class="mono">muse-spark-1.3</span> · 기여자 ON · 네트워크 <span class="mono">restricted</span> (요청된 프로필 — 실제 집행 미검증)</div>` +
+          `<div class="ev small">모델 <span class="mono">muse-spark-1.3</span> · 기여자 ON · 네트워크 <span class="mono">brokered</span> (요청된 프로필 — 실제 집행 미검증)</div>` +
           `<div class="ev small mono" style="white-space:pre-wrap;word-break:break-word;max-width:100%;">바이너리 ${esc(bin.path || "?")} · ${esc(bin.sha256 || "?")}</div>` +
           `<div class="ev small">설정 상태 <span class="mono">${esc(pf.config_status || "?")}</span> · 키 존재 <span class="mono">${esc(String(auth.meta_api_key_present))}</span> · 자격 출처 <span class="mono">${esc(auth.credential_source || "?")}</span></div>` +
           chRows +

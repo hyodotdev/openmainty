@@ -115,6 +115,7 @@ def _seed_runs(n, repo="t1"):
         _git("add", "-A", cwd=work)
         _git("commit", "-qm", "init %d" % i, cwd=work)
         head = _git("rev-parse", "HEAD", cwd=work).strip()
+        st["workGit"] = runner.record_git_pointer(work)
         fp = runner.source_snapshot(work)["fingerprint"]
         st["workCommit"] = head
         st["verifiedFingerprints"] = {"reproduce": fp}
@@ -129,9 +130,9 @@ def _counting_build(repo):
     calls = []
     orig = runner.source_snapshot
 
-    def counting(work):
+    def counting(work, **kw):
         calls.append(str(work))
-        return orig(work)
+        return orig(work, **kw)
 
     with mock.patch.object(runner, "source_snapshot",
                            side_effect=counting):

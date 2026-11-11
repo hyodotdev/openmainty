@@ -172,6 +172,8 @@ class AskProtocolTests(unittest.TestCase):
         work = self._git_work()
         (work / "fix.txt").write_text("y")
         state = self._state()
+        # 301: proof binding needs the prep record.
+        state["workGit"] = runner.record_git_pointer(work)
         ex = self._live({"fix": [(0, "FILES CHANGED: fix.txt\nTEST ADDED: t")]})
         self.assertTrue(runner.run_worker_step(state, PROFILE, "fix", ex, work, "b"))
         self.assertEqual(state["steps"]["fix"]["status"], "done")

@@ -78,6 +78,7 @@ class GitTextTimeoutTests(TimeoutGitMixin):
         self.assertLess(elapsed, bound + 10 + 7)
 
     def test_source_changes_timeout_is_unknown_not_clean(self):
+        from openmainty import runner as _runner
         run_id = "run-timeout-probe"
         rdir = store.run_dir(run_id)
         work = rdir / "work"
@@ -87,6 +88,10 @@ class GitTextTimeoutTests(TimeoutGitMixin):
             "baseCommit": "abc123",
             "workCommit": "abc123",
             "steps": {"prepare": {"status": "done"}},
+            # 301: the fixture mirrors the production shape — the
+            # live read binds to the prep record, then the wedged
+            # git still times out to unknown.
+            "workGit": _runner.record_git_pointer(work),
         }
         start = time.monotonic()
         sc = serve._source_changes(state)

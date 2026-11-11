@@ -1862,18 +1862,55 @@ def _validate_report_chain(root: Path, op_id: str, latest: dict,
                            stored["snapshot"].get("build_evidence"))
 
 
-def _git(repo_dir: str, args: list, timeout: int = _FETCH_TIMEOUT_S):
+def _git(repo_dir: str, args: list, timeout: int = _FETCH_TIMEOUT_S,
+         *, git_bound=None):
+    """Run git in a repo dir; failures are typed.
+
+    Always over the hardened path: -c overrides plus the scrubbed
+    env (system/global/XDG config off), in the unbound branch too.
+    Bound (worker-touched tree): re-prove the .git pointer first;
+    a changed pointer refuses git-pointer-changed before any
+    spawn. Because global config is off everywhere here, these
+    calls no longer see a global LFS filter.
+    302d: argv construction runs inside the typed handling, so a
+    probe refusal (SourceUnreadable) or a hung probe
+    (TimeoutExpired) surfaces as the typed 502 "unreadable",
+    never raw. Pointer refusal stays git-pointer-changed.
+    """
+    from . import runner as _runner
+    if git_bound is None:
+        bound_paths = None
+    else:
+        try:
+            bound_paths = _runner.reprove_git_pointer(
+                repo_dir, git_bound)
+        except _runner.SourceUnreadable as exc:
+            raise IssueRecoveryError(
+                "worktree git identity changed since prepare",
+                status=502, code="git-pointer-changed") from exc
     try:
+        if bound_paths is None:
+            argv = _runner.hardened_git_argv(
+                ["-C", str(repo_dir)] + list(args))
+        else:
+            argv = _runner.hardened_git_argv(
+                list(args), gitdir=bound_paths["gitdir"],
+                worktree=bound_paths["worktree"])
         proc = subprocess.run(
-            ["git"] + args, cwd=repo_dir, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, timeout=timeout)
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout, env=_runner.hardened_git_env())
+    except _runner.SourceUnreadable as exc:
+        raise IssueRecoveryError(f"git unreadable: {exc}",
+                                 status=502,
+                                 code="unreadable") from exc
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise IssueRecoveryError(f"git read failed: {exc}",
                                  status=502, code="unreadable") from exc
     return proc
 
 
-def _ref_readable(repo_dir: str, head: str) -> bool:
+def _ref_readable(repo_dir: str, head: str, *,
+                  git_bound=None) -> bool:
     """True only when the pinned commit itself resolves.
 
     A bad revision, missing checkout, or Git failure means the
@@ -1881,12 +1918,15 @@ def _ref_readable(repo_dir: str, head: str) -> bool:
     absent from the tree of a READABLE pinned commit is a genuine
     absence, recorded with that commit as evidence.
     """
-    probe = _git(repo_dir, ["cat-file", "-e", f"{head}^{{commit}}"])
+    probe = _git(repo_dir, ["cat-file", "-e", f"{head}^{{commit}}"],
+                   git_bound=git_bound)
     return probe.returncode == 0
 
 
-def _path_absent(repo_dir: str, head: str, path: str) -> bool:
-    probe = _git(repo_dir, ["ls-tree", head, "--", path])
+def _path_absent(repo_dir: str, head: str, path: str, *,
+                 git_bound=None) -> bool:
+    probe = _git(repo_dir, ["ls-tree", head, "--", path],
+                 git_bound=git_bound)
     if probe.returncode != 0:
         raise IssueRecoveryError(
             f"unreadable tree at {head[:12]} for {path}",

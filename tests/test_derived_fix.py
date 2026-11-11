@@ -2755,7 +2755,8 @@ class TestFullInputSidecar(DerivedFixFixtureMixin):
         self.assertNotIn("model", seen["kwargs"])
         self.assertEqual(got["profile"]["model"], "muse-spark-1.3")
         self.assertEqual(got["profile"]["argv_state"], "requested")
-        self.assertEqual(seen["workdir"], rec["workspace"]["path"])
+        self.assertEqual(seen["workdir"],
+                         os.path.realpath(rec["workspace"]["path"]))
         # No secret material is smuggled into the prompt.
         self.assertNotIn("META_API_KEY", got["text"])
         # Honest empty omission set on the happy path.

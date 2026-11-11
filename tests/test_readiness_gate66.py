@@ -420,10 +420,10 @@ class Gate66Tests(unittest.TestCase):
     def test_c_shared_rc124_fails_closed_identically(self):
         orig = batches._snapshot_status
 
-        def fault(worktree):
+        def fault(worktree, **kw):
             if str(self.integ) in (worktree or ""):
                 return None, "source_unreadable", "tracked-list", 124
-            return orig(worktree)
+            return orig(worktree, **kw)
 
         batches._snapshot_status = fault
         self.addCleanup(self._restore_snapshot, orig)
@@ -458,10 +458,10 @@ class Gate66Tests(unittest.TestCase):
     def test_c3_one_negative_line_under_sharing(self):
         orig = batches._snapshot_status
 
-        def fault(worktree):
+        def fault(worktree, **kw):
             if str(self.integ) in (worktree or ""):
                 return None, "source_unreadable", "tracked-list", 124
-            return orig(worktree)
+            return orig(worktree, **kw)
 
         batches._snapshot_status = fault
         self.addCleanup(self._restore_snapshot, orig)

@@ -87,11 +87,16 @@ class HomeMixin(unittest.TestCase):
 
 
 class FingerprintTests(HomeMixin):
+    def _co_state(self):
+        # 301: work_commit binds to the prep record even on plain
+        # checkouts; the fixture records its own tree first.
+        return {"workGit": runner.record_git_pointer(self.co)}
+
     def test_tracked_edit_keeps_head_but_changes_fingerprint(self):
         before = runner.source_snapshot(self.co)
-        head_before = runner.work_commit(self.co, {})
+        head_before = runner.work_commit(self.co, self._co_state())
         (self.co / "a.txt").write_text("after\n", encoding="utf-8")
-        head_after = runner.work_commit(self.co, {})
+        head_after = runner.work_commit(self.co, self._co_state())
         after = runner.source_snapshot(self.co)
         # The Codex reproduction: HEAD cannot tell the dirty tree apart.
         self.assertEqual(head_before, head_after)

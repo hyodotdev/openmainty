@@ -512,9 +512,9 @@ class GraphSnapshotMemoTest(unittest.TestCase):
         calls = []
         orig = runner.source_snapshot
 
-        def counting(work):
+        def counting(work, **kw):
             calls.append(str(work))
-            return orig(work)
+            return orig(work, **kw)
 
         outs = []
         with mock.patch.object(runner, "source_snapshot",
@@ -801,9 +801,9 @@ class P1SignatureRevalidationTest(unittest.TestCase):
         run = {"id": "run-p1-01"}
         orig = runner.source_snapshot
 
-        def counting(work):
+        def counting(work, **kw):
             calls.append(str(work))
-            return orig(work)
+            return orig(work, **kw)
 
         with mock.patch.object(store, "run_dir", return_value=rundir), \
                 mock.patch.object(runner, "source_snapshot",
@@ -1047,9 +1047,9 @@ class P1ConfigScopesTest(unittest.TestCase):
         run = {"id": "run-p1-scope-01"}
         orig = runner.source_snapshot
 
-        def counting(work):
+        def counting(work, **kw):
             calls.append(str(work))
-            return orig(work)
+            return orig(work, **kw)
 
         with mock.patch.object(store, "run_dir", return_value=rundir), \
                 mock.patch.object(runner, "source_snapshot",
@@ -1393,9 +1393,9 @@ class P1ScopeCacheTest(unittest.TestCase):
         run = {"id": "run-p1-cache-01"}
         orig = runner.source_snapshot
 
-        def counting(work):
+        def counting(work, **kw):
             calls.append(str(work))
-            return orig(work)
+            return orig(work, **kw)
 
         with mock.patch.object(store, "run_dir", return_value=rundir), \
                 mock.patch.object(runner, "source_snapshot",
@@ -1665,9 +1665,9 @@ class P1ScopeCacheTest(unittest.TestCase):
             calls = []
             orig = runner.source_snapshot
 
-            def counting(work):
+            def counting(work, **kw):
                 calls.append(str(work))
-                return orig(work)
+                return orig(work, **kw)
 
             with mock.patch.object(
                     store, "run_dir",

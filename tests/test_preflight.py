@@ -1124,14 +1124,15 @@ class MuseDedicatedCase(PreflightCase):
     def test_build_argv_exact(self):
         argv = muse.build_source_repair_cmd("do repair", "/w")
         self.assertEqual(argv[0:2], ["muse", "exec"])
-        self.assertEqual(argv.count("--sandbox-network"), 1)
-        self.assertIn("restricted",
-                      argv[argv.index("--sandbox-network") + 1])
+        for flag in ("--trust-workspace", "--sandbox-network",
+                     "--disable-write"):
+            self.assertNotIn(flag, argv)
         for flag in ("--disable-shell", "--disable-web-tools",
                      "--disable-reminders",
                      "--no-foreign-personal-context",
                      "--disable-request-user-input",
                      "--approval-mode", "--approval-judge",
+                     "--no-session-log",
                      "--max-model-steps", "--max-tool-output-bytes"):
             self.assertIn(flag, argv)
         self.assertEqual(
@@ -1573,6 +1574,37 @@ class MuseDedicatedCase(PreflightCase):
             ("containment",
              mock.patch.object(pf, "native_containment",
                                return_value=None)),
+            # Slice 303: the self-test hook is unconditional in
+            # the product, so these exec fixtures route it through
+            # its own seam with a passing record; the self-test
+            # itself is covered by test_303_native_selftest.
+            # Slice 304a: the record must also pass the product
+            # validator, so the stub carries the expected control
+            # names and the exact bindings of the canned
+            # wrapper/policy/snap below; the pre-spawn
+            # revalidation (which stats a real policy file the
+            # canned wrapper never creates) is stubbed to pass
+            # at the same seam. Assertions unchanged.
+            ("selftest",
+             mock.patch.object(muse, "_native_selftest",
+                               return_value={
+                                   "passed": True,
+                                   "failed_control": None,
+                                   "controls": [
+                                       {"name": n,
+                                        "status": "passed"}
+                                       for n in muse
+                                       ._EXPECTED_SELFTEST_CONTROLS],
+                                   "policy_sha256": "a" * 64,
+                                   "policy_size": 1,
+                                   "policy_dev": 1,
+                                   "policy_ino": 1,
+                                   "sandbox_exec":
+                                   "/usr/bin/sandbox-exec",
+                                   "pinned_sha256": "f" * 64})),
+            ("revalidate",
+             mock.patch.object(muse, "_revalidate_pre_spawn",
+                               return_value=(True, ""))),
             ("resolve",
              mock.patch.object(muse, "resolve_pinned_muse",
                                return_value=dict(snap))),
@@ -1608,30 +1640,104 @@ class MuseDedicatedCase(PreflightCase):
         # never return and no exit/report fields are set.
         popen_mock, kill_mock = self._start_exec_caller_fixtures(
             (b"partial", b"", "ok", False, False, False, True))
+        # Repair seams only (slice 298): a canned broker
+        # double and a canned wrapper argv. Every other mock
+        # stays as the fixture built it.
+        class _FixtureBroker(object):
+            def __init__(self, allow=None):
+                self._allow = tuple(allow) \
+                    if allow is not None else ()
+
+            def start(self):
+                return 54321
+
+            def log(self):
+                return []
+
+            def stop(self):
+                return {"joined": 0, "alive": []}
+
+        broker_patch = mock.patch.object(
+            muse, "_BROKER_CLASS", _FixtureBroker)
+        broker_patch.start()
+        self.addCleanup(broker_patch.stop)
+        wrapper_patch = mock.patch.object(
+            muse, "_msp_build_wrapper",
+            return_value={
+                "argv": ["/usr/bin/sandbox-exec", "-f",
+                         "/owned/policy",
+                         "/owned/fixture/muse"],
+                "policy": {"path": "/owned/policy",
+                           "sha256": "a" * 64, "size": 1,
+                           "dev": 1, "ino": 1,
+                           "sandbox_exec":
+                           "/usr/bin/sandbox-exec"}})
+        wrapper_patch.start()
+        self.addCleanup(wrapper_patch.stop)
         with mock.patch.dict(os.environ):
             os.environ.pop("META_API_KEY", None)
             code, out, usage = muse.exec_source_repair(
                 "repair prompt", self.tmp.name,
                 admission_kind="target", preflight_home=self.home)
         popen_mock.assert_called_once()
-        self.assertEqual(
-            popen_mock.call_args[0][0][0], "/owned/fixture/muse")
+        args = popen_mock.call_args[0][0]
+        self.assertEqual(args[0], "/usr/bin/sandbox-exec")
+        self.assertEqual(args[1:4],
+                         ["-f", "/owned/policy",
+                          "/owned/fixture/muse"])
+        self.assertEqual(args[4], "exec")
+        self.assertIn("-c", args)
         kill_mock.assert_called_once_with(424243)
         self.assertEqual(code, 1)
         self.assertEqual(out, "")
         self.assertIn("incomplete", usage.get("error", ""))
         self.assertEqual(
-            set(usage) <= {"stdout_bytes", "stderr_bytes",
-                           "stdout_truncated", "stderr_truncated",
-                           "readers_joined", "child_reaped",
-                           "tokens_measurable", "tokens", "error"},
-            True)
+            set(usage), {"stdout_bytes", "stderr_bytes",
+                         "stdout_truncated", "stderr_truncated",
+                         "readers_joined", "child_reaped",
+                         "broker_log", "broker_stop",
+                         "repair_root",
+                         "tokens_measurable", "tokens", "error"})
         self.assertNotIn("exit_code", usage)
 
     def test_exec_refuses_unreaped_ok_capture(self):
         # Same caller gate, other half: joined but never reaped.
         popen_mock, kill_mock = self._start_exec_caller_fixtures(
             (b"partial", b"", "ok", False, False, True, False))
+        # Repair seams only (slice 298): same doubles as the
+        # unjoined test above; every other mock stays as the
+        # fixture built it.
+        class _FixtureBroker(object):
+            def __init__(self, allow=None):
+                self._allow = tuple(allow) \
+                    if allow is not None else ()
+
+            def start(self):
+                return 54321
+
+            def log(self):
+                return []
+
+            def stop(self):
+                return {"joined": 0, "alive": []}
+
+        broker_patch = mock.patch.object(
+            muse, "_BROKER_CLASS", _FixtureBroker)
+        broker_patch.start()
+        self.addCleanup(broker_patch.stop)
+        wrapper_patch = mock.patch.object(
+            muse, "_msp_build_wrapper",
+            return_value={
+                "argv": ["/usr/bin/sandbox-exec", "-f",
+                         "/owned/policy",
+                         "/owned/fixture/muse"],
+                "policy": {"path": "/owned/policy",
+                           "sha256": "a" * 64, "size": 1,
+                           "dev": 1, "ino": 1,
+                           "sandbox_exec":
+                           "/usr/bin/sandbox-exec"}})
+        wrapper_patch.start()
+        self.addCleanup(wrapper_patch.stop)
         with mock.patch.dict(os.environ):
             os.environ.pop("META_API_KEY", None)
             code, out, usage = muse.exec_source_repair(

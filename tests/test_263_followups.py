@@ -103,7 +103,9 @@ def _seed_verified_run(repo, issue, files, worker="t263"):
     """Verified run whose worktree holds exactly `files` (rel -> text).
 
     Files are committed; the run's verified fingerprint is the clean
-    snapshot. Returns (state, work).
+    snapshot. Returns (state, work). 301: the fixture mirrors the
+    production prep — the tree is recorded before anything else
+    reads it.
     """
     st = store.create(repo, issue, "fail-closed run %s" % issue,
                       "fbase%s" % issue, {"worker": worker})
@@ -118,6 +120,7 @@ def _seed_verified_run(repo, issue, files, worker="t263"):
     _git("add", "-A", cwd=work)
     _git("commit", "-qm", "init", cwd=work)
     head = _git("rev-parse", "HEAD", cwd=work).strip()
+    st["workGit"] = runner.record_git_pointer(work)
     fp = runner.source_snapshot(work)["fingerprint"]
     st["workCommit"] = head
     st["verifiedFingerprints"] = {"reproduce": fp}
