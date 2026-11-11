@@ -731,6 +731,11 @@ class SelftestCase(unittest.TestCase):
 
     def test_real_builder_policy_feeds_selftest(self):
         wrapped = self._real_wrapped()
+        # The real pin for the same fixture binary: the copy
+        # control requires the staged bytes to equal the pinned
+        # snapshot, so a placeholder pin can no longer feed it.
+        snap = muse_mod._snapshot_binary(
+            os.path.join(self.tmp, "real-exe"))
         canon = os.path.join(self.tmp, "canon")
         os.makedirs(canon)
         work = os.path.join(self.tmp, "work2")
@@ -748,7 +753,7 @@ class SelftestCase(unittest.TestCase):
             record = muse_mod._native_selftest(
                 wrapper_argv=wrapped["argv"],
                 policy=wrapped["policy"],
-                pinned_sha256="f" * 64, canon=canon,
+                pinned_sha256=snap["sha256"], canon=canon,
                 workdir=work, broker=_FakeBroker(),
                 base_env=dict(self.env))
         self.assertTrue(record.get("passed"),
@@ -796,6 +801,26 @@ class SelftestCase(unittest.TestCase):
         self.assertEqual(ctl["exit"], 0)
         self.assertTrue(ctl["created"])
 
+    def test_revalidate_catches_binary_drift(self):
+        # Direct seam test: the binary changes after the
+        # snapshot was taken. Revalidation must refuse before
+        # the model spawn, naming the binary drift. The
+        # end-to-end swap test now trips the earlier copy
+        # integrity gate; this pins the revalidation gate
+        # itself for swaps landing after the copy.
+        snap = muse_mod._snapshot_binary(self.exe_fake)
+        wrapped = {"argv": [self.sandbox_fake, "-f",
+                            self.policy_path, self.exe_fake],
+                   "policy": dict(self.policy)}
+        with open(self.exe_fake, "ab") as fh:
+            fh.write(b"# drift\n")
+        ok, why = muse_mod._revalidate_pre_spawn(wrapped, snap)
+        self.assertFalse(ok,
+                         "a drifted binary must not revalidate")
+        self.assertIn("binary", why,
+                      "the refusal must name the binary: %r"
+                      % (why,))
+
     def test_policy_swap_fails_pre_spawn(self):
         swapped = {}
         orig = muse_mod._msp_spawn_process
@@ -817,6 +842,11 @@ class SelftestCase(unittest.TestCase):
                         "broker must be stopped on stale refusal")
 
     def test_binary_swap_fails_pre_spawn(self):
+        # The swap lands on the first spawn, before the copy
+        # control stages bytes, so the copy control's required
+        # pinned-equality check fires first (still a 125
+        # refusal): the staged bytes cannot equal the pinned
+        # snapshot once the binary has drifted.
         swapped = {}
         orig = muse_mod._msp_spawn_process
 
@@ -832,7 +862,13 @@ class SelftestCase(unittest.TestCase):
             exit_code, _out, usage = self._run()
         self.assertEqual(exit_code, 125,
                          "a swapped binary must refuse")
-        self.assertEqual(usage.get("code"), "native-selftest-stale")
+        self.assertEqual(usage.get("code"), "native-selftest-failed")
+        record = self._record(usage)
+        self.assertEqual(record["failed_control"], "copy_exec")
+        ctl = self._by_name(record)["copy_exec"]
+        self.assertIn("mismatch", ctl.get("error", ""),
+                      "a drifted binary must fail the copy "
+                      "integrity check: %r" % (ctl,))
 
     def test_tampered_record_missing_control_refuses(self):
         names = ["baseline_unwrapped_true", "non_pinned_exec",
@@ -995,11 +1031,11 @@ class SelftestCase(unittest.TestCase):
         policy = ncontain_mod.create_repair_broker_policy(
             root, exe_pin, home, 19996, work)
         with open(policy["policy_path"]) as fh:
-            return fh.read(), home
+            return fh.read(), home, root, work, exe
 
     def test_proof_text_missing_clause_refuses(self):
         from openmainty import ncontain as ncontain_mod
-        text, home = self._build_repair_text()
+        text, home, _root, _work, _exe = self._build_repair_text()
         live = ncontain_mod.subscription_worker_exceptions(home)
         victim = live[0]
         clause = "(%s %s)" % (
@@ -1016,7 +1052,7 @@ class SelftestCase(unittest.TestCase):
 
     def test_proof_text_duplicated_clause_refuses(self):
         from openmainty import ncontain as ncontain_mod
-        text, home = self._build_repair_text()
+        text, home, _root, _work, _exe = self._build_repair_text()
         live = ncontain_mod.subscription_worker_exceptions(home)
         victim = live[0]
         clause = "(%s %s)" % (
@@ -1034,7 +1070,7 @@ class SelftestCase(unittest.TestCase):
 
     def test_proof_text_two_read_lines_refuses(self):
         from openmainty import ncontain as ncontain_mod
-        text, home = self._build_repair_text()
+        text, home, _root, _work, _exe = self._build_repair_text()
         live = ncontain_mod.subscription_worker_exceptions(home)
         readlines = [ln for ln in text.splitlines()
                      if ln.startswith("(deny file-read*")]
@@ -1046,6 +1082,165 @@ class SelftestCase(unittest.TestCase):
                 msg="a text with two read-deny lines must refuse"):
             ncontain_mod._prove_repair_read_exceptions(
                 live, os.path.realpath(home), tampered)
+
+    def test_copy_exec_short_write_writes_full_copy(self):
+        # os.write short-writes the staged copy once: the control
+        # must still stage byte-identical bytes (looped write plus
+        # re-read verify), so the self-test passes and the record
+        # carries the verified copy identity.
+        orig_open, orig_write = os.open, os.write
+        orig_close = os.close
+        copy_fds = set()
+        state = {"cut": False}
+
+        def _open(path, flags, *args, **kwargs):
+            fd = orig_open(path, flags, *args, **kwargs)
+            if isinstance(path, str) and path.endswith("/copy"):
+                copy_fds.add(fd)
+            return fd
+
+        def _close(fd):
+            copy_fds.discard(fd)
+            return orig_close(fd)
+
+        def _short_write(fd, data):
+            if fd in copy_fds and not state["cut"] \
+                    and len(data) > 1:
+                state["cut"] = True
+                return orig_write(fd, data[:len(data) // 2])
+            return orig_write(fd, data)
+
+        with mock.patch.object(os, "open", side_effect=_open), \
+                mock.patch.object(os, "close", side_effect=_close), \
+                mock.patch.object(os, "write",
+                                  side_effect=_short_write):
+            exit_code, _out, usage = self._run()
+        self.assertTrue(state["cut"],
+                        "the short-write stub must have fired")
+        record = self._record(usage)
+        self.assertTrue(record.get("passed"),
+                        "a short write must not fail the "
+                        "self-test: %r" % (record,))
+        ctl = self._by_name(record)["copy_exec"]
+        self.assertEqual(ctl.get("copy_sha256"),
+                         self.snap["sha256"],
+                         "the staged copy must match the pinned "
+                         "snapshot")
+        self.assertEqual(ctl.get("copy_size"), self.snap["size"],
+                         "the staged copy size must match the "
+                         "pinned snapshot")
+
+    def test_copy_exec_corrupt_copy_refuses(self):
+        # The staged bytes differ from the pinned snapshot (one
+        # flipped bit, same length): the control must refuse with
+        # a mismatch reason instead of counting the nonzero exit
+        # as a denial.
+        orig_open, orig_write = os.open, os.write
+        orig_close = os.close
+        copy_fds = set()
+
+        def _open(path, flags, *args, **kwargs):
+            fd = orig_open(path, flags, *args, **kwargs)
+            if isinstance(path, str) and path.endswith("/copy"):
+                copy_fds.add(fd)
+            return fd
+
+        def _close(fd):
+            copy_fds.discard(fd)
+            return orig_close(fd)
+
+        def _corrupt_write(fd, data):
+            if fd in copy_fds and len(data) > 0:
+                raw = bytes(data)
+                return orig_write(fd, bytes([raw[0] ^ 1])
+                                  + raw[1:])
+            return orig_write(fd, data)
+
+        with mock.patch.object(os, "open", side_effect=_open), \
+                mock.patch.object(os, "close", side_effect=_close), \
+                mock.patch.object(os, "write",
+                                  side_effect=_corrupt_write):
+            exit_code, _out, usage = self._run()
+        self.assertEqual(exit_code, 125,
+                         "a corrupt copy must refuse")
+        self.assertEqual(usage.get("code"), "native-selftest-failed")
+        record = self._record(usage)
+        self.assertEqual(record["failed_control"], "copy_exec")
+        ctl = self._by_name(record)["copy_exec"]
+        self.assertIn("mismatch", ctl.get("error", ""),
+                      "a corrupt copy must report a mismatch, not "
+                      "a denial: %r" % (ctl,))
+
+    def test_allow_extra_write_rule_refuses(self):
+        from openmainty import ncontain as ncontain_mod
+        prove = getattr(ncontain_mod,
+                        "_prove_no_extra_allow_rules", None)
+        self.assertTrue(callable(prove),
+                        "the policy must prove no extra allow "
+                        "rules")
+        text, home, root, work, exe = self._build_repair_text()
+        live = ncontain_mod.subscription_worker_exceptions(home)
+        tampered = (text + "(allow file-write* "
+                    "(subpath /tmp))\n")
+        with self.assertRaisesRegex(
+                ncontain_mod.ContainmentError, "allow rule",
+                msg="an extra allow rule must refuse"):
+            prove(tampered, root, exe, home, work, live)
+
+    def test_allow_proof_wired_into_build(self):
+        # Wiring: the builder must invoke the allow-rule proof
+        # and propagate its refusal. A raising stub fails the
+        # build; if the call were removed, the build would
+        # succeed and this test would fail.
+        from openmainty import ncontain as ncontain_mod
+        root = os.path.join(os.path.realpath(self.tmp), "wroot")
+        os.makedirs(root, 0o700)
+        exe = os.path.join(self.tmp, "w-repair-exe")
+        with open(exe, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(exe, 0o755)
+        snap = muse_mod._snapshot_binary(exe)
+        exe_pin = {"path": snap["real_path"],
+                   "real_path": snap["real_path"],
+                   "sha256": snap["sha256"], "size": snap["size"],
+                   "dev": snap["dev"], "ino": snap["ino"],
+                   "mode": oct(stat.S_IMODE(os.lstat(exe).st_mode)),
+                   "offline_only": True, "admits_worker": False}
+        home = os.path.join(os.path.realpath(self.tmp), "whome")
+        os.makedirs(home, 0o700)
+        work = os.path.join(os.path.realpath(self.tmp), "wwork")
+        os.makedirs(work)
+
+        def _wired(*args):
+            raise ncontain_mod.ContainmentError("wired")
+
+        with mock.patch.object(ncontain_mod,
+                               "_prove_no_extra_allow_rules",
+                               side_effect=_wired):
+            with self.assertRaisesRegex(
+                    ncontain_mod.ContainmentError, "wired",
+                    msg="the build must invoke the allow proof"):
+                ncontain_mod.create_repair_broker_policy(
+                    root, exe_pin, home, 19994, work)
+
+    def test_allow_removed_rule_refuses(self):
+        from openmainty import ncontain as ncontain_mod
+        prove = getattr(ncontain_mod,
+                        "_prove_no_extra_allow_rules", None)
+        self.assertTrue(callable(prove),
+                        "the policy must prove no extra allow "
+                        "rules")
+        text, home, root, work, exe = self._build_repair_text()
+        live = ncontain_mod.subscription_worker_exceptions(home)
+        d2 = [ln for ln in text.splitlines()
+              if ln.startswith("(allow file-write-data")]
+        self.assertEqual(len(d2), 1,
+                         "untouched text keeps one D2 write line")
+        tampered = text.replace(d2[0] + "\n", "")
+        with self.assertRaisesRegex(
+                ncontain_mod.ContainmentError, "allow rule",
+                msg="a removed allow rule must refuse"):
+            prove(tampered, root, exe, home, work, live)
 
     def _valid_record(self):
         names = ["baseline_unwrapped_true", "non_pinned_exec",

@@ -898,6 +898,53 @@ def _prove_repair_read_exceptions(exceptions, home_real,
                 "policy text: %s %s" % (kind, path))
 
 
+_ALLOW_RULE_HEADS = ("(allow file-read", "(allow file-write",
+                      "(allow process-exec")
+
+
+def _prove_no_extra_allow_rules(text, root, exe_path, home,
+                                work, exceptions) -> None:
+    """Prove no allow rule outside the reviewed set.
+
+    Every line starting with `(allow file-read`, `(allow
+    file-write` or `(allow process-exec` must be exactly one of:
+    the metadata line recomputed from the base ancestors plus
+    the reviewed exception ancestors, the D2 settings-lock write
+    line for this home, or the repair extra lines for this work
+    root (write, conditional read, .git deny). Anything else --
+    an added rule or a removed one -- raises ContainmentError.
+    Text-only proof, not live enforcement: it shows the built
+    text carries exactly the reviewed allow surface, alongside
+    the layered removal proofs that pin each appended line.
+    """
+    wanted_meta = _ancestor_literals([root, exe_path])
+    for path in [entry["path"] for entry in exceptions]:
+        for anc in _ancestor_literals([path]):
+            if anc not in wanted_meta:
+                wanted_meta.append(anc)
+    for extra in SUBSCRIPTION_WORKER_EXTRA_META_LITERALS:
+        if extra not in wanted_meta:
+            wanted_meta.append(extra)
+    metaline = ("(allow file-read-metadata %s)"
+                % " ".join("(literal %s)" % _sb_literal(a)
+                           for a in wanted_meta))
+    account_home = _resolve_worker_home(home)
+    lock_path = os.path.normpath(os.path.join(
+        account_home, SUBSCRIPTION_WORKER_SETTINGS_LOCK[2:]))
+    d2_line = ("(allow file-write-data file-write-create "
+               "(literal %s))" % _sb_literal(lock_path))
+    expected = [metaline, d2_line] + _repair_extra_lines(
+        work, root)
+    expected = [ln for ln in expected
+                if ln.startswith(_ALLOW_RULE_HEADS)]
+    got = [ln for ln in text.splitlines()
+           if ln.startswith(_ALLOW_RULE_HEADS)]
+    if sorted(got) != sorted(expected):
+        raise ContainmentError(
+            "repair proof: allow rules differ from the "
+            "reviewed set")
+
+
 def _prove_repair_plus(text: str, sub: str,
                        extra_lines) -> None:
     """Prove text is the broker text plus exactly the repair
@@ -1012,6 +1059,9 @@ def build_repair_broker_policy_text(root: str,
     _prove_repair_read_exceptions(
         subscription_worker_exceptions(home_real), home_real,
         text)
+    _prove_no_extra_allow_rules(
+        text, root, exe_path, home, work,
+        subscription_worker_exceptions(home_real))
     return text
 
 

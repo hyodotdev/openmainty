@@ -966,14 +966,20 @@ def _exec_repair_parent(preflight_home) -> str:
 #       (mode 0755) and execs D/copy --help through the wrapper
 #       prefix -- the same shape as non_pinned_exec, which runs
 #       /usr/bin/true there. Close to non_pinned_exec, but it adds
-#       this: the SAME BYTES under a DIFFERENT PATH must still be
-#       denied (exit nonzero, no new files), proving the exec pin
-#       follows identity, not the path string. Note on MCP: with
-#       exec pinned to the literal exe, any spawned server or
-#       child process IS this same binary; what the binary does
-#       with server flags stays behaviorally unproven -- the
-#       stream tool allowlist (write_file only) is the refusal
-#       point for that, not this control.
+#       this: the SAME BYTES under a DIFFERENT PATH must still
+#       exit nonzero with no new files and D gone afterwards. The
+#       copy is written in a loop and re-read before the spawn:
+#       its sha256 and size must equal the pinned snapshot, so a
+#       nonzero exit cannot be our own truncated or corrupt
+#       staging. What a nonzero exit does NOT show is the cause:
+#       a sandbox denial and a copy that fails to run for another
+#       reason look the same offline, and no exit-code mapping is
+#       attempted. Note on MCP: with exec pinned to the literal
+#       exe, any spawned server or child process IS this same
+#       binary; what the binary does with server flags stays
+#       behaviorally unproven -- the stream tool allowlist
+#       (write_file only) is the refusal point for that, not
+#       this control.
 #   worktree_identity  the derived worktree must be byte-identical
 #       before and after the self-test: regular files by sha256,
 #       symlinks by target, plus the directory set, so a leftover
@@ -1499,26 +1505,72 @@ def _native_selftest(*, wrapper_argv, policy, pinned_sha256, canon,
         return _finish("copy_exec",
                        {"error": "cannot stage copy: %s" % exc,
                         "path": copy_path, "created": False}, True)
-    try:
-        os.write(fd, copy_bytes)
-    except OSError as exc:
+    write_error = None
+    remaining = copy_bytes
+    while len(remaining) > 0 and write_error is None:
         try:
-            os.close(fd)
-        except OSError:
-            pass
-        return _finish("copy_exec",
-                       {"error": "cannot write copy: %s" % exc,
-                        "path": copy_path, "created": False}, True)
+            sent = os.write(fd, remaining)
+        except OSError as exc:
+            write_error = exc
+            break
+        if sent <= 0:
+            write_error = "short write made no progress"
+            break
+        remaining = remaining[sent:]
     try:
         os.close(fd)
     except OSError:
         pass
+    if write_error is not None:
+        return _finish("copy_exec",
+                       {"error": "cannot write copy: %s" % write_error,
+                        "path": copy_path, "created": False}, True)
     try:
         os.chmod(copy_path, 0o755)
     except OSError as exc:
         return _finish("copy_exec",
                        {"error": "cannot chmod copy: %s" % exc,
                         "path": copy_path, "created": True}, True)
+    try:
+        staged_fd = os.open(copy_path,
+                            os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        return _finish("copy_exec",
+                       {"error": "cannot re-open copy: %s" % exc,
+                        "path": copy_path, "created": True}, True)
+    try:
+        staged_stat = os.fstat(staged_fd)
+        if not stat.S_ISREG(staged_stat.st_mode):
+            return _finish(
+                "copy_exec",
+                {"error": "copy is not a regular file",
+                 "path": copy_path, "created": True}, True)
+        staged_digest = hashlib.sha256()
+        while True:
+            try:
+                part = os.read(staged_fd, 65536)
+            except OSError as exc:
+                return _finish(
+                    "copy_exec",
+                    {"error": "cannot re-read copy: %s" % exc,
+                     "path": copy_path, "created": True}, True)
+            if not part:
+                break
+            staged_digest.update(part)
+    finally:
+        try:
+            os.close(staged_fd)
+        except OSError:
+            pass
+    staged_sha256 = staged_digest.hexdigest()
+    if staged_stat.st_size != len(copy_bytes) \
+            or staged_sha256 != pinned_sha256:
+        return _finish(
+            "copy_exec",
+            {"error": "copy mismatch: staged bytes differ from "
+                      "pinned snapshot",
+             "path": copy_path, "created": True,
+             "staged_sha256": staged_sha256}, True)
     snap_d0_ok, snap_d0_err, snap_d0 = _native_selftest_snapshot(dpath)
     if not snap_d0_ok:
         return _finish("copy_exec",
@@ -1541,6 +1593,8 @@ def _native_selftest(*, wrapper_argv, policy, pinned_sha256, canon,
     if r5c["timeout"] or r5c["spawn_error"] or r5c["exit"] == 0 \
             or not r5c["created"] or not snap_same:
         return _finish("copy_exec", r5c, True)
+    r5c["copy_sha256"] = staged_sha256
+    r5c["copy_size"] = len(copy_bytes)
     record["controls"].append(
         {"name": "copy_exec", "status": "passed", **r5c})
 
