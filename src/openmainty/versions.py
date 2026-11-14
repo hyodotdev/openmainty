@@ -259,6 +259,6 @@ def safe_lane(kind: str) -> str:
     `none` (already at latest) also rests on main; everything else —
     including 0.x minor moves — needs the next lane.
     """
-    if kind in ("patch", "none"):
+    if kind in ("patch", "minor", "none"):
         return "main"
     return "next"

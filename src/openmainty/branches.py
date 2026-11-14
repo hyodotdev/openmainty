@@ -17,9 +17,12 @@ from . import store as _store
 from . import versions
 
 
-def slugify_topic(text: str) -> str:
+DEFAULT_TOPIC_LENGTH = 48
+
+
+def slugify_topic(text: str, max_length: int = DEFAULT_TOPIC_LENGTH) -> str:
     slug = re.sub(r"[^A-Za-z0-9]+", "-", (text or "").lower()).strip("-")
-    return (slug or "update")[:48]
+    return (slug or "update")[:max_length].rstrip("-") or "update"
 
 
 def route(name: str, current: str | None, latest: str | None,
@@ -44,8 +47,9 @@ def route(name: str, current: str | None, latest: str | None,
         return {"lane": lane, "kind": kind, "branch": None, "reason": reason,
                 "peer_blocked": peer_blocked}
     lane = versions.safe_lane(kind)
-    if peer_blocked and lane == "main":
-        lane = "next"
+    # A peer conflict only matters while the update sits on the next lane.
+    if peer_blocked and lane == "next":
+        lane = "main"
     prefix = "codex/maint" if lane == "main" else "codex/next"
     topic = slugify_topic(f"{name}-{latest}")
     reason = _reason(name, current, latest, kind, lane, peer_blocked)
