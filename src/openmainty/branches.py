@@ -322,3 +322,12 @@ def promotion_readiness(state: dict,
             "criteria": [{"name": n, "ok": bool(ok),
                           **({"detail": d} if d else {})}
                          for n, ok, d in checks]}
+
+
+def branch_age_label(days: int) -> str:
+    """Short label for how old a branch is."""
+    if days < 1:
+        return "today"
+    if days < 7:
+        return f"{days}d"
+    return f"{days // 7}w"

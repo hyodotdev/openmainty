@@ -622,3 +622,10 @@ def dry_run_report(home, older_than_days: int = 7,
             "never": list(NEVER),
             "total_reclaimable_bytes": total,
             "deletes_nothing": True}
+
+
+def stale_runs(runs: list[dict], config: dict) -> list[dict]:
+    """Runs past the configured retention window."""
+    from .retention import expired
+
+    return [run for run in runs if expired(run.get("age_days", 0), config)]
